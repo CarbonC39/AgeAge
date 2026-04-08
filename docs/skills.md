@@ -1,0 +1,320 @@
+# Skills Reference
+
+Skills are Markdown files that teach the agent specialised behaviour for specific task types. When a user's message matches a skill by name, the agent loads that skill's instructions into its system prompt and restricts its tool access to the skill's declared list.
+
+Skills are stored in `{workspace}/skills/` and are **hot-reloaded every 2 seconds** — no restart needed after editing.
+
+---
+
+## File format
+
+A skill file is a Markdown document with a YAML frontmatter block at the top:
+
+```markdown
+---
+name: my-skill
+version: "1.0"
+description: "One-line summary shown to the router."
+complexity: medium
+required_tools:
+  - web_search
+  - web_fetch
+  - finish_task
+---
+
+# My Skill
+
+Instructions for the agent go here. Use plain Markdown.
+You can include lists, headers, code blocks, etc.
+```
+
+The YAML block is delimited by `---` lines. Everything after the second `---` is the **prompt body**, injected verbatim into the agent's system prompt when the skill is matched.
+
+---
+
+## Frontmatter fields
+
+### `name` *(string, required)*
+
+The skill's identifier. Used for name-based matching against user input.
+
+```yaml
+name: code_review
+```
+
+Matching is **case-insensitive word-boundary regex**: a skill named `code_review` matches messages that contain the word `code_review` (not as part of a larger word). If omitted, the filename without `.md` is used as the name.
+
+### `version` *(string, optional)*
+
+Informational only. Useful for tracking changes, not parsed by the engine.
+
+```yaml
+version: "1.0"
+```
+
+### `description` *(string, optional)*
+
+A one-line summary of what the skill does. Shown to the **router** when the skill is matched, helping it reason about complexity and tool selection.
+
+```yaml
+description: "Review code files for bugs, style issues, and security problems."
+```
+
+### `required_tools` *(string list, optional)*
+
+The tools the agent is allowed to use while this skill is active. Only tools that exist in the global registry (or the skill-only tool list below) can be listed.
+
+```yaml
+required_tools:
+  - file_read
+  - bash
+  - delegate
+  - finish_task
+```
+
+**`finish_task` is always injected automatically** — you do not need to include it, though doing so causes no harm.
+
+If no skill is matched, the router determines the tool list. If a skill is matched but `required_tools` is empty, the full tool set remains available.
+
+#### Skill-only tools
+
+Some tools are not globally registered. They are injected only when a matched skill lists them:
+
+| Tool name          | Description |
+|--------------------|-------------|
+| `grep`             | Recursive text search within files (ripgrep-style). |
+| `glob`             | Recursive file pattern matching (`**` supported). |
+| `update_todos`     | Maintain a live task list shown to the user and injected into every LLM context. Cleared automatically after `finish_task`. |
+| `escalate`         | Spawn a sub-agent using the strongest configured model (`[router.strong]`). Use for deep reasoning subtasks. |
+| `browser_navigate` | Open a URL in a managed browser session; returns the page title and readable text. Keeps the session alive across calls in the same turn. |
+| `browser_action`   | Interact with the current page: click, type, fill, hover, scroll, select, press, check, uncheck. |
+| `browser_content`  | Retrieve page content as readable text, raw HTML, or ARIA accessibility tree snapshot. |
+
+All three `browser_*` tools share one `BrowserSession` per `Run()` call and clean up automatically on turn completion. Configure the browser backend in `[browser]` — see [config.md](config.md#browser).
+
+### `complexity` *(string, optional)*
+
+When set, **bypasses the router LLM call entirely** and synthesises a routing decision directly. This saves one LLM round-trip per user turn for skills where the complexity is always known in advance.
+
+```yaml
+complexity: medium
+```
+
+| Value     | Effect |
+|-----------|--------|
+| `simple`  | Router skipped; no tools injected beyond `required_tools`. No `delegate` tool. |
+| `medium`  | Router skipped; uses `[router.medium]` model if configured. No `delegate` tool. |
+| `complex` | Router skipped; uses `[router.strong]` model if configured. `delegate` tool injected (if sub-agents are enabled). |
+
+If an unrecognised value is used, a warning is logged and the normal router flow runs instead.
+
+When multiple skills are matched simultaneously, the **highest** complexity wins.
+
+---
+
+## Prompt body
+
+Everything after the closing `---` of the frontmatter is the skill's prompt, injected into the system prompt under a `## Matched Skills & Specialized Instructions` heading:
+
+```
+## Matched Skills & Specialized Instructions
+
+### code_review
+*Description: Review code for best practices, bugs, and improvement suggestions.*
+
+[your skill body here]
+```
+
+Write the body as instructions directed at the agent. Be explicit: specify the steps to follow, the output format, and what to do in edge cases. The agent treats this content as authoritative system-level guidance.
+
+---
+
+## Matching behaviour
+
+- Matching runs on **every user turn**, checking each skill's `name` as a word-boundary pattern against the raw user input.
+- **Multiple skills can match** at once. All matching skills are merged: their prompts are concatenated, their `required_tools` lists are unioned, and the highest `complexity` wins.
+- Matching is **case-insensitive** and uses whole-word boundaries, so `review` does not match a skill named `code_review`.
+
+## Pipeline Skills
+
+Instead of a single prompt, a skill can define a **structured pipeline** of execution nodes. This is ideal for multi-step processes where you want to isolate variables, enforce sequential execution, or iterate over a list.
+
+A pipeline skill uses a `pipeline:` list in the frontmatter instead of a prompt body.
+
+```yaml
+---
+name: summarize-articles
+version: "1.0"
+description: "Fetch and summarize multiple articles."
+vars:
+  urls: []
+pipeline:
+  - id: get_content
+    type: auto
+    tool: web_fetch
+    foreach: $vars.urls
+    inputs:
+      url: $foreach.current
+    outputs:
+      result: contents
+
+  - id: summarize
+    type: agent
+    foreach: $vars.contents
+    prompt: |
+      Summarize this article:
+      {{$foreach.current}}
+    outputs:
+      result: summaries
+
+  - id: final_report
+    type: agent
+    prompt: |
+      Combine these summaries into a single report:
+      {{$vars.summaries}}
+    outputs:
+      result: final_output
+---
+```
+
+### Pipeline Concepts
+
+- **Variables (`vars`)**: A shared state map. Values can be initialized in the frontmatter or passed by the user (e.g., `input`).
+- **Nodes**: Executed sequentially. If a node fails, subsequent nodes are marked as `skipped` (⏭️).
+- **Isolation**: Every `agent` node gets a completely fresh sub-agent. They do not share conversation history, preventing context bloat and hallucination bleed-over.
+- **Node Types**:
+  - `agent` (default): Spawns an LLM sub-agent. The agent's `finish_task` tool is replaced with `node_complete` to return structured data (`status`, `vars`, `reason`, `context`).
+  - `auto`: Calls a tool directly without LLM reasoning. Extremely fast and deterministic.
+- **Iteration (`foreach`)**: Runs the node for every item in an array. Outputs are automatically collected into arrays matching the input length.
+- **Context Accumulation (`output_context: true`)**: `agent` nodes can return a `context` string via `node_complete` which is automatically prepended to the prompt of all subsequent nodes.
+
+**Routing:** Pipeline skills are automatically classified as `complex` by the router to ensure they have the resources needed to orchestrate multiple sub-tasks.
+
+---
+
+## Examples
+
+### Minimal skill
+
+```markdown
+---
+name: summarize
+description: "Summarize a document or URL."
+complexity: medium
+required_tools:
+  - web_fetch
+---
+
+Fetch the given URL with `web_fetch`, then write a concise summary in plain paragraphs. Call `finish_task` with the summary.
+```
+
+### Skill with sub-agent delegation
+
+```markdown
+---
+name: research
+description: "Deep research using parallel web searches."
+complexity: complex
+required_tools:
+  - web_search
+  - web_fetch
+  - delegate
+---
+
+## Research Protocol
+
+1. Use `web_search` to find 3-5 relevant sources.
+2. For each source, use `delegate` to fetch and summarise it in parallel:
+   - task: "Summarise the key points of this article relevant to the user's question."
+   - tools: ["web_fetch"]
+   - pre_tool: "web_fetch"
+   - pre_tool_args: {"url": "<source_url>"}
+3. Synthesise all summaries into a final answer and call `finish_task`.
+```
+
+### Skill with task tracking
+
+```markdown
+---
+name: migration
+description: "Database schema migration planning."
+complexity: complex
+required_tools:
+  - bash
+  - file_read
+  - file_write
+  - update_todos
+---
+
+Before starting, call `update_todos` with the full task list. Mark each step as `in_progress` while working and `done` when complete. The user can see your progress in real time.
+```
+
+---
+
+## AGENT.md and SOUL.md
+
+AgeAge splits system-level instructions into two separate files:
+
+### AGENT.md *(always injected)*
+
+`AGENT.md` (`{workspace}/data/AGENT.md`) contains **execution directives** — rules about how the agent should behave regardless of persona. These are injected into every agent turn in all modes.
+
+```markdown
+# AGENT
+
+## Execution Directives
+
+- Use tools to gather information and perform actions.
+- Call finish_task when the task is complete.
+- Always respond in the same language the user uses.
+- Deploy tools efficiently; avoid unnecessary calls.
+```
+
+### SOUL.md *(injected conditionally)*
+
+`SOUL.md` (`{workspace}/data/SOUL.md`) contains the agent's **persona and communication style**. It is injected:
+
+- In `ageage serve` and `ageage connect` modes (always)
+- In `ageage cli --soul` mode (opt-in with the `--soul` flag; off by default)
+
+```markdown
+# SOUL
+
+You are a concise, direct assistant. Avoid filler phrases.
+Use clear formatting when helpful. Keep responses focused.
+```
+
+**Precedence:** AGENT.md is injected first, then SOUL.md (if active), then matched skill prompts. Skill instructions take precedence over both personality files where they conflict.
+
+**Sub-agents** spawned by `delegate` and `escalate` inherit neither file — they operate with a minimal system prompt focused on their specific subtask.
+
+---
+
+### Skill with browser automation
+
+```markdown
+---
+name: web-automation
+description: "Interact with JavaScript-heavy sites or pages requiring login."
+complexity: complex
+required_tools:
+  - browser_navigate
+  - browser_action
+  - browser_content
+  - update_todos
+---
+
+Use `browser_navigate` to open the target URL, `browser_action` to interact with
+page elements, and `browser_content` to read results. All three share the same
+browser session within a turn. Call `finish_task` with your findings.
+```
+
+---
+
+## Tips
+
+- **Keep skill names unique and specific.** Generic names like `help` or `task` will match too broadly.
+- **List only the tools the skill actually needs.** Fewer tools means a smaller, cleaner context for the LLM.
+- **Use `complexity` to skip the router** for skills with a predictable workload — it saves latency and tokens on every matched turn.
+- **Use `update_todos`** for multi-step skills where the user benefits from seeing progress (e.g. long file processing, multi-source research).
+- **Skills are live-reloaded** — edit a `.md` file and the change takes effect within 2 seconds without restarting the server.

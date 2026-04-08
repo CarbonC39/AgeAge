@@ -1,0 +1,5 @@
+workspace/*
+*.exe
+*.exe~
+ageage
+.claude/*

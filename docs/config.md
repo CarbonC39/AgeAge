@@ -62,11 +62,12 @@ mode             = "supervised"
 non_include_tools = []
 ```
 
-| Key                | Type         | Default        | Description |
-|--------------------|--------------|----------------|-------------|
-| `max_iterations`   | int          | `20`           | Hard limit on tool-call rounds per user turn. |
-| `mode`             | string       | `"supervised"` | `"full"` allows all tools without confirmation. `"supervised"` prompts the user before destructive actions (bash, file_write, file_edit). |
-| `non_include_tools`| string list  | `[]`           | Tools to never register. Supports exact names (`"bash"`) and prefix matching (`"cron"` excludes all cron tools, `"memory_"` excludes all memory tools). `finish_task` cannot be excluded. |
+| Key                  | Type         | Default        | Description |
+|----------------------|--------------|----------------|-------------|
+| `max_iterations`     | int          | `20`           | Hard limit on tool-call rounds per user turn. |
+| `mode`               | string       | `"supervised"` | `"full"` allows all tools without confirmation. `"supervised"` prompts the user before destructive actions (bash, file_write, file_edit). |
+| `non_include_tools`  | string list  | `[]`           | Tools to never register. Supports exact names (`"bash"`) and prefix matching (`"cron"` excludes all cron tools, `"memory_"` excludes all memory tools). `finish_task` cannot be excluded. |
+| `max_parallel_tools` | int          | `0`            | Maximum number of tool calls that may execute concurrently within a single LLM response. `0` or `1` = sequential (default). `>1` = parallel; when combined with streaming, tools whose JSON arguments complete during the stream are dispatched immediately without waiting for the full response. |
 
 ---
 
@@ -451,9 +452,24 @@ workspace/
 │   ├── cron.json        # Scheduled tasks
 │   └── tmp/             # Managed temp files for converter output (auto-cleaned)
 └── skills/
-    ├── code_review.md   # Example skill
-    └── ...
+    ├── code_review.md   # Example markdown skill
+    └── research.yaml    # Example pipeline skill
 ```
+
+In CLI mode, AgeAge also creates a **`.ageage/`** directory in the current working directory (the directory you launched the CLI from). In serve/connect/mcp modes, it is created inside the workspace instead.
+
+```
+.ageage/
+├── .gitignore           # Ignores tmp/ only; CONTEXT.md and settings.json are tracked
+├── CONTEXT.md           # Workspace notes auto-injected into every agent system prompt
+├── settings.json        # Per-directory always-allow command prefixes (CLI mode)
+└── tmp/                 # Scratch space for temporary pipeline data
+```
+
+| File | Purpose |
+|------|---------|
+| `CONTEXT.md` | Free-form working notes injected into the system prompt when non-empty. The agent may update it without user confirmation. Keep under 2 000 characters. |
+| `settings.json` | When you answer `a` (always allow) at a supervised confirmation prompt, the command prefix is recorded here and auto-allowed in future sessions from the same directory. |
 
 ### AGENT.md vs SOUL.md
 

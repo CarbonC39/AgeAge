@@ -78,6 +78,11 @@ type PipelineNode struct {
 	// InjectSoul controls whether SOUL.md is included in the node's system prompt.
 	InjectSoul bool `yaml:"inject_soul"`
 
+	// NoContext disables .ageage/CONTEXT.md injection for this node.
+	// By default, pipeline nodes inherit the global CONTEXT.md (InjectContext=true).
+	// Set to true for nodes that don't need workspace context (e.g. pure generation tasks).
+	NoContext bool `yaml:"no_context"`
+
 	// OutputContext enables the optional "context" field in node_complete.
 	// When true, the node's agent may include a context string in its finish
 	// call that gets injected into subsequent agent nodes' prompts.
@@ -99,9 +104,12 @@ type PipelineNode struct {
 	// 0 or 1 = sequential; >1 = parallel. Default: 0.
 	Concurrency int `yaml:"concurrency"`
 
-	// Inputs maps tool/agent argument names to pipeline variable references.
-	// Values may be $vars.name, $foreach.current, $foreach.index, or literals.
-	Inputs map[string]string `yaml:"inputs"`
+	// Inputs maps tool/agent argument names to values.
+	// String values are treated as pipeline variable references:
+	//   $vars.name, $foreach.current, $foreach.current.field, $foreach.index, or a literal string.
+	// Non-string values (lists, maps, numbers, booleans) are passed through as-is,
+	// with any nested string elements resolved recursively.
+	Inputs map[string]interface{} `yaml:"inputs"`
 
 	// Outputs maps pipeline variable names to the node's output keys.
 	// For auto nodes: the tool's return string is stored under the key "result".

@@ -131,18 +131,19 @@ Write the body as instructions directed at the agent. Be explicit: specify the s
 
 ## Matching behaviour
 
-- Matching runs on **every user turn**, checking each skill's `name` as a word-boundary pattern against the raw user input.
-- **Multiple skills can match** at once. All matching skills are merged: their prompts are concatenated, their `required_tools` lists are unioned, and the highest `complexity` wins.
-- Matching is **case-insensitive** and uses whole-word boundaries, so `review` does not match a skill named `code_review`.
+Skills are activated in one of two ways (mutually exclusive — only one skill is ever active per turn):
+
+1. **Explicit command** — the user message starts with `/skill-name`. The name is normalised (lowercase, spaces and underscores → hyphens) and matched exactly. The `/skill-name` prefix is stripped from the message before it reaches the agent.
+2. **Router selection** — when the router is enabled, it makes an LLM call that reads all skill descriptions and the user message, then returns the name of the best-matching skill (or none). Requires `[router] enabled = true`.
 
 ## Pipeline Skills
 
 Instead of a single prompt, a skill can define a **structured pipeline** of execution nodes. This is ideal for multi-step processes where you want to isolate variables, enforce sequential execution, or iterate over a list.
 
-A pipeline skill uses a `pipeline:` list in the frontmatter instead of a prompt body.
+Pipeline skills are **standalone `.yaml` files** (not `.md` files) placed in the `skills/` directory. The file contains top-level `name`, `description`, `vars`, and `pipeline` fields.
 
 ```yaml
----
+# skills/summarize-articles.yaml
 name: summarize-articles
 version: "1.0"
 description: "Fetch and summarize multiple articles."
@@ -174,7 +175,6 @@ pipeline:
       {{$vars.summaries}}
     outputs:
       result: final_output
----
 ```
 
 ### Pipeline Concepts
@@ -187,8 +187,11 @@ pipeline:
   - `auto`: Calls a tool directly without LLM reasoning. Extremely fast and deterministic.
 - **Iteration (`foreach`)**: Runs the node for every item in an array. Outputs are automatically collected into arrays matching the input length.
 - **Context Accumulation (`output_context: true`)**: `agent` nodes can return a `context` string via `node_complete` which is automatically prepended to the prompt of all subsequent nodes.
+- **Workspace Context (`no_context: true`)**: By default, every pipeline `agent` node has `.ageage/CONTEXT.md` injected into its system prompt (the same workspace context the main agent sees). Set `no_context: true` on a node to suppress this — useful for pure generation tasks that don't need project context.
 
-**Routing:** Pipeline skills are automatically classified as `complex` by the router to ensure they have the resources needed to orchestrate multiple sub-tasks.
+**Routing:** When the router selects a pipeline skill (or it is triggered via `/skill-name`), it is automatically treated as `complex` complexity — ensuring the strong model and full tool set are available to orchestrate multiple sub-tasks. This can be overridden with a top-level `complexity:` field in the YAML file.
+
+> For a complete reference on all pipeline fields, syntax, and patterns, see [pipeline.md](pipeline.md).
 
 ---
 
@@ -286,7 +289,9 @@ Use clear formatting when helpful. Keep responses focused.
 
 **Precedence:** AGENT.md is injected first, then SOUL.md (if active), then matched skill prompts. Skill instructions take precedence over both personality files where they conflict.
 
-**Sub-agents** spawned by `delegate` and `escalate` inherit neither file — they operate with a minimal system prompt focused on their specific subtask.
+**Sub-agents** spawned by `delegate` and `escalate` inherit neither file and do not receive `.ageage/CONTEXT.md` — they operate with a minimal system prompt focused on their specific subtask.
+
+**Pipeline nodes** receive `.ageage/CONTEXT.md` by default (the same workspace context visible to the main agent). Suppress it on a per-node basis with `no_context: true`.
 
 ---
 

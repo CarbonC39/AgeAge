@@ -274,6 +274,7 @@ Skill-only tools are **never** in the global registry. They are instantiated and
 |--------------------|-------------|
 | `grep`             | Regex search within a file. |
 | `glob`             | File pattern matching (`**` supported). |
+| `tree`             | Directory tree listing, similar to `tree -L N`. |
 | `update_todos`     | Live task list shown to the user and injected into every LLM context. |
 | `escalate`         | Spawn a sub-agent using the strongest configured model. |
 | `node_complete`    | Replaces `finish_task` in pipeline `agent` nodes to return structured outputs. |
@@ -345,6 +346,34 @@ Finds files matching a glob pattern under a directory, with full `**` cross-dire
 - Results are capped at **500 paths**.
 - The base path is security-checked.
 - Not registered globally — use `required_tools: [glob]` in a skill.
+
+---
+
+### `tree`
+
+Returns a directory tree listing similar to the Unix `tree -L N` command, with directories listed first.
+
+| Parameter | Type    | Required | Description                                                      |
+|-----------|---------|----------|------------------------------------------------------------------|
+| `path`    | string  | No       | Directory to list. Defaults to the workspace root.               |
+| `depth`   | integer | No       | Maximum depth to recurse (1–6). Default: `2`.                    |
+| `all`     | boolean | No       | Include hidden files and directories (names starting with `.`). Default: `false`. |
+
+**Output format:**
+```
+my-project/
+├── src/
+│   ├── main.go
+│   └── handler.go
+├── config.toml
+└── README.md
+
+2 directories, 3 files
+```
+
+**Notes:**
+- Results are sorted: directories first, then files, both alphabetically.
+- Not registered globally — use `required_tools: [tree]` in a skill.
 
 ---
 

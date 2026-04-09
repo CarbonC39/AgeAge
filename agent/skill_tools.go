@@ -122,7 +122,8 @@ func runSkillDelegate(
 	}
 
 	subAgent := factory.CreateAgentFiltered(nil, "", UniqueStrings(safeTools))
-	subAgent.InjectSoul = false // sub-agents never get personality injection
+	subAgent.InjectSoul = false   // sub-agents never get personality injection
+	subAgent.InjectContext = false // delegate sub-agents don't need workspace context
 	subAgent.IsSubAgent = true
 	subAgent.MaxIterations = factory.Config.SubAgent.MaxIterations
 

@@ -430,6 +430,7 @@ func (e *PipelineExecutor) execAgentNode(ctx context.Context, node skills.Pipeli
 	subAgent := e.factory.CreateAgentFiltered(e.confirmMgr, e.channelID, filteredTools)
 	subAgent.IsSubAgent = true
 	subAgent.InjectSoul = node.InjectSoul
+	subAgent.InjectContext = !node.NoContext // default true; opt-out per node with no_context: true
 	if e.factory.Config.SubAgent.MaxIterations > 0 {
 		subAgent.MaxIterations = e.factory.Config.SubAgent.MaxIterations
 	}
@@ -629,24 +630,60 @@ func (e *PipelineExecutor) buildNodePrompt(node skills.PipelineNode, foreachItem
 	return strings.Join(parts, "\n\n---\n\n")
 }
 
-// resolveValue resolves a pipeline variable reference to its current value,
-// or returns the literal string if it doesn't match a known prefix.
+// resolveValue resolves a pipeline value to its runtime counterpart.
 //
-//	$vars.name        → e.vars["name"]
-//	$foreach.current  → foreachItem
-//	$foreach.index    → foreachIdx (as int)
-//	<anything else>   → literal string
-func (e *PipelineExecutor) resolveValue(ref string, foreachItem interface{}, foreachIdx int) interface{} {
-	switch {
-	case ref == "$foreach.current":
-		return foreachItem
-	case ref == "$foreach.index":
-		return foreachIdx
-	case strings.HasPrefix(ref, "$vars."):
-		key := strings.TrimPrefix(ref, "$vars.")
-		return e.vars[key]
+// String values are treated as variable references:
+//
+//	$foreach.current        → foreachItem
+//	$foreach.current.field  → field of foreachItem (foreachItem must be a map)
+//	$foreach.index          → foreachIdx (int)
+//	$vars.name              → e.vars["name"]
+//	<anything else>         → literal string (unchanged)
+//
+// Map and slice values are resolved recursively: string elements are treated
+// as variable references while non-string elements (numbers, booleans, nil)
+// are passed through unchanged. This lets inputs such as:
+//
+//	tools: []
+//	pre_tool_args:
+//	  path: $vars.file_path
+//	  start_line: $foreach.current.start_line
+//
+// be expressed naturally in YAML and resolved at runtime.
+func (e *PipelineExecutor) resolveValue(val interface{}, foreachItem interface{}, foreachIdx int) interface{} {
+	switch v := val.(type) {
+	case string:
+		switch {
+		case v == "$foreach.current":
+			return foreachItem
+		case v == "$foreach.index":
+			return foreachIdx
+		case strings.HasPrefix(v, "$foreach.current."):
+			field := strings.TrimPrefix(v, "$foreach.current.")
+			if m, ok := foreachItem.(map[string]interface{}); ok {
+				return m[field]
+			}
+			return nil
+		case strings.HasPrefix(v, "$vars."):
+			key := strings.TrimPrefix(v, "$vars.")
+			return e.vars[key]
+		default:
+			return v // literal
+		}
+	case map[string]interface{}:
+		resolved := make(map[string]interface{}, len(v))
+		for k, mv := range v {
+			resolved[k] = e.resolveValue(mv, foreachItem, foreachIdx)
+		}
+		return resolved
+	case []interface{}:
+		resolved := make([]interface{}, len(v))
+		for i, ev := range v {
+			resolved[i] = e.resolveValue(ev, foreachItem, foreachIdx)
+		}
+		return resolved
 	default:
-		return ref // literal
+		return val // int, float64, bool, nil — pass through unchanged
 	}
 }
 

@@ -344,6 +344,21 @@ func (c *Config) MemoryPath() string {
 	return filepath.Join(c.Workspace, "data", "MEMORY.jsonl")
 }
 
+// AgeAgeDirPath returns the .ageage directory path within the effective work dir.
+func (c *Config) AgeAgeDirPath() string {
+	return filepath.Join(c.EffectiveWorkDir(), ".ageage")
+}
+
+// ContextMDPath returns the path to .ageage/CONTEXT.md.
+func (c *Config) ContextMDPath() string {
+	return filepath.Join(c.AgeAgeDirPath(), "CONTEXT.md")
+}
+
+// WorkspaceSettingsPath returns the path to .ageage/settings.json.
+func (c *Config) WorkspaceSettingsPath() string {
+	return filepath.Join(c.AgeAgeDirPath(), "settings.json")
+}
+
 // ShouldExcludeTool checks if a tool should be excluded based on non_include_tools config.
 func (c *Config) ShouldExcludeTool(toolName string) bool {
 	toolNameLower := strings.ToLower(toolName)

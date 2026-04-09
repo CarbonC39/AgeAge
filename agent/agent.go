@@ -47,6 +47,7 @@ type Agent struct {
 	TodoEditFunc     func(msgID, text string) error // Optional: edit a previously sent todo notification
 	InjectSoul          bool                           // If true, SOUL.md personality is injected (serve/connect default true; CLI default false)
 	IsSubAgent          bool                           // If true, this is a sub-agent (disables pre-execution and skill-only tool injection)
+	InjectContext       bool                           // If true, .ageage/CONTEXT.md is injected into the system prompt (default true for main agent and pipeline nodes)
 	MaxIterations       int                            // Maximum iterations for this agent run
 	factory             *AgentFactory                  // Back-reference used for skill-only tool injection; nil for manually created agents
 	todoStore           *tools.TodoStore               // Non-nil when update_todos is injected; cleared after finish_task
@@ -69,6 +70,7 @@ func NewAgent(cfg *config.Config, client *llm.Client, registry *tools.Registry, 
 		MaxIterations: cfg.Agent.MaxIterations,
 		messages:      make([]llm.Message, 0, 64),
 		tmpMgr:        newTmpManager(cfg.Workspace),
+		InjectContext: true, // on by default; explicitly disabled for delegate sub-agents
 	}
 
 	if cfg.Router.Enabled {
@@ -174,6 +176,25 @@ func (a *Agent) buildSystemPrompt(matchedSkill *skills.Skill) string {
 			sb.WriteString("## Personality & Behavior\n\n")
 			sb.WriteString(strings.TrimSpace(string(soulData)))
 			sb.WriteString("\n\n")
+		}
+	}
+
+	// Workspace context notes — injected for main agent and pipeline nodes (InjectContext=true),
+	// suppressed for delegate sub-agents (InjectContext=false).
+	// Placed before skill instructions so the prefix stays stable for KV-cache reuse.
+	if a.InjectContext {
+		sb.WriteString("## Context Notes File\n\n")
+		sb.WriteString("You have access to `.ageage/CONTEXT.md` in the working directory. " +
+			"Use `file_write` or `file_edit` to update it (no confirmation required). " +
+			"Store only essential cross-session facts: decisions, key file paths, architecture notes, discovered constraints. " +
+			"**Keep the file under 2 000 characters. Never store conversation history, task progress logs, or verbose notes.**\n\n")
+
+		if contextData, err := os.ReadFile(a.cfg.ContextMDPath()); err == nil {
+			if trimmed := strings.TrimSpace(string(contextData)); trimmed != "" {
+				sb.WriteString("### Current Contents of .ageage/CONTEXT.md\n\n")
+				sb.WriteString(trimmed)
+				sb.WriteString("\n\n")
+			}
 		}
 	}
 

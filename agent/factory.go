@@ -30,6 +30,7 @@ type AgentFactory struct {
 	HasMemories     bool
 	MCPSessions     map[string]*mcp.ClientSession // Active MCP sessions
 	InjectSoul      bool                          // Passed to each created agent; true in serve/connect, false in CLI
+	OnAlwaysAllow   func(operation string)        // Optional: called when user selects "a" (always-allow) in CLI confirm
 
 	skillsMu sync.RWMutex
 	Skills   []skills.Skill
@@ -237,6 +238,9 @@ func (f *AgentFactory) CreateAgentFiltered(confirmMgr *tools.ConfirmationManager
 			return true
 		case "a":
 			autoAllowAll = true
+			if f.OnAlwaysAllow != nil {
+				f.OnAlwaysAllow(operation)
+			}
 			fmt.Println("  ✓  Auto-allow enabled for this session.")
 			return true
 		default:
@@ -275,18 +279,36 @@ func (f *AgentFactory) CreateAgentFiltered(confirmMgr *tools.ConfirmationManager
 	if shouldRegisterTool("file_read") {
 		registry.Register(&tools.FileReadTool{Security: f.SecurityChecker})
 	}
+
+	// fileConfirmFunc auto-approves writes/edits targeting .ageage/CONTEXT.md.
+	// FileWriteTool: "Write N bytes to <path>" — path is the last token.
+	// FileEditTool:  "Edit file <path> (replace text)" — path is the second token.
+	// Both reliably contain the absolute path as a whole path segment, so a
+	// path-boundary-aware Contains check suffices; the path itself cannot
+	// appear as a substring of another valid path at this position.
+	contextMDPath := filepath.ToSlash(f.Config.ContextMDPath())
+	fileConfirmFunc := func(operation string) bool {
+		slashed := filepath.ToSlash(operation)
+		// Require the path to be preceded by a space (word boundary) so a
+		// path like /foo/CONTEXT.md doesn't accidentally match /bar/foo/CONTEXT.md.
+		if strings.Contains(slashed, " "+contextMDPath) {
+			return true
+		}
+		return confirmFunc(operation)
+	}
+
 	if shouldRegisterTool("file_write") {
 		registry.Register(&tools.FileWriteTool{
 			Security:    f.SecurityChecker,
 			Supervised:  isSupervised,
-			ConfirmFunc: confirmFunc,
+			ConfirmFunc: fileConfirmFunc,
 		})
 	}
 	if shouldRegisterTool("file_edit") {
 		registry.Register(&tools.FileEditTool{
 			Security:    f.SecurityChecker,
 			Supervised:  isSupervised,
-			ConfirmFunc: confirmFunc,
+			ConfirmFunc: fileConfirmFunc,
 		})
 	}
 

@@ -465,6 +465,38 @@ func startChannels(factory *agent.AgentFactory) (*channel.Manager, int) {
 			}
 		}
 
+		// ToolStartCallback: send a Markdown diff block to the channel when the
+		// agent writes or edits a file, so IM users can see what changed.
+		notifyFn := ag.NotifyFunc
+		ag.ToolStartCallback = func(name, args string) {
+			if notifyFn == nil {
+				return
+			}
+			var msg string
+			switch name {
+			case "file_write":
+				var p struct {
+					Path    string `json:"path"`
+					Content string `json:"content"`
+				}
+				if json.Unmarshal([]byte(args), &p) == nil && p.Path != "" {
+					msg = imDiffWrite(p.Path, p.Content)
+				}
+			case "file_edit":
+				var p struct {
+					Path    string `json:"path"`
+					Search  string `json:"search"`
+					Replace string `json:"replace"`
+				}
+				if json.Unmarshal([]byte(args), &p) == nil && p.Path != "" {
+					msg = imDiffEdit(p.Path, p.Search, p.Replace)
+				}
+			}
+			if msg != "" {
+				notifyFn(msg)
+			}
+		}
+
 		agents[key] = ag
 		return ag, nil
 	}
@@ -634,6 +666,9 @@ func runConnect(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	factory.InjectSoul = true
+	if err := agent.EnsureAgeAgeDir(factory.Config.EffectiveWorkDir()); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not create .ageage directory: %s\n", err)
+	}
 
 	watchCtx, watchCancel := context.WithCancel(context.Background())
 	defer watchCancel()
@@ -671,6 +706,9 @@ func runServe(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	factory.InjectSoul = true
+	if err := agent.EnsureAgeAgeDir(factory.Config.EffectiveWorkDir()); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not create .ageage directory: %s\n", err)
+	}
 
 	watchCtx, watchCancel := context.WithCancel(context.Background())
 	defer watchCancel()
@@ -724,6 +762,22 @@ func runCLI(cmd *cobra.Command, args []string) error {
 		fmt.Fprintf(os.Stderr, "warning: could not determine working directory: %s — using workspace as fallback\n", err)
 	}
 	factory.InjectSoul = soulFlag
+
+	// Ensure .ageage directory exists in the working directory.
+	if err := agent.EnsureAgeAgeDir(factory.Config.EffectiveWorkDir()); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not create .ageage directory: %s\n", err)
+	}
+
+	// Merge workspace-local always-allow commands from .ageage/settings.json.
+	settingsPath := factory.Config.WorkspaceSettingsPath()
+	if cmds := agent.LoadWorkspaceAutoAllowCommands(settingsPath); len(cmds) > 0 {
+		factory.Config.Bash.AutoAllowCommands = append(factory.Config.Bash.AutoAllowCommands, cmds...)
+	}
+
+	// Persist "always allow" choices to .ageage/settings.json for future sessions.
+	factory.OnAlwaysAllow = func(operation string) {
+		agent.AppendAlwaysAllow(settingsPath, operation)
+	}
 
 	watchCtx, watchCancel := context.WithCancel(context.Background())
 	defer watchCancel()
@@ -833,12 +887,12 @@ func runCLI(cmd *cobra.Command, args []string) error {
 					case "file_edit":
 						spinner.Stop()
 						var p struct {
-							Path      string `json:"path"`
-							OldString string `json:"old_string"`
-							NewString string `json:"new_string"`
+							Path    string `json:"path"`
+							Search  string `json:"search"`
+							Replace string `json:"replace"`
 						}
 						if json.Unmarshal([]byte(args), &p) == nil && p.Path != "" {
-							ui.printFileEdit(p.Path, p.OldString, p.NewString)
+							ui.printFileEdit(p.Path, p.Search, p.Replace)
 						}
 					default:
 						label := name
@@ -906,6 +960,48 @@ func runCLI(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// imDiffWrite builds a Markdown diff block for a file_write operation.
+func imDiffWrite(path, content string) string {
+	const maxLines = 30
+	lines := strings.Split(content, "\n")
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "**📝 Writing `%s`**\n```diff\n", path)
+	for i, l := range lines {
+		if i >= maxLines {
+			fmt.Fprintf(&sb, "... (%d more lines)\n", len(lines)-maxLines)
+			break
+		}
+		fmt.Fprintf(&sb, "+ %s\n", l)
+	}
+	sb.WriteString("```")
+	return sb.String()
+}
+
+// imDiffEdit builds a Markdown diff block for a file_edit operation.
+func imDiffEdit(path, oldStr, newStr string) string {
+	const maxLines = 15
+	oldLines := strings.Split(oldStr, "\n")
+	newLines := strings.Split(newStr, "\n")
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "**✏️ Editing `%s`**\n```diff\n", path)
+	for i, l := range oldLines {
+		if i >= maxLines {
+			fmt.Fprintf(&sb, "... (%d more lines)\n", len(oldLines)-maxLines)
+			break
+		}
+		fmt.Fprintf(&sb, "- %s\n", l)
+	}
+	for i, l := range newLines {
+		if i >= maxLines {
+			fmt.Fprintf(&sb, "... (%d more lines)\n", len(newLines)-maxLines)
+			break
+		}
+		fmt.Fprintf(&sb, "+ %s\n", l)
+	}
+	sb.WriteString("```")
+	return sb.String()
+}
+
 func runSkills(cmd *cobra.Command, args []string) error {
 	configPath, _ := cmd.Flags().GetString("config")
 	configPath = findConfigFile(configPath)
@@ -948,6 +1044,9 @@ func runMCP(cmd *cobra.Command, args []string) error {
 	factory, err := agent.NewFactory(configPath, debugFlag)
 	if err != nil {
 		return err
+	}
+	if err := agent.EnsureAgeAgeDir(factory.Config.EffectiveWorkDir()); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not create .ageage directory: %s\n", err)
 	}
 
 	watchCtx, watchCancel := context.WithCancel(context.Background())

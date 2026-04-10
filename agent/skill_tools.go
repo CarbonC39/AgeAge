@@ -45,6 +45,13 @@ var skillOnlyToolFactories = map[string]func(*AgentFactory, *tools.Registry, *Ag
 		a.todoStore = store
 		return &tools.UpdateTodosTool{Store: store}
 	},
+	"ask_user": func(f *AgentFactory, _ *tools.Registry, a *Agent) tools.Tool {
+		return &tools.AskUserTool{
+			ChannelID:     a.GetChannelID(),
+			Manager:       f.UserInputMgr,
+			NotifyFuncPtr: &a.AskUserNotify,
+		}
+	},
 	"escalate": func(f *AgentFactory, r *tools.Registry, _ *Agent) tools.Tool {
 		return &EscalateTool{factory: f, registry: r}
 	},

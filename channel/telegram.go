@@ -13,24 +13,41 @@ import (
 
 // TelegramChannel connects to Telegram via Bot API (long polling).
 type TelegramChannel struct {
-	Token   string
-	Options ChannelOptions
-	baseURL string
-	client  *http.Client
-	stopCh  chan struct{}
-	botID   int64
-	mu      sync.Mutex
+	Token          string
+	AllowedUsers   []string // Telegram user IDs allowed to interact; empty = allow all
+	Options        ChannelOptions
+	AnswerCallback func(channelID, answer string) // Optional: called when an inline-keyboard button is pressed
+	baseURL        string
+	client         *http.Client
+	stopCh         chan struct{}
+	botID          int64
+	mu             sync.Mutex
 }
 
 // NewTelegram creates a new Telegram channel.
-func NewTelegram(botToken string, opts ChannelOptions) *TelegramChannel {
+func NewTelegram(botToken string, allowedUsers []string, opts ChannelOptions) *TelegramChannel {
 	return &TelegramChannel{
-		Token:   botToken,
-		Options: opts,
-		baseURL: fmt.Sprintf("https://api.telegram.org/bot%s", botToken),
-		client:  &http.Client{Timeout: 60 * time.Second},
-		stopCh:  make(chan struct{}),
+		Token:        botToken,
+		AllowedUsers: allowedUsers,
+		Options:      opts,
+		baseURL:      fmt.Sprintf("https://api.telegram.org/bot%s", botToken),
+		client:       &http.Client{Timeout: 60 * time.Second},
+		stopCh:       make(chan struct{}),
 	}
+}
+
+// isAllowedUser returns true when AllowedUsers is empty (allow all) or the
+// given userID is present in the whitelist.
+func (t *TelegramChannel) isAllowedUser(userID string) bool {
+	if len(t.AllowedUsers) == 0 {
+		return true
+	}
+	for _, id := range t.AllowedUsers {
+		if id == userID {
+			return true
+		}
+	}
+	return false
 }
 
 func (t *TelegramChannel) Name() string { return "telegram" }
@@ -68,6 +85,20 @@ func (t *TelegramChannel) Start(handler MessageHandler) error {
 		for _, update := range updates {
 			offset = update.UpdateID + 1
 
+			// Handle inline-keyboard button presses.
+			if update.CallbackQuery != nil {
+				cq := update.CallbackQuery
+				t.answerCallbackQuery(cq.ID) // dismiss the loading spinner immediately
+				if t.AnswerCallback != nil && cq.Message != nil {
+					senderID := fmt.Sprintf("%d", cq.From.ID)
+					if t.isAllowedUser(senderID) {
+						chatID := fmt.Sprintf("%d", cq.Message.Chat.ID)
+						t.AnswerCallback(chatID, cq.Data)
+					}
+				}
+				continue
+			}
+
 			if update.Message == nil || update.Message.Text == "" {
 				continue
 			}
@@ -77,10 +108,15 @@ func (t *TelegramChannel) Start(handler MessageHandler) error {
 				continue
 			}
 
+			senderID := fmt.Sprintf("%d", update.Message.From.ID)
+			if !t.isAllowedUser(senderID) {
+				continue // silently ignore non-whitelisted users
+			}
+
 			msg := IncomingMessage{
 				ChannelType: "telegram",
 				ChannelID:   fmt.Sprintf("%d", update.Message.Chat.ID),
-				SenderID:    fmt.Sprintf("%d", update.Message.From.ID),
+				SenderID:    senderID,
 				SenderName:  update.Message.From.FirstName,
 				Text:        update.Message.Text,
 				ReplyTo:     fmt.Sprintf("%d", update.Message.MessageID),
@@ -170,8 +206,21 @@ func (t *TelegramChannel) Reply(chatID, replyToID, text string) error {
 // --- Telegram API types ---
 
 type tgUpdate struct {
-	UpdateID int        `json:"update_id"`
-	Message  *tgMessage `json:"message"`
+	UpdateID      int              `json:"update_id"`
+	Message       *tgMessage       `json:"message"`
+	CallbackQuery *tgCallbackQuery `json:"callback_query"`
+}
+
+type tgCallbackQuery struct {
+	ID      string     `json:"id"`
+	From    tgUser     `json:"from"`
+	Message *tgMessage `json:"message"`
+	Data    string     `json:"data"`
+}
+
+type tgInlineButton struct {
+	Text         string `json:"text"`
+	CallbackData string `json:"callback_data"`
 }
 
 type tgMessage struct {
@@ -355,6 +404,52 @@ func (t *TelegramChannel) doSendChunk(chatID, text string, replyTo int, parseMod
 		return fmt.Sprintf("%d", msg.MessageID), nil
 	}
 	return "", nil
+}
+
+// answerCallbackQuery acknowledges a Telegram callback query to dismiss the
+// loading spinner shown on the button. Errors are silently ignored.
+func (t *TelegramChannel) answerCallbackQuery(callbackQueryID string) {
+	payload := map[string]interface{}{"callback_query_id": callbackQueryID}
+	data, _ := json.Marshal(payload)
+	resp, err := t.client.Post(t.baseURL+"/answerCallbackQuery", "application/json", bytes.NewReader(data))
+	if err == nil {
+		resp.Body.Close()
+	}
+}
+
+// SendQuestion sends a question to a Telegram chat. When options are provided
+// they are rendered as a single-column inline keyboard; otherwise plain text.
+func (t *TelegramChannel) SendQuestion(channelID, question string, options []string) error {
+	payload := map[string]interface{}{
+		"chat_id": channelID,
+		"text":    "❓ " + question,
+	}
+	if len(options) > 0 {
+		rows := make([][]tgInlineButton, len(options))
+		for i, opt := range options {
+			rows[i] = []tgInlineButton{{Text: opt, CallbackData: opt}}
+		}
+		payload["reply_markup"] = map[string]interface{}{
+			"inline_keyboard": rows,
+		}
+	}
+
+	data, _ := json.Marshal(payload)
+	resp, err := t.client.Post(t.baseURL+"/sendMessage", "application/json", bytes.NewReader(data))
+	if err != nil {
+		return fmt.Errorf("failed to send Telegram question: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	var tgResp tgResponse
+	if err := json.Unmarshal(body, &tgResp); err != nil {
+		return err
+	}
+	if !tgResp.OK {
+		return fmt.Errorf("Telegram sendMessage failed: %s", tgResp.Description)
+	}
+	return nil
 }
 
 // splitTextChunks splits text into chunks of at most maxLen characters,

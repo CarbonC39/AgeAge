@@ -39,9 +39,10 @@ type PipelineExecutor struct {
 	debug     bool
 
 	// Todo notification callbacks — mirror the parent Agent fields.
-	sendFn   func(text string) string
-	editFn   func(msgID, text string) error
-	notifyFn func(message string)
+	sendFn        func(text string) string
+	editFn        func(msgID, text string) error
+	notifyFn      func(message string)
+	askUserNotify func(string, []string) // Propagated to pipeline sub-agents for ask_user tool
 
 	// Passed through to sub-agents for supervised-mode confirmations.
 	confirmMgr *tools.ConfirmationManager
@@ -62,6 +63,7 @@ func NewPipelineExecutor(
 	sendFn func(text string) string,
 	editFn func(msgID, text string) error,
 	notifyFn func(message string),
+	askUserNotify func(string, []string),
 	confirmMgr *tools.ConfirmationManager,
 	channelID string,
 	sharedReg *tools.Registry,
@@ -81,19 +83,20 @@ func NewPipelineExecutor(
 	}
 
 	return &PipelineExecutor{
-		ps:         ps,
-		skill:      skill,
-		factory:    factory,
-		sharedReg:  sharedReg,
-		vars:       vars,
-		nestDepth:  nestDepth,
-		debug:      factory.Debug,
-		sendFn:     sendFn,
-		editFn:     editFn,
-		notifyFn:   notifyFn,
-		confirmMgr: confirmMgr,
-		channelID:  channelID,
-		nodeStatus: status,
+		ps:            ps,
+		skill:         skill,
+		factory:       factory,
+		sharedReg:     sharedReg,
+		vars:          vars,
+		nestDepth:     nestDepth,
+		debug:         factory.Debug,
+		sendFn:        sendFn,
+		editFn:        editFn,
+		notifyFn:      notifyFn,
+		askUserNotify: askUserNotify,
+		confirmMgr:    confirmMgr,
+		channelID:     channelID,
+		nodeStatus:    status,
 	}
 }
 
@@ -431,6 +434,7 @@ func (e *PipelineExecutor) execAgentNode(ctx context.Context, node skills.Pipeli
 	subAgent.IsSubAgent = true
 	subAgent.InjectSoul = node.InjectSoul
 	subAgent.InjectContext = !node.NoContext // default true; opt-out per node with no_context: true
+	subAgent.AskUserNotify = e.askUserNotify // propagate so ask_user tool can reach the user
 	if e.factory.Config.SubAgent.MaxIterations > 0 {
 		subAgent.MaxIterations = e.factory.Config.SubAgent.MaxIterations
 	}
@@ -544,11 +548,12 @@ func (e *PipelineExecutor) execNestedPipeline(ctx context.Context, node skills.P
 		e.factory,
 		initialInput,
 		e.nestDepth+1,
-		nil, nil, nil, // no independent todo display for nested pipelines
+		nil, nil, nil, nil, // no independent todo display for nested pipelines
 		e.confirmMgr,
 		e.channelID,
 		e.sharedReg,
 	)
+	nestedExec.askUserNotify = e.askUserNotify
 	// Apply all resolved inputs as nested vars (including non-"input" keys).
 	for k, v := range extraVars {
 		nestedExec.vars[k] = v

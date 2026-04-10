@@ -414,37 +414,48 @@ func detectPython() string {
 // If no channels are enabled, returns nil manager and 0 count.
 func startChannels(factory *agent.AgentFactory) (*channel.Manager, int) {
 	cfg := factory.Config
-	// Per-chat agent pool: each chat/room gets its own persistent agent.
-	agents := make(map[string]*agent.Agent)
+
+	// Session manager — one per .ageage directory (shared across all chats).
+	sm := agent.NewSessionManager(factory.Config.AgeAgeDirPath())
+
+	// Per-session agent pool. In channel mode, session IDs are prefixed with a
+	// sanitised chatKey so each chat's sessions are independent.
+	agents := make(map[string]*agent.Agent) // sessionID → agent
+	activeSessions := make(map[string]string) // chatKey → active sessionID
 	var agentMu sync.Mutex
 
 	confirmMgr := tools.NewConfirmationManager()
 
-	// We'll need a way for NotifyFunc to access the channels to send messages.
-	// We'll set this up after creating the manager.
 	var managerPtr *channel.Manager
-	// channelsByType maps channel name → Channel, for editable-channel lookups.
 	channelsByType := make(map[string]channel.Channel)
 
-	getAgent := func(key string, chatKey string) (*agent.Agent, error) {
-		agentMu.Lock()
-		defer agentMu.Unlock()
-		if ag, ok := agents[key]; ok {
-			return ag, nil
+	// chatSessionID returns the active session ID for a chatKey, creating the
+	// default session on first access. Must be called with agentMu held.
+	chatSessionID := func(chatKey string) string {
+		if id, ok := activeSessions[chatKey]; ok {
+			return id
 		}
+		id := agent.SanitizeSessionID(chatKey)
+		_ = sm.EnsureSession(id)
+		activeSessions[chatKey] = id
+		return id
+	}
 
-		ag := factory.CreateAgent(confirmMgr, "")
-
+	// makeChatAgent creates an agent for a session, wires IM callbacks, and
+	// optionally loads existing history. Must be called with agentMu held.
+	makeChatAgent := func(chatKey, sessionID string) *agent.Agent {
 		parts := strings.SplitN(chatKey, ":", 2)
 		channelType, channelID := "", ""
 		if len(parts) == 2 {
 			channelType, channelID = parts[0], parts[1]
 		}
 
-		// Wire up todo send/edit if the channel supports message editing.
+		ag := factory.CreateAgent(confirmMgr, "")
+		ag.SessionDir = sm.SessionDir(sessionID)
+
 		if ch, ok := channelsByType[channelType]; ok {
 			if editable, ok := ch.(channel.Editable); ok {
-				cID := channelID // capture for closures
+				cID := channelID
 				ag.TodoSendFunc = func(text string) string {
 					msgID, err := editable.SendMessage(cID, text)
 					if err != nil {
@@ -457,16 +468,16 @@ func startChannels(factory *agent.AgentFactory) (*channel.Manager, int) {
 				}
 			}
 		}
-
-		// NotifyFunc is the fallback for channels without editing support.
 		ag.NotifyFunc = func(message string) {
 			if managerPtr != nil && channelType != "" {
 				managerPtr.Send(channelType, channelID, message)
 			}
 		}
-
-		// ToolStartCallback: send a Markdown diff block to the channel when the
-		// agent writes or edits a file, so IM users can see what changed.
+		ag.AskUserNotify = func(question string, options []string) {
+			if managerPtr != nil && channelType != "" {
+				managerPtr.SendQuestion(channelType, channelID, question, options)
+			}
+		}
 		notifyFn := ag.NotifyFunc
 		ag.ToolStartCallback = func(name, args string) {
 			if notifyFn == nil {
@@ -497,14 +508,31 @@ func startChannels(factory *agent.AgentFactory) (*channel.Manager, int) {
 			}
 		}
 
-		agents[key] = ag
-		return ag, nil
+		// Load existing conversation history.
+		if msgs, err := sm.LoadHistory(sessionID); err == nil && len(msgs) > 0 {
+			ag.SetMessages(msgs)
+		}
+
+		return ag
+	}
+
+	// getAgent returns the agent for the chatKey's active session, creating it
+	// on first access.
+	getAgent := func(chatKey string) (*agent.Agent, string) {
+		agentMu.Lock()
+		defer agentMu.Unlock()
+		sessionID := chatSessionID(chatKey)
+		if ag, ok := agents[sessionID]; ok {
+			return ag, sessionID
+		}
+		ag := makeChatAgent(chatKey, sessionID)
+		agents[sessionID] = ag
+		return ag, sessionID
 	}
 
 	// Per-chat mutexes to ensure sequential processing in each chat.
 	chatMu := make(map[string]*sync.Mutex)
 	var chatMuLock sync.Mutex
-
 	getChatMutex := func(chatKey string) *sync.Mutex {
 		chatMuLock.Lock()
 		defer chatMuLock.Unlock()
@@ -516,17 +544,146 @@ func startChannels(factory *agent.AgentFactory) (*channel.Manager, int) {
 		return mu
 	}
 
+	// handleSessionCmd processes /session sub-commands for a given chatKey.
+	// The defaultPrefix is the sanitised chatKey (session ID prefix for this chat).
+	handleSessionCmd := func(chatKey, rawInput string) string {
+		defaultPrefix := agent.SanitizeSessionID(chatKey)
+
+		// /session display name ↔ full session ID mapping helpers.
+		toFullID := func(name string) string {
+			if name == "default" || name == "" {
+				return defaultPrefix
+			}
+			return defaultPrefix + "-" + agent.SanitizeSessionID(name)
+		}
+		toDisplayName := func(fullID string) string {
+			if fullID == defaultPrefix {
+				return "default"
+			}
+			return strings.TrimPrefix(fullID, defaultPrefix+"-")
+		}
+
+		agentMu.Lock()
+		currentSessionID := chatSessionID(chatKey)
+		agentMu.Unlock()
+
+		parts := strings.Fields(rawInput)
+		sub := ""
+		if len(parts) >= 2 {
+			sub = strings.ToLower(parts[1])
+		}
+
+		switch sub {
+		case "": // /session — show current session
+			infos, _ := sm.ListWithPrefix(defaultPrefix)
+			cur := toDisplayName(currentSessionID)
+			var sb strings.Builder
+			fmt.Fprintf(&sb, "**Current session:** %s\n", cur)
+			if len(infos) > 1 {
+				sb.WriteString("_Use /session list to see all sessions._")
+			}
+			return sb.String()
+
+		case "list":
+			infos, err := sm.ListWithPrefix(defaultPrefix)
+			if err != nil || len(infos) == 0 {
+				return "No sessions found."
+			}
+			cur := toDisplayName(currentSessionID)
+			var sb strings.Builder
+			sb.WriteString("**Sessions:**\n")
+			for _, si := range infos {
+				marker := ""
+				if si.ID == cur {
+					marker = " ← current"
+				}
+				fmt.Fprintf(&sb, "• %s (%d messages)%s\n", si.ID, si.MessageCount, marker)
+			}
+			return strings.TrimRight(sb.String(), "\n")
+
+		case "new":
+			name := ""
+			if len(parts) >= 3 {
+				name = strings.Join(parts[2:], "-")
+			} else {
+				name = fmt.Sprintf("session-%d", len(agents))
+			}
+			newFullID := toFullID(name)
+
+			// Save current agent history.
+			agentMu.Lock()
+			if curAg, ok := agents[currentSessionID]; ok {
+				_ = sm.SaveHistory(currentSessionID, curAg.Messages())
+			}
+			// Create new agent for new session.
+			if err := sm.EnsureSession(newFullID); err != nil {
+				agentMu.Unlock()
+				return fmt.Sprintf("❌ Failed to create session: %s", err)
+			}
+			newAg := makeChatAgent(chatKey, newFullID)
+			agents[newFullID] = newAg
+			activeSessions[chatKey] = newFullID
+			agentMu.Unlock()
+			return fmt.Sprintf("✅ Switched to new session **%s**.", toDisplayName(newFullID))
+
+		case "switch":
+			if len(parts) < 3 {
+				return "Usage: /session switch <name>"
+			}
+			name := strings.Join(parts[2:], "-")
+			newFullID := toFullID(name)
+			if _, err := sm.LoadHistory(newFullID); err != nil {
+				// Check if directory exists
+				if _, statErr := os.Stat(sm.SessionDir(newFullID)); os.IsNotExist(statErr) {
+					return fmt.Sprintf("❌ Session '%s' does not exist. Use /session new %s to create it.", name, name)
+				}
+			}
+			agentMu.Lock()
+			if curAg, ok := agents[currentSessionID]; ok {
+				_ = sm.SaveHistory(currentSessionID, curAg.Messages())
+			}
+			_ = sm.EnsureSession(newFullID)
+			if _, ok := agents[newFullID]; !ok {
+				newAg := makeChatAgent(chatKey, newFullID)
+				agents[newFullID] = newAg
+			}
+			activeSessions[chatKey] = newFullID
+			agentMu.Unlock()
+			return fmt.Sprintf("✅ Switched to session **%s**.", toDisplayName(newFullID))
+
+		case "delete":
+			if len(parts) < 3 {
+				return "Usage: /session delete <name>"
+			}
+			name := strings.Join(parts[2:], "-")
+			delFullID := toFullID(name)
+			if delFullID == currentSessionID {
+				return "❌ Cannot delete the active session. Switch to another session first."
+			}
+			agentMu.Lock()
+			delete(agents, delFullID)
+			agentMu.Unlock()
+			if err := sm.Delete(delFullID); err != nil {
+				return fmt.Sprintf("❌ Failed to delete session: %s", err)
+			}
+			return fmt.Sprintf("🗑️ Deleted session **%s**.", toDisplayName(delFullID))
+
+		default:
+			return "Usage: /session [list | new [name] | switch <name> | delete <name>]"
+		}
+	}
+
 	handler := func(msg channel.IncomingMessage) string {
-		text := strings.TrimSpace(strings.ToLower(msg.Text))
+		text := strings.TrimSpace(msg.Text)
+		textLow := strings.ToLower(text)
 		chatKey := msg.ChannelType + ":" + msg.ChannelID
 
-		// Confirmation responses (y/n/a) bypass the per-chat mutex to avoid
-		// deadlocking with the agent that is waiting for the confirmation.
-		if text == "y" || text == "n" || text == "a" {
+		// Confirmation responses bypass the per-chat mutex.
+		if textLow == "y" || textLow == "n" || textLow == "a" {
 			pending := confirmMgr.GetAllPending(msg.ChannelID)
 			if len(pending) > 0 {
 				pc := pending[0]
-				allowed := (text == "y" || text == "a")
+				allowed := (textLow == "y" || textLow == "a")
 				confirmMgr.RespondToConfirmation(pc.ID, allowed)
 				if !allowed {
 					return "❌ Operation denied."
@@ -535,15 +692,24 @@ func startChannels(factory *agent.AgentFactory) (*channel.Manager, int) {
 			}
 		}
 
-		// /stop also bypasses the per-chat mutex: the mutex is held by the
-		// running agent, so waiting for it would make /stop arrive too late.
-		if text == "/stop" {
+		// /stop and /session abort bypass the per-chat mutex (may be held by the agent).
+		if textLow == "/stop" || textLow == "/session abort" {
 			agentMu.Lock()
-			if ag, ok := agents[chatKey]; ok {
-				ag.Stop()
+			if sessionID, ok := activeSessions[chatKey]; ok {
+				if ag, ok := agents[sessionID]; ok {
+					ag.Stop()
+				}
 			}
 			agentMu.Unlock()
+			factory.UserInputMgr.Cancel(msg.ChannelID)
 			return "🛑 Task stopped."
+		}
+
+		// If a pipeline node is waiting for user input, route this message to it
+		// instead of starting a new agent run.
+		if factory.UserInputMgr.HasPending(msg.ChannelID) {
+			factory.UserInputMgr.Respond(msg.ChannelID, text)
+			return "✅ Got it."
 		}
 
 		// All other messages are processed sequentially per chat.
@@ -555,25 +721,29 @@ func startChannels(factory *agent.AgentFactory) (*channel.Manager, int) {
 			fmt.Printf("\n  ▸ [%s] %s: %s\n", msg.ChannelType, msg.SenderName, msg.Text)
 		}
 
-		// Use lowercased `text` so commands are case-insensitive.
-		switch text {
+		// /session commands.
+		if strings.HasPrefix(textLow, "/session") {
+			return handleSessionCmd(chatKey, text)
+		}
+
+		switch textLow {
 		case "/clear":
 			agentMu.Lock()
-			if ag, ok := agents[chatKey]; ok {
+			sessionID := chatSessionID(chatKey)
+			if ag, ok := agents[sessionID]; ok {
 				ag.ClearHistory()
+				_ = sm.SaveHistory(sessionID, ag.Messages())
 			}
 			agentMu.Unlock()
 			return "🗑️ Conversation history cleared."
 
 		case "/summarize":
-			ag, err := getAgent(chatKey, chatKey)
-			if err != nil {
-				return fmt.Sprintf("Error: %s", err)
-			}
+			ag, sessionID := getAgent(chatKey)
 			summary, err := ag.ForceSummarize()
 			if err != nil {
 				return fmt.Sprintf("❌ %s", err)
 			}
+			_ = sm.SaveHistory(sessionID, ag.Messages())
 			return fmt.Sprintf("📋 Summary:\n%s", summary)
 
 		case "/help":
@@ -581,18 +751,16 @@ func startChannels(factory *agent.AgentFactory) (*channel.Manager, int) {
 				"/clear — Clear conversation history\n" +
 				"/stop — Stop the current task\n" +
 				"/summarize — Summarize conversation\n" +
+				"/session — Manage sessions (list, new, switch, delete)\n" +
 				"/help — Show this help"
 		}
 
-		ag, err := getAgent(chatKey, chatKey)
-		if err != nil {
-			return fmt.Sprintf("Error initializing agent: %s", err)
-		}
-
-		// Set current channel ID for tools to use.
+		ag, sessionID := getAgent(chatKey)
 		ag.SetChannelID(msg.ChannelID)
 
 		result, err := ag.Run(context.Background(), msg.Text, nil)
+		// Save history after every run (best-effort; ignore errors).
+		_ = sm.SaveHistory(sessionID, ag.Messages())
 		if err != nil {
 			return fmt.Sprintf("Agent error: %s", err)
 		}
@@ -611,7 +779,8 @@ func startChannels(factory *agent.AgentFactory) (*channel.Manager, int) {
 		if cfg.Channels.Telegram.BotToken == "" {
 			fmt.Println("  ⚠  Telegram: bot_token not set, skipping")
 		} else {
-			tg := channel.NewTelegram(cfg.Channels.Telegram.BotToken, opts)
+			tg := channel.NewTelegram(cfg.Channels.Telegram.BotToken, cfg.Channels.Telegram.AllowedUsers, opts)
+			tg.AnswerCallback = func(channelID, answer string) { factory.UserInputMgr.Respond(channelID, answer) }
 			manager.Register(tg)
 			channelsByType["telegram"] = tg
 			fmt.Println("  ✓  Telegram")
@@ -625,7 +794,9 @@ func startChannels(factory *agent.AgentFactory) (*channel.Manager, int) {
 		} else if len(cfg.Channels.Discord.ChannelIDs) == 0 {
 			fmt.Println("  ⚠  Discord: no channel_ids configured, skipping")
 		} else {
-			manager.Register(channel.NewDiscord(cfg.Channels.Discord.BotToken, cfg.Channels.Discord.ChannelIDs, opts))
+			dc := channel.NewDiscord(cfg.Channels.Discord.BotToken, cfg.Channels.Discord.ChannelIDs, cfg.Channels.Discord.AllowedUsers, opts)
+			manager.Register(dc)
+			channelsByType["discord"] = dc
 			fmt.Println("  ✓  Discord")
 			registered++
 		}
@@ -640,6 +811,7 @@ func startChannels(factory *agent.AgentFactory) (*channel.Manager, int) {
 				cfg.Channels.Matrix.UserID,
 				cfg.Channels.Matrix.AccessToken,
 				cfg.Channels.Matrix.RoomIDs,
+				cfg.Channels.Matrix.AllowedUsers,
 				opts,
 			)
 			manager.Register(mx)
@@ -783,10 +955,56 @@ func runCLI(cmd *cobra.Command, args []string) error {
 	defer watchCancel()
 	go factory.WatchSkills(watchCtx)
 
-	ag := factory.CreateAgent(nil, "")
+	// ── Session setup ─────────────────────────────────────────────────────────
+	sm := agent.NewSessionManager(factory.Config.AgeAgeDirPath())
+	activeSessionID := "default"
+	if err := sm.EnsureSession(activeSessionID); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not initialise session: %s\n", err)
+	}
+
+	// createSessionAgent builds a fresh agent wired to a session directory.
+	createSessionAgent := func(sessionID string) *agent.Agent {
+		newAg := factory.CreateAgent(nil, "")
+		newAg.SessionDir = sm.SessionDir(sessionID)
+		newAg.AskUserNotify = func(question string, options []string) {
+			// Print the question; the spinner is stopped by ToolStartCallback.
+			fmt.Println()
+			fmt.Printf("  ❓ %s\n", question)
+			for i, opt := range options {
+				fmt.Printf("     %d. %s\n", i+1, opt)
+			}
+			fmt.Println("  (Type your answer, or /stop to cancel)")
+		}
+		return newAg
+	}
+
+	ag := createSessionAgent(activeSessionID)
+
+	// Load existing history so the conversation resumes after a restart.
+	if msgs, err := sm.LoadHistory(activeSessionID); err == nil && len(msgs) > 0 {
+		ag.SetMessages(msgs)
+	}
+
+	// switchSession saves the current agent's history, then loads (or creates)
+	// the target session and returns a fresh agent for it.
+	switchSession := func(newID string) (*agent.Agent, error) {
+		_ = sm.SaveHistory(activeSessionID, ag.Messages())
+		if err := sm.EnsureSession(newID); err != nil {
+			return nil, err
+		}
+		newAg := createSessionAgent(newID)
+		if msgs, err := sm.LoadHistory(newID); err == nil && len(msgs) > 0 {
+			newAg.SetMessages(msgs)
+		}
+		activeSessionID = newID
+		return newAg, nil
+	}
 
 	ui := newCLIUI(factory.Config.LLM.Model)
 	ui.printBanner()
+	if len(ag.Messages()) > 0 {
+		ui.printInfo(fmt.Sprintf("Resumed session '%s'.", activeSessionID))
+	}
 
 	// Read stdin in a dedicated goroutine so the main loop can remain
 	// responsive (e.g. to /stop) while the agent is running.
@@ -801,6 +1019,8 @@ func runCLI(cmd *cobra.Command, args []string) error {
 	}()
 
 	// Ctrl+C: stop the running agent gracefully; if idle, exit.
+	// The signal handler captures `ag` by variable reference so it always sees
+	// the current agent even after a session switch.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
@@ -833,13 +1053,95 @@ func runCLI(cmd *cobra.Command, args []string) error {
 				continue
 			}
 
+			// ── /session commands ──────────────────────────────────────────────
+			if strings.HasPrefix(strings.ToLower(input), "/session") {
+				parts := strings.Fields(input)
+				sub := ""
+				if len(parts) >= 2 {
+					sub = strings.ToLower(parts[1])
+				}
+				switch sub {
+				case "": // /session — show current session info
+					infos, _ := sm.ListWithPrefix("")
+					ui.printInfo(fmt.Sprintf("Current session: %s", activeSessionID))
+					if len(infos) > 1 {
+						ui.printInfo("Use /session list to see all sessions.")
+					}
+				case "list":
+					infos, err := sm.List()
+					if err != nil || len(infos) == 0 {
+						ui.printInfo("No sessions found.")
+					} else {
+						fmt.Println()
+						for _, si := range infos {
+							marker := ""
+							if si.ID == activeSessionID {
+								marker = "  ← current"
+							}
+							fmt.Printf("  • %-20s %d messages%s\n", si.ID, si.MessageCount, marker)
+						}
+						fmt.Println()
+					}
+				case "new":
+					newName := ""
+					if len(parts) >= 3 {
+						newName = agent.SanitizeSessionID(strings.Join(parts[2:], "-"))
+					} else {
+						newName = fmt.Sprintf("session-%d", len(strings.Fields(activeSessionID)))
+					}
+					newAg, err := switchSession(newName)
+					if err != nil {
+						ui.printErr(fmt.Sprintf("Failed to create session: %s", err))
+					} else {
+						ag = newAg
+						ui.printOK(fmt.Sprintf("Switched to new session '%s'.", activeSessionID))
+					}
+				case "switch":
+					if len(parts) < 3 {
+						ui.printWarn("Usage: /session switch <name>")
+					} else {
+						targetID := agent.SanitizeSessionID(strings.Join(parts[2:], "-"))
+						if _, statErr := os.Stat(sm.SessionDir(targetID)); os.IsNotExist(statErr) {
+							ui.printErr(fmt.Sprintf("Session '%s' does not exist.", targetID))
+						} else {
+							newAg, err := switchSession(targetID)
+							if err != nil {
+								ui.printErr(fmt.Sprintf("Failed to switch session: %s", err))
+							} else {
+								ag = newAg
+								ui.printOK(fmt.Sprintf("Switched to session '%s'.", activeSessionID))
+							}
+						}
+					}
+				case "delete":
+					if len(parts) < 3 {
+						ui.printWarn("Usage: /session delete <name>")
+					} else {
+						delID := agent.SanitizeSessionID(strings.Join(parts[2:], "-"))
+						if delID == activeSessionID {
+							ui.printErr("Cannot delete the active session.")
+						} else if err := sm.Delete(delID); err != nil {
+							ui.printErr(fmt.Sprintf("Failed to delete session: %s", err))
+						} else {
+							ui.printOK(fmt.Sprintf("Deleted session '%s'.", delID))
+						}
+					}
+				default:
+					ui.printWarn("Usage: /session [list | new [name] | switch <name> | delete <name>]")
+				}
+				ui.printPrompt()
+				continue
+			}
+
 			switch input {
 			case "exit", "quit":
+				_ = sm.SaveHistory(activeSessionID, ag.Messages())
 				ui.printInfo("Goodbye!")
 				return nil
 
 			case "/clear":
 				ag.ClearHistory()
+				_ = sm.SaveHistory(activeSessionID, ag.Messages())
 				ui.printOK("History cleared.")
 				ui.printPrompt()
 
@@ -856,6 +1158,7 @@ func runCLI(cmd *cobra.Command, args []string) error {
 					fmt.Println()
 					fmt.Println(summary)
 					fmt.Println()
+					_ = sm.SaveHistory(activeSessionID, ag.Messages())
 				}
 				ui.printPrompt()
 
@@ -894,6 +1197,8 @@ func runCLI(cmd *cobra.Command, args []string) error {
 						if json.Unmarshal([]byte(args), &p) == nil && p.Path != "" {
 							ui.printFileEdit(p.Path, p.Search, p.Replace)
 						}
+					case "ask_user":
+						spinner.Stop() // AskUserNotify will print the question
 					default:
 						label := name
 						spinner.Update("Running " + label + "…")
@@ -929,6 +1234,8 @@ func runCLI(cmd *cobra.Command, args []string) error {
 			select {
 			case res := <-agentCh:
 				agentCh = nil
+				// Save history after every completed turn (best-effort).
+				_ = sm.SaveHistory(activeSessionID, ag.Messages())
 				if res.err != nil {
 					fmt.Println()
 					ui.printErr(res.err.Error())
@@ -945,18 +1252,26 @@ func runCLI(cmd *cobra.Command, args []string) error {
 			case input, ok := <-inputCh:
 				if !ok {
 					ag.Stop()
+					factory.UserInputMgr.Cancel("")
 					<-agentCh
+					_ = sm.SaveHistory(activeSessionID, ag.Messages())
 					return nil
 				}
-				if strings.TrimSpace(input) == "/stop" {
+				trimmed := strings.TrimSpace(input)
+				if trimmed == "/stop" {
 					ag.Stop()
+					factory.UserInputMgr.Cancel("")
 					fmt.Println()
 					ui.printWarn("Stop signal sent.")
+				} else if factory.UserInputMgr.HasPending("") {
+					// A pipeline node is waiting for user input — deliver the answer.
+					factory.UserInputMgr.Respond("", trimmed)
 				}
 			}
 		}
 	}
 
+	_ = sm.SaveHistory(activeSessionID, ag.Messages())
 	return nil
 }
 

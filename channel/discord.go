@@ -13,27 +13,43 @@ import (
 
 // DiscordChannel connects to Discord via Bot API (REST polling).
 type DiscordChannel struct {
-	Token      string   // Bot token (without "Bot " prefix)
-	ChannelIDs []string // Channel IDs to monitor
-	Options    ChannelOptions
-	baseURL    string
-	client     *http.Client
-	stopCh     chan struct{}
-	lastMsgIDs map[string]string // Track last seen message per channel
-	mu         sync.Mutex
+	Token        string   // Bot token (without "Bot " prefix)
+	ChannelIDs   []string // Channel IDs to monitor
+	AllowedUsers []string // Discord user IDs allowed to interact; empty = allow all
+	Options      ChannelOptions
+	baseURL      string
+	client       *http.Client
+	stopCh       chan struct{}
+	lastMsgIDs   map[string]string // Track last seen message per channel
+	mu           sync.Mutex
 }
 
 // NewDiscord creates a new Discord channel.
-func NewDiscord(botToken string, channelIDs []string, opts ChannelOptions) *DiscordChannel {
+func NewDiscord(botToken string, channelIDs []string, allowedUsers []string, opts ChannelOptions) *DiscordChannel {
 	return &DiscordChannel{
-		Token:      botToken,
-		ChannelIDs: channelIDs,
-		Options:    opts,
-		baseURL:    "https://discord.com/api/v10",
-		client:     &http.Client{Timeout: 30 * time.Second},
-		stopCh:     make(chan struct{}),
-		lastMsgIDs: make(map[string]string),
+		Token:        botToken,
+		ChannelIDs:   channelIDs,
+		AllowedUsers: allowedUsers,
+		Options:      opts,
+		baseURL:      "https://discord.com/api/v10",
+		client:       &http.Client{Timeout: 30 * time.Second},
+		stopCh:       make(chan struct{}),
+		lastMsgIDs:   make(map[string]string),
 	}
+}
+
+// isAllowedUser returns true when AllowedUsers is empty (allow all) or the
+// given userID is present in the whitelist.
+func (d *DiscordChannel) isAllowedUser(userID string) bool {
+	if len(d.AllowedUsers) == 0 {
+		return true
+	}
+	for _, id := range d.AllowedUsers {
+		if id == userID {
+			return true
+		}
+	}
+	return false
 }
 
 func (d *DiscordChannel) Name() string { return "discord" }
@@ -259,6 +275,10 @@ func (d *DiscordChannel) pollChannel(channelID, botID string, handler MessageHan
 		d.mu.Lock()
 		d.lastMsgIDs[channelID] = msg.ID
 		d.mu.Unlock()
+
+		if !d.isAllowedUser(msg.Author.ID) {
+			continue // silently ignore non-whitelisted users
+		}
 
 		incoming := IncomingMessage{
 			ChannelType: "discord",

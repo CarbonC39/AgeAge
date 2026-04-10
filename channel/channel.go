@@ -2,6 +2,7 @@ package channel
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 )
 
@@ -13,6 +14,7 @@ type IncomingMessage struct {
 	SenderName  string // Display name
 	Text        string // Message content
 	ReplyTo     string // Message ID to reply to (if applicable)
+	ThreadID    string // Thread/topic ID within the channel (Discord threads, etc.); empty if not in a thread
 }
 
 // ChannelOptions holds common settings passed to all channel connectors.
@@ -48,6 +50,16 @@ type Editable interface {
 	SendMessage(channelID, text string) (messageID string, err error)
 	// EditMessage replaces the content of a previously sent message.
 	EditMessage(channelID, messageID, text string) error
+}
+
+// InteractiveChannel is an optional interface for channels that support
+// rendering multiple-choice options as interactive elements (e.g. Telegram
+// inline keyboard buttons). Channels that don't implement this receive a
+// plain numbered text list instead.
+type InteractiveChannel interface {
+	// SendQuestion sends a question to channelID. If options is non-empty and
+	// the channel supports interactive elements, they are rendered as buttons.
+	SendQuestion(channelID, question string, options []string) error
 }
 
 // MessageHandler is called when a message is received from a channel.
@@ -133,5 +145,34 @@ func (m *Manager) Send(channelType, channelID, text string) {
 		if ch.Name() == channelType {
 			ch.Send(channelID, text)
 		}
+	}
+}
+
+// SendQuestion sends a question to a specific channel, using interactive
+// buttons when the channel supports it. Falls back to a numbered text list.
+func (m *Manager) SendQuestion(channelType, channelID, question string, options []string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for _, ch := range m.channels {
+		if ch.Name() != channelType {
+			continue
+		}
+		if ic, ok := ch.(InteractiveChannel); ok {
+			if err := ic.SendQuestion(channelID, question, options); err != nil {
+				fmt.Printf("[%s] SendQuestion error: %s\n", channelType, err)
+			}
+			return
+		}
+		// Plain-text fallback.
+		text := "❓ " + question
+		for i, opt := range options {
+			text += fmt.Sprintf("\n%d. %s", i+1, opt)
+		}
+		if len(options) > 0 {
+			text += "\n" + strings.Repeat("-", 20) + "\nReply with a number or your answer."
+		}
+		ch.Send(channelID, text)
+		return
 	}
 }

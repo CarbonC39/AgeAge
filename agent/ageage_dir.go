@@ -12,16 +12,20 @@ type workspaceSettings struct {
 	AutoAllowCommands []string `json:"auto_allow_commands"`
 }
 
-// EnsureAgeAgeDir creates the .ageage directory structure in workDir.
+// EnsureAgeAgeDir creates the .ageage directory structure inside workDir.
 // Idempotent: safe to call on every startup.
 //
 // Layout:
 //
-//	.ageage/
-//	  .gitignore      — ignores tmp/
-//	  CONTEXT.md      — working notes injected into the system prompt
-//	  settings.json   — persists always-allow command prefixes
-//	  tmp/            — scratch space for temporary data
+//	<workDir>/
+//	  .gitignore               — .ageage/ is appended here if the file exists
+//	  .ageage/
+//	    settings.json          — persists always-allow command prefixes (global)
+//	    tmp/                   — scratch space for temporary data
+//	    sessions/
+//	      default/
+//	        CONTEXT.md         — session-specific notes injected into system prompt
+//	        history.jsonl      — full conversation history (local only)
 func EnsureAgeAgeDir(workDir string) error {
 	ageageDir := filepath.Join(workDir, ".ageage")
 	tmpDir := filepath.Join(ageageDir, "tmp")
@@ -30,21 +34,9 @@ func EnsureAgeAgeDir(workDir string) error {
 		return err
 	}
 
-	// .gitignore — only tmp/ is ignored; CONTEXT.md and settings.json are tracked.
-	gitignorePath := filepath.Join(ageageDir, ".gitignore")
-	if _, err := os.Stat(gitignorePath); os.IsNotExist(err) {
-		if err := os.WriteFile(gitignorePath, []byte("tmp/\n"), 0o644); err != nil {
-			return err
-		}
-	}
-
-	// CONTEXT.md — empty placeholder (populated by the agent over time).
-	contextPath := filepath.Join(ageageDir, "CONTEXT.md")
-	if _, err := os.Stat(contextPath); os.IsNotExist(err) {
-		if err := os.WriteFile(contextPath, []byte(""), 0o644); err != nil {
-			return err
-		}
-	}
+	// If the workspace has a .gitignore, add .ageage/ to it so the entire
+	// metadata directory stays out of the project's git history.
+	addToGitignore(workDir, ".ageage/")
 
 	// settings.json — initially empty auto_allow_commands list.
 	settingsPath := filepath.Join(ageageDir, "settings.json")
@@ -55,7 +47,39 @@ func EnsureAgeAgeDir(workDir string) error {
 		}
 	}
 
+	// Ensure the default session exists.
+	sm := NewSessionManager(ageageDir)
+	if err := sm.EnsureSession("default"); err != nil {
+		return err
+	}
+
 	return nil
+}
+
+// addToGitignore appends entry to workDir/.gitignore if that file exists and
+// does not already contain the entry. A no-op when the file is absent.
+func addToGitignore(workDir, entry string) {
+	gitignorePath := filepath.Join(workDir, ".gitignore")
+	data, err := os.ReadFile(gitignorePath)
+	if err != nil {
+		return // file doesn't exist or unreadable — skip silently
+	}
+
+	// Check if the entry is already present (line-by-line, ignoring whitespace and
+	// trailing slashes so both ".ageage" and ".ageage/" are treated as equivalent).
+	normalized := strings.TrimRight(strings.TrimSpace(entry), "/")
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.TrimRight(strings.TrimSpace(line), "/") == normalized {
+			return // already there
+		}
+	}
+
+	// Append with a leading newline if the file doesn't already end with one.
+	suffix := entry + "\n"
+	if len(data) > 0 && data[len(data)-1] != '\n' {
+		suffix = "\n" + suffix
+	}
+	_ = os.WriteFile(gitignorePath, append(data, []byte(suffix)...), 0o644)
 }
 
 // LoadWorkspaceAutoAllowCommands reads the auto-allow command prefixes from

@@ -183,24 +183,27 @@ type ChannelConfig struct {
 
 // TelegramConfig holds Telegram Bot settings.
 type TelegramConfig struct {
-	Enabled  bool   `toml:"enabled"`
-	BotToken string `toml:"bot_token"`
+	Enabled      bool     `toml:"enabled"`
+	BotToken     string   `toml:"bot_token"`
+	AllowedUsers []string `toml:"allowed_users"` // Telegram user IDs (as strings) that may use the bot; empty = allow all
 }
 
 // DiscordConfig holds Discord Bot settings.
 type DiscordConfig struct {
-	Enabled    bool     `toml:"enabled"`
-	BotToken   string   `toml:"bot_token"`
-	ChannelIDs []string `toml:"channel_ids"` // Discord channel IDs to monitor
+	Enabled      bool     `toml:"enabled"`
+	BotToken     string   `toml:"bot_token"`
+	ChannelIDs   []string `toml:"channel_ids"`   // Discord channel IDs to monitor (required for REST polling)
+	AllowedUsers []string `toml:"allowed_users"` // Discord user IDs that may use the bot; empty = allow all
 }
 
 // MatrixConfig holds Matrix client settings.
 type MatrixConfig struct {
-	Enabled     bool     `toml:"enabled"`
-	Homeserver  string   `toml:"homeserver"` // e.g., "https://matrix.org"
-	UserID      string   `toml:"user_id"`    // e.g., "@bot:matrix.org"
-	AccessToken string   `toml:"access_token"`
-	RoomIDs     []string `toml:"room_ids"` // Room IDs to monitor
+	Enabled      bool     `toml:"enabled"`
+	Homeserver   string   `toml:"homeserver"`    // e.g., "https://matrix.org"
+	UserID       string   `toml:"user_id"`       // e.g., "@bot:matrix.org"
+	AccessToken  string   `toml:"access_token"`
+	RoomIDs      []string `toml:"room_ids"`      // Rooms to monitor; empty = all joined rooms
+	AllowedUsers []string `toml:"allowed_users"` // Matrix user IDs (e.g. "@alice:matrix.org"); empty = allow all
 }
 
 // ServerConfig holds HTTP server settings.

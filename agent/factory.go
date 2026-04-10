@@ -27,6 +27,7 @@ type AgentFactory struct {
 	SecurityChecker *security.Checker
 	Debug           bool
 	CronStore       *tools.CronStore
+	UserInputMgr    *tools.UserInputManager       // Shared ask_user pending-input state
 	HasMemories     bool
 	MCPSessions     map[string]*mcp.ClientSession // Active MCP sessions
 	InjectSoul      bool                          // Passed to each created agent; true in serve/connect, false in CLI
@@ -180,6 +181,7 @@ func NewFactory(configPath string, debug bool) (*AgentFactory, error) {
 		SecurityChecker: sec,
 		Debug:           debug,
 		CronStore:       cronStore,
+		UserInputMgr:    tools.NewUserInputManager(),
 		HasMemories:     hasMemories,
 		MCPSessions:     mcpSessions,
 	}, nil
@@ -249,6 +251,7 @@ func (f *AgentFactory) CreateAgentFiltered(confirmMgr *tools.ConfirmationManager
 		}
 	}
 
+
 	// Helper function to check if a tool should be registered
 	shouldRegisterTool := func(toolName string) bool {
 		if f.Config.ShouldExcludeTool(toolName) {
@@ -280,18 +283,16 @@ func (f *AgentFactory) CreateAgentFiltered(confirmMgr *tools.ConfirmationManager
 		registry.Register(&tools.FileReadTool{Security: f.SecurityChecker})
 	}
 
-	// fileConfirmFunc auto-approves writes/edits targeting .ageage/CONTEXT.md.
-	// FileWriteTool: "Write N bytes to <path>" — path is the last token.
-	// FileEditTool:  "Edit file <path> (replace text)" — path is the second token.
-	// Both reliably contain the absolute path as a whole path segment, so a
-	// path-boundary-aware Contains check suffices; the path itself cannot
-	// appear as a substring of another valid path at this position.
-	contextMDPath := filepath.ToSlash(f.Config.ContextMDPath())
+	// fileConfirmFunc auto-approves writes/edits targeting any session's CONTEXT.md.
+	// Operation string formats:
+	//   FileWriteTool: "Write N bytes to `<abs-path>`"
+	//   FileEditTool:  "Edit file `<abs-path>` (replace text)"
+	// Both contain the absolute path as a distinct segment, so checking for the
+	// canonical sub-path "/.ageage/sessions/<id>/CONTEXT.md" is sufficient.
 	fileConfirmFunc := func(operation string) bool {
 		slashed := filepath.ToSlash(operation)
-		// Require the path to be preceded by a space (word boundary) so a
-		// path like /foo/CONTEXT.md doesn't accidentally match /bar/foo/CONTEXT.md.
-		if strings.Contains(slashed, " "+contextMDPath) {
+		// Match any session CONTEXT.md: */.ageage/sessions/<id>/CONTEXT.md
+		if strings.Contains(slashed, "/.ageage/sessions/") && strings.Contains(slashed, "/CONTEXT.md") {
 			return true
 		}
 		return confirmFunc(operation)

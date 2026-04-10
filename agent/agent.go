@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"runtime"
 	"strings"
@@ -42,12 +43,14 @@ type Agent struct {
 	cancelMu         sync.Mutex
 	currentChannelID string                         // For async confirmations in channel mode
 	ConfirmationMgr  *tools.ConfirmationManager     // Optional: for async confirmations
-	NotifyFunc       func(message string)           // Optional: for sending notifications to the channel
-	TodoSendFunc     func(text string) string       // Optional: send a todo notification, returns message ID
-	TodoEditFunc     func(msgID, text string) error // Optional: edit a previously sent todo notification
+	NotifyFunc       func(message string)                    // Optional: for sending notifications to the channel
+	AskUserNotify    func(question string, options []string) // Optional: send ask_user question to the user
+	TodoSendFunc     func(text string) string                // Optional: send a todo notification, returns message ID
+	TodoEditFunc     func(msgID, text string) error          // Optional: edit a previously sent todo notification
 	InjectSoul          bool                           // If true, SOUL.md personality is injected (serve/connect default true; CLI default false)
 	IsSubAgent          bool                           // If true, this is a sub-agent (disables pre-execution and skill-only tool injection)
 	InjectContext       bool                           // If true, .ageage/CONTEXT.md is injected into the system prompt (default true for main agent and pipeline nodes)
+	SessionDir          string                         // Directory for the active session (e.g. .ageage/sessions/default); CONTEXT.md is read from here
 	MaxIterations       int                            // Maximum iterations for this agent run
 	factory             *AgentFactory                  // Back-reference used for skill-only tool injection; nil for manually created agents
 	todoStore           *tools.TodoStore               // Non-nil when update_todos is injected; cleared after finish_task
@@ -82,6 +85,44 @@ func NewAgent(cfg *config.Config, client *llm.Client, registry *tools.Registry, 
 	}
 
 	return ag
+}
+
+// contextMDPath returns the CONTEXT.md path for the agent's active session.
+// When SessionDir is set (session-aware usage) it points to the session's own
+// CONTEXT.md; otherwise it falls back to the workspace-level path.
+func (a *Agent) contextMDPath() string {
+	if a.SessionDir != "" {
+		return filepath.Join(a.SessionDir, "CONTEXT.md")
+	}
+	return a.cfg.ContextMDPath()
+}
+
+// BuildSystemPrompt returns the system prompt string for the current agent
+// state without a specific skill active. Used when restoring history so the
+// fresh context (CONTEXT.md) is embedded in a new system message.
+func (a *Agent) BuildSystemPrompt() string {
+	return a.buildSystemPrompt(nil)
+}
+
+// Messages returns a snapshot of the agent's current message history.
+func (a *Agent) Messages() []llm.Message {
+	return a.messages
+}
+
+// SetMessages replaces the agent's message history with the supplied slice.
+// If msgs is non-empty and the first entry is not a system message, a fresh
+// system prompt is prepended automatically. This is the correct way to restore
+// conversation history when resuming a session.
+func (a *Agent) SetMessages(msgs []llm.Message) {
+	if len(msgs) == 0 {
+		a.messages = msgs
+		return
+	}
+	if msgs[0].Role != "system" {
+		sysMsg := llm.Message{Role: "system", Content: a.buildSystemPrompt(nil)}
+		msgs = append([]llm.Message{sysMsg}, msgs...)
+	}
+	a.messages = msgs
 }
 
 // parseSkillCommand checks whether input begins with a /skill-name command.
@@ -189,7 +230,7 @@ func (a *Agent) buildSystemPrompt(matchedSkill *skills.Skill) string {
 			"Store only essential cross-session facts: decisions, key file paths, architecture notes, discovered constraints. " +
 			"**Keep the file under 2 000 characters. Never store conversation history, task progress logs, or verbose notes.**\n\n")
 
-		if contextData, err := os.ReadFile(a.cfg.ContextMDPath()); err == nil {
+		if contextData, err := os.ReadFile(a.contextMDPath()); err == nil {
 			if trimmed := strings.TrimSpace(string(contextData)); trimmed != "" {
 				sb.WriteString("### Current Contents of .ageage/CONTEXT.md\n\n")
 				sb.WriteString(trimmed)
@@ -745,6 +786,7 @@ func (a *Agent) runPipelineSkill(ctx context.Context, skill *skills.Skill, input
 		a.TodoSendFunc,
 		a.TodoEditFunc,
 		a.NotifyFunc,
+		a.AskUserNotify,
 		a.ConfirmationMgr,
 		a.currentChannelID,
 		a.registry,
@@ -1092,11 +1134,6 @@ func (a *Agent) ClearHistory() {
 	}
 }
 
-// SetMessages overrides the conversation history.
-func (a *Agent) SetMessages(messages []llm.Message) {
-	a.messages = make([]llm.Message, len(messages))
-	copy(a.messages, messages)
-}
 
 // SetChannelID sets the current channel ID for async confirmations.
 func (a *Agent) SetChannelID(channelID string) {

@@ -13,28 +13,44 @@ import (
 
 // MatrixChannel connects to a Matrix homeserver via Client-Server API.
 type MatrixChannel struct {
-	Homeserver string   // e.g., "https://matrix.org"
-	UserID     string   // e.g., "@bot:matrix.org"
-	Token      string   // Access token
-	RoomIDs    []string // Rooms to monitor
-	Options    ChannelOptions
-	client     *http.Client
-	stopCh     chan struct{}
-	since      string // Sync token for /sync
-	mu         sync.Mutex
+	Homeserver   string   // e.g., "https://matrix.org"
+	UserID       string   // e.g., "@bot:matrix.org"
+	Token        string   // Access token
+	RoomIDs      []string // Rooms to monitor; empty = all joined rooms
+	AllowedUsers []string // Matrix user IDs allowed to interact; empty = allow all
+	Options      ChannelOptions
+	client       *http.Client
+	stopCh       chan struct{}
+	since        string // Sync token for /sync
+	mu           sync.Mutex
 }
 
 // NewMatrix creates a new Matrix channel.
-func NewMatrix(homeserver, userID, accessToken string, roomIDs []string, opts ChannelOptions) *MatrixChannel {
+func NewMatrix(homeserver, userID, accessToken string, roomIDs []string, allowedUsers []string, opts ChannelOptions) *MatrixChannel {
 	return &MatrixChannel{
-		Homeserver: strings.TrimRight(homeserver, "/"),
-		UserID:     userID,
-		Token:      accessToken,
-		RoomIDs:    roomIDs,
-		Options:    opts,
-		client:     &http.Client{Timeout: 60 * time.Second},
-		stopCh:     make(chan struct{}),
+		Homeserver:   strings.TrimRight(homeserver, "/"),
+		UserID:       userID,
+		Token:        accessToken,
+		RoomIDs:      roomIDs,
+		AllowedUsers: allowedUsers,
+		Options:      opts,
+		client:       &http.Client{Timeout: 60 * time.Second},
+		stopCh:       make(chan struct{}),
 	}
+}
+
+// isAllowedUser returns true when AllowedUsers is empty (allow all) or the
+// given userID is present in the whitelist.
+func (m *MatrixChannel) isAllowedUser(userID string) bool {
+	if len(m.AllowedUsers) == 0 {
+		return true
+	}
+	for _, id := range m.AllowedUsers {
+		if id == userID {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *MatrixChannel) Name() string { return "matrix" }
@@ -105,6 +121,10 @@ func (m *MatrixChannel) Start(handler MessageHandler) error {
 
 				if event.Sender == m.UserID {
 					continue
+				}
+
+				if !m.isAllowedUser(event.Sender) {
+					continue // silently ignore non-whitelisted users
 				}
 
 				msg := IncomingMessage{

@@ -113,8 +113,10 @@ func (m *Manager) StartAll() error {
 		}(ch)
 	}
 
-	// Wait for the first error.
-	return <-errCh
+	// Wait for the first error; stop all channels so remaining goroutines exit.
+	err := <-errCh
+	m.StopAll()
+	return err
 }
 
 // StopAll gracefully stops all channels.

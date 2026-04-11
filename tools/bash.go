@@ -52,7 +52,7 @@ func (t *BashTool) Parameters() map[string]any {
 	}
 }
 
-func (t *BashTool) Execute(args json.RawMessage) (string, error) {
+func (t *BashTool) Execute(ctx context.Context, args json.RawMessage) (string, error) {
 	var params struct {
 		Command string `json:"command"`
 	}
@@ -97,7 +97,7 @@ func (t *BashTool) Execute(args json.RawMessage) (string, error) {
 		timeout = 30 * time.Second
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	var execCmd *exec.Cmd

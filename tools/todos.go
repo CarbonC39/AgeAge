@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -180,7 +181,7 @@ type updateTodosArgs struct {
 	Todos []TodoItem `json:"todos"`
 }
 
-func (t *UpdateTodosTool) Execute(args json.RawMessage) (string, error) {
+func (t *UpdateTodosTool) Execute(_ context.Context, args json.RawMessage) (string, error) {
 	var a updateTodosArgs
 	if err := json.Unmarshal(args, &a); err != nil {
 		return "", fmt.Errorf("invalid arguments: %w", err)

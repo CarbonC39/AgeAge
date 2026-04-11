@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 
@@ -12,7 +13,9 @@ type Tool interface {
 	Name() string
 	Description() string
 	Parameters() map[string]interface{}
-	Execute(args json.RawMessage) (string, error)
+	// Execute runs the tool. ctx is the agent's run context and must be forwarded
+	// to any blocking or cancellable operations (HTTP calls, sub-agents, etc.).
+	Execute(ctx context.Context, args json.RawMessage) (string, error)
 }
 
 // Registry manages all registered tools.
@@ -116,10 +119,10 @@ func (r *Registry) ListAll() []Tool {
 }
 
 // Execute executes a tool by name with the given arguments.
-func (r *Registry) Execute(name string, args json.RawMessage) (string, error) {
+func (r *Registry) Execute(ctx context.Context, name string, args json.RawMessage) (string, error) {
 	t, ok := r.tools[name]
 	if !ok {
 		return "", fmt.Errorf("unknown tool: %s", name)
 	}
-	return t.Execute(args)
+	return t.Execute(ctx, args)
 }

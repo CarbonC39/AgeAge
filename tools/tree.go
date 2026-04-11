@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -43,7 +44,7 @@ func (t *TreeTool) Parameters() map[string]interface{} {
 	}
 }
 
-func (t *TreeTool) Execute(args json.RawMessage) (string, error) {
+func (t *TreeTool) Execute(_ context.Context, args json.RawMessage) (string, error) {
 	var params struct {
 		Path  string `json:"path"`
 		Depth int    `json:"depth"`

@@ -544,7 +544,7 @@ func (t *BrowserNavigateTool) Parameters() map[string]interface{} {
 	}
 }
 
-func (t *BrowserNavigateTool) Execute(args json.RawMessage) (string, error) {
+func (t *BrowserNavigateTool) Execute(_ context.Context, args json.RawMessage) (string, error) {
 	var p struct {
 		URL       string `json:"url"`
 		WaitUntil string `json:"wait_until"`
@@ -605,7 +605,7 @@ func (t *BrowserActionTool) Parameters() map[string]interface{} {
 	}
 }
 
-func (t *BrowserActionTool) Execute(args json.RawMessage) (string, error) {
+func (t *BrowserActionTool) Execute(_ context.Context, args json.RawMessage) (string, error) {
 	var p struct {
 		Action   string `json:"action"`
 		Selector string `json:"selector"`
@@ -648,7 +648,7 @@ func (t *BrowserContentTool) Parameters() map[string]interface{} {
 	}
 }
 
-func (t *BrowserContentTool) Execute(args json.RawMessage) (string, error) {
+func (t *BrowserContentTool) Execute(_ context.Context, args json.RawMessage) (string, error) {
 	var p struct {
 		Format   string `json:"format"`
 		Selector string `json:"selector"`

@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 )
@@ -32,7 +33,7 @@ func (t *FinishTool) Parameters() map[string]interface{} {
 	}
 }
 
-func (t *FinishTool) Execute(args json.RawMessage) (string, error) {
+func (t *FinishTool) Execute(_ context.Context, args json.RawMessage) (string, error) {
 	var params struct {
 		Summary string `json:"summary"`
 	}

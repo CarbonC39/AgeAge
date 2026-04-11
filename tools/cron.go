@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -128,7 +129,7 @@ func (t *CronAddTool) Parameters() map[string]any {
 	}
 }
 
-func (t *CronAddTool) Execute(args json.RawMessage) (string, error) {
+func (t *CronAddTool) Execute(_ context.Context, args json.RawMessage) (string, error) {
 	var params struct {
 		Schedule string `json:"schedule"`
 		Command  string `json:"command"`
@@ -180,7 +181,7 @@ func (t *CronRemoveTool) Parameters() map[string]any {
 	}
 }
 
-func (t *CronRemoveTool) Execute(args json.RawMessage) (string, error) {
+func (t *CronRemoveTool) Execute(_ context.Context, args json.RawMessage) (string, error) {
 	var params struct {
 		ID string `json:"id"`
 	}
@@ -224,7 +225,7 @@ func (t *CronListTool) Parameters() map[string]any {
 	}
 }
 
-func (t *CronListTool) Execute(args json.RawMessage) (string, error) {
+func (t *CronListTool) Execute(_ context.Context, args json.RawMessage) (string, error) {
 	entries := t.Store.List()
 
 	if len(entries) == 0 {

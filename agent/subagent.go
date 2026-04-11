@@ -63,7 +63,7 @@ type SubAgentArgs struct {
 	PreToolArgs json.RawMessage `json:"pre_tool_args"`
 }
 
-func (t *DelegateTool) Execute(args json.RawMessage) (string, error) {
+func (t *DelegateTool) Execute(ctx context.Context, args json.RawMessage) (string, error) {
 	var a SubAgentArgs
 	if err := json.Unmarshal(args, &a); err != nil {
 		return "", fmt.Errorf("failed to parse delegation arguments: %w", err)
@@ -103,7 +103,7 @@ func (t *DelegateTool) Execute(args json.RawMessage) (string, error) {
 			fmt.Printf("  ⤷  %-10s pre-tool: %s\n", "Delegate", a.PreTool)
 		}
 
-		preResult, err := t.registry.Execute(a.PreTool, a.PreToolArgs)
+		preResult, err := t.registry.Execute(ctx, a.PreTool, a.PreToolArgs)
 		if err != nil {
 			// If pre-tool fails, we report it back to the main agent.
 			// The main agent can then decide to retry or skip.
@@ -118,15 +118,16 @@ func (t *DelegateTool) Execute(args json.RawMessage) (string, error) {
 		)
 	}
 
-	// 2. Run the sub-agent with timeout and iteration monitoring.
-	ctx := context.Background()
+	// 2. Run the sub-agent, capping with SubAgent.Timeout if configured.
+	// Inherit the parent ctx so that a user /stop also cancels the delegate.
+	execCtx := ctx
 	if t.factory.Config.SubAgent.Timeout > 0 {
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, time.Duration(t.factory.Config.SubAgent.Timeout)*time.Second)
+		execCtx, cancel = context.WithTimeout(ctx, time.Duration(t.factory.Config.SubAgent.Timeout)*time.Second)
 		defer cancel()
 	}
 
-	result, err := subAgent.Run(ctx, a.Task, nil)
+	result, err := subAgent.Run(execCtx, a.Task, nil)
 	if err != nil {
 		// FALLBACK LOGIC: If independent model fails, retry with default agent model.
 		if t.factory.Config.SubAgent.Model.Model != "" {

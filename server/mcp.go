@@ -59,7 +59,7 @@ func (s *MCPServer) Start() error {
 			callAg := s.factory.CreateAgent(nil, "")
 			
 			argBytes, _ := json.Marshal(args)
-			result, err := callAg.GetRegistry().Execute(tool.Name(), argBytes)
+			result, err := callAg.GetRegistry().Execute(ctx, tool.Name(), argBytes)
 
 			if err != nil {
 				return &mcp.CallToolResult{

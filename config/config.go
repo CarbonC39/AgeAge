@@ -16,6 +16,7 @@ type Config struct {
 	LLM       LLMConfig       `toml:"llm"`
 	Agent     AgentConfig     `toml:"agent"`
 	SubAgent  SubAgentConfig  `toml:"subagent"`
+	Pipeline  PipelineConfig  `toml:"pipeline"`
 	Router    RouterConfig    `toml:"router"`
 	Summarize SummarizeConfig `toml:"summarize"`
 	Security  SecurityConfig  `toml:"security"`
@@ -29,9 +30,22 @@ type Config struct {
 	Server    ServerConfig    `toml:"server"`
 }
 
+// PipelineModels maps pipeline node complexity levels to specific model configs.
+// Takes precedence over [router] model settings when set.
+type PipelineModels struct {
+	Simple  ModelConfig `toml:"simple"`  // Model for complexity=simple nodes
+	Medium  ModelConfig `toml:"medium"`  // Model for complexity=medium nodes
+	Complex ModelConfig `toml:"complex"` // Model for complexity=complex nodes
+}
+
+// PipelineConfig holds settings for pipeline execution.
+type PipelineConfig struct {
+	ForeachConcurrency int            `toml:"foreach_concurrency"` // Max parallel foreach iterations; 0 or 1 = sequential
+	Models             PipelineModels `toml:"models"`              // Per-complexity model overrides
+}
+
 // SubAgentConfig holds settings for sub-agents.
 type SubAgentConfig struct {
-	Enabled       bool        `toml:"enabled"`
 	MaxIterations int         `toml:"max_iterations"` // Maximum iterations for sub-agent
 	Timeout       int         `toml:"timeout"`        // Timeout in seconds for sub-agent
 	Model         ModelConfig `toml:"model"`          // Optional independent model for sub-agent
@@ -228,7 +242,6 @@ func DefaultConfig() *Config {
 			NonIncludeTools: []string{},
 		},
 		SubAgent: SubAgentConfig{
-			Enabled:       true,
 			MaxIterations: 10,
 			Timeout:       300,
 		},
@@ -309,13 +322,17 @@ func LoadConfig(path string) (*Config, error) {
 	cfg.Workspace, _ = filepath.Abs(cfg.Workspace)
 	cfg.WorkDir = cfg.Workspace // default; CLI mode overrides this to cwd
 
-	// Ensure workspace data directory exists.
-	dataDir := filepath.Join(cfg.Workspace, "data")
-	if err := os.MkdirAll(dataDir, 0o755); err != nil {
-		return nil, fmt.Errorf("failed to create data directory: %w", err)
-	}
-
 	return cfg, nil
+}
+
+// EnsureDirs creates directories required at runtime (e.g. workspace/data).
+// Call this after LoadConfig, not inside it, to keep the loader side-effect-free.
+func (c *Config) EnsureDirs() error {
+	dataDir := filepath.Join(c.Workspace, "data")
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		return fmt.Errorf("failed to create data directory: %w", err)
+	}
+	return nil
 }
 
 // SOULPath returns the path to the SOUL.md file.

@@ -3,6 +3,7 @@ package tools
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -48,7 +49,7 @@ func (t *FileReadTool) Parameters() map[string]any {
 
 const fileReadMaxLines = 500
 
-func (t *FileReadTool) Execute(args json.RawMessage) (string, error) {
+func (t *FileReadTool) Execute(_ context.Context, args json.RawMessage) (string, error) {
 	var params struct {
 		Path      string `json:"path"`
 		StartLine int    `json:"start_line"`
@@ -160,7 +161,7 @@ func (t *FileWriteTool) Parameters() map[string]any {
 	}
 }
 
-func (t *FileWriteTool) Execute(args json.RawMessage) (string, error) {
+func (t *FileWriteTool) Execute(_ context.Context, args json.RawMessage) (string, error) {
 	var params struct {
 		Path    string `json:"path"`
 		Content string `json:"content"`
@@ -231,7 +232,7 @@ func (t *FileEditTool) Parameters() map[string]any {
 	}
 }
 
-func (t *FileEditTool) Execute(args json.RawMessage) (string, error) {
+func (t *FileEditTool) Execute(_ context.Context, args json.RawMessage) (string, error) {
 	var params struct {
 		Path    string `json:"path"`
 		Search  string `json:"search"`

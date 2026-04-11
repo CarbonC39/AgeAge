@@ -105,10 +105,6 @@ type PipelineNode struct {
 	// Output variables are collected as arrays after all iterations complete.
 	Foreach string `yaml:"foreach"`
 
-	// Concurrency limits the number of parallel iterations for foreach nodes.
-	// 0 or 1 = sequential; >1 = parallel. Default: 0.
-	Concurrency int `yaml:"concurrency"`
-
 	// Inputs maps tool/agent argument names to values.
 	// String values are treated as pipeline variable references:
 	//   $vars.name, $foreach.current, $foreach.current.field, $foreach.index, or a literal string.
@@ -220,7 +216,15 @@ func parsePipelineFile(path string) (*Skill, error) {
 		return nil, fmt.Errorf("invalid pipeline YAML: %w", err)
 	}
 
-	// A YAML file without a pipeline key is not a pipeline skill — skip it.
+	// Detect "pipeline:" key present but empty vs. file has no pipeline key.
+	var keys map[string]interface{}
+	if err := yaml.Unmarshal(data, &keys); err == nil {
+		if _, hasPipeline := keys["pipeline"]; hasPipeline && len(raw.Pipeline) == 0 {
+			return nil, fmt.Errorf("pipeline key is present but the node list is empty in %s", filepath.Base(path))
+		}
+	}
+
+	// A YAML file without a pipeline key is not a pipeline skill — skip it silently.
 	if len(raw.Pipeline) == 0 {
 		return nil, nil
 	}
@@ -237,6 +241,21 @@ func parsePipelineFile(path string) (*Skill, error) {
 	// Ensure $vars.input always exists (populated from the user's message).
 	if _, ok := raw.Vars["input"]; !ok {
 		raw.Vars["input"] = ""
+	}
+
+	// Validate nodes.
+	seenIDs := make(map[string]bool, len(raw.Pipeline))
+	for i, node := range raw.Pipeline {
+		if node.ID == "" {
+			return nil, fmt.Errorf("node %d has no id", i)
+		}
+		if seenIDs[node.ID] {
+			return nil, fmt.Errorf("duplicate node id %q", node.ID)
+		}
+		seenIDs[node.ID] = true
+		if node.Type == "auto" && node.Tool == "" {
+			return nil, fmt.Errorf("node %q has type=auto but no tool specified", node.ID)
+		}
 	}
 
 	return &Skill{

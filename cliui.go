@@ -12,6 +12,141 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
+// ── Think-block stream filter ──────────────────────────────────────────────────
+
+// ThinkStreamFilter wraps a StreamCallback and intercepts <think>…</think>
+// blocks produced by reasoning models (e.g. DeepSeek-R1, QwQ).
+//
+// When showThink=false (default): think content is suppressed during streaming;
+// after </think> a single summary line is printed.
+// When showThink=true: think content is streamed in dim colour before the response.
+//
+// LastThink holds the raw text of the most recent think block so the /think
+// command can replay it.
+type ThinkStreamFilter struct {
+	inner     llm.StreamCallback
+	showThink bool
+
+	// streaming state
+	buf         string // accumulates tokens until a safe flush point
+	inThink     bool
+	thinkBuf    strings.Builder // content inside the current think block
+	hasThink    bool            // at least one think block seen this turn
+
+	// exported result
+	LastThink string
+}
+
+const thinkOpen = "<think>"
+const thinkClose = "</think>"
+
+// Wrap returns a StreamCallback that routes tokens through the filter.
+// Call Reset() before each agent turn to clear state.
+func (f *ThinkStreamFilter) Wrap() llm.StreamCallback {
+	return f.feed
+}
+
+// Reset clears per-turn state. Call before starting a new agent run.
+func (f *ThinkStreamFilter) Reset() {
+	f.buf = ""
+	f.inThink = false
+	f.thinkBuf.Reset()
+	f.hasThink = false
+}
+
+// feed is the actual StreamCallback implementation.
+func (f *ThinkStreamFilter) feed(token string) {
+	f.buf += token
+	for {
+		if !f.inThink {
+			// Look for opening tag.
+			idx := strings.Index(f.buf, thinkOpen)
+			if idx != -1 {
+				// Flush content before the tag to the real callback.
+				if idx > 0 && f.inner != nil {
+					f.inner(f.buf[:idx])
+				}
+				f.buf = f.buf[idx+len(thinkOpen):]
+				f.inThink = true
+				f.thinkBuf.Reset()
+				// Loop to process whatever's left in buf.
+				continue
+			}
+			// No opening tag found; check if the tail could be a partial tag.
+			safe, held := splitAtPartialTag(f.buf, thinkOpen)
+			if safe != "" && f.inner != nil {
+				f.inner(safe)
+			}
+			f.buf = held
+			return
+		}
+
+		// Inside think block: look for closing tag.
+		idx := strings.Index(f.buf, thinkClose)
+		if idx != -1 {
+			f.thinkBuf.WriteString(f.buf[:idx])
+			f.buf = f.buf[idx+len(thinkClose):]
+			f.inThink = false
+			f.onThinkEnd()
+			continue
+		}
+		// No closing tag; hold the tail that could be a partial tag.
+		safe, held := splitAtPartialTag(f.buf, thinkClose)
+		f.thinkBuf.WriteString(safe)
+		f.buf = held
+		return
+	}
+}
+
+// Flush drains any remaining buffered content at end-of-stream.
+func (f *ThinkStreamFilter) Flush() {
+	if f.buf == "" {
+		return
+	}
+	if f.inThink {
+		f.thinkBuf.WriteString(f.buf)
+	} else if f.inner != nil {
+		f.inner(f.buf)
+	}
+	f.buf = ""
+}
+
+func (f *ThinkStreamFilter) onThinkEnd() {
+	content := f.thinkBuf.String()
+	f.LastThink = content
+	f.hasThink = true
+
+	if f.showThink {
+		// Print the full think content in dim colour with a header.
+		header := stGray.Render("┌── thinking ") + stDim.Render(line(38))
+		footer := stGray.Render("└" + line(50))
+		fmt.Println()
+		fmt.Println(header)
+		// Print each line dimmed.
+		for _, l := range strings.Split(strings.TrimSpace(content), "\n") {
+			fmt.Println(stDim.Render("│ " + l))
+		}
+		fmt.Println(footer)
+		fmt.Println()
+	} else {
+		// Summary line only.
+		chars := len([]rune(strings.TrimSpace(content)))
+		fmt.Println(stDim.Render(fmt.Sprintf("  ◆ thinking… (%d chars)", chars)))
+	}
+}
+
+// splitAtPartialTag splits s into a safe-to-emit prefix and a held suffix.
+// The suffix is the longest tail of s that could be the start of tag.
+func splitAtPartialTag(s, tag string) (safe, held string) {
+	// Walk backwards: find the longest suffix of s that is a prefix of tag.
+	for l := min(len(s), len(tag)-1); l > 0; l-- {
+		if strings.HasPrefix(tag, s[len(s)-l:]) {
+			return s[:len(s)-l], s[len(s)-l:]
+		}
+	}
+	return s, ""
+}
+
 // ── Colour palette ────────────────────────────────────────────────────────────
 
 var (
@@ -44,10 +179,52 @@ var bannerBox = lipgloss.NewStyle().
 // ── cliUI ─────────────────────────────────────────────────────────────────────
 
 type cliUI struct {
-	model string
+	model      string
+	sessionIn  int
+	sessionOut int
 }
 
 func newCLIUI(model string) *cliUI { return &cliUI{model: model} }
+
+// costPer1M returns the input and output cost per 1 million tokens for a
+// recognised model name prefix. Returns (0, 0) for unknown models.
+func costPer1M(model string) (in, out float64) {
+	m := strings.ToLower(model)
+	switch {
+	case strings.HasPrefix(m, "gpt-4o-mini"):
+		return 0.15, 0.60
+	case strings.HasPrefix(m, "gpt-4o"):
+		return 2.50, 10.00
+	case strings.HasPrefix(m, "gpt-4-turbo"):
+		return 10.00, 30.00
+	case strings.HasPrefix(m, "gpt-4"):
+		return 30.00, 60.00
+	case strings.HasPrefix(m, "gpt-3.5"):
+		return 0.50, 1.50
+	case strings.HasPrefix(m, "o1-mini"):
+		return 1.10, 4.40
+	case strings.HasPrefix(m, "o1"):
+		return 15.00, 60.00
+	case strings.HasPrefix(m, "o3-mini"):
+		return 1.10, 4.40
+	case strings.HasPrefix(m, "o3"):
+		return 10.00, 40.00
+	case strings.HasPrefix(m, "deepseek-r1"):
+		return 0.55, 2.19
+	case strings.HasPrefix(m, "deepseek"):
+		return 0.27, 1.10
+	case strings.HasPrefix(m, "claude-3-5-haiku"):
+		return 0.80, 4.00
+	case strings.HasPrefix(m, "claude-3-5"):
+		return 3.00, 15.00
+	case strings.HasPrefix(m, "claude-3-opus"):
+		return 15.00, 75.00
+	case strings.HasPrefix(m, "claude"):
+		return 3.00, 15.00
+	default:
+		return 0, 0
+	}
+}
 
 func (u *cliUI) printBanner() {
 	title := stPink.Render("✦ AgeAge") + "  " + stPurple.Render(u.model)
@@ -71,9 +248,25 @@ func (u *cliUI) printUsage(usage llm.Usage) {
 	if usage.TotalTokens == 0 {
 		return
 	}
-	stats := fmt.Sprintf("↑ %d  ↓ %d  ∑ %d tokens",
+	u.sessionIn += usage.PromptTokens
+	u.sessionOut += usage.CompletionTokens
+
+	// Per-turn line.
+	turn := fmt.Sprintf("↑ %d  ↓ %d  ∑ %d tokens",
 		usage.PromptTokens, usage.CompletionTokens, usage.TotalTokens)
-	fmt.Println(stDim.Render("  " + stats))
+	fmt.Println(stDim.Render("  " + turn))
+
+	// Session-cumulative line with optional cost.
+	inCost, outCost := costPer1M(u.model)
+	if inCost > 0 {
+		cost := float64(u.sessionIn)/1e6*inCost + float64(u.sessionOut)/1e6*outCost
+		session := fmt.Sprintf("session ↑ %d  ↓ %d  ≈ $%.4f",
+			u.sessionIn, u.sessionOut, cost)
+		fmt.Println(stDim.Render("  " + session))
+	} else {
+		session := fmt.Sprintf("session ↑ %d  ↓ %d", u.sessionIn, u.sessionOut)
+		fmt.Println(stDim.Render("  " + session))
+	}
 }
 
 func (u *cliUI) printOK(msg string) {
@@ -173,6 +366,44 @@ func (s *Spinner) Stop() {
 	doneCh := s.doneCh
 	s.mu.Unlock()
 	<-doneCh
+}
+
+// ── Tool result display ───────────────────────────────────────────────────────
+
+// toolResultMaxChars is how many characters of tool output to show inline.
+const toolResultMaxChars = 300
+
+// printToolResult prints a compact summary of a tool's return value.
+// It is intentionally terse — the goal is glanceability, not full output.
+func (u *cliUI) printToolResult(name, result string) {
+	// Skip tools whose output is better shown via other callbacks (diff tools).
+	switch name {
+	case "file_write", "file_edit", "ask_user", "finish_task", "node_complete":
+		return
+	}
+	if result == "" {
+		return
+	}
+	// Condense multi-line output to a single representative line.
+	firstLine := result
+	lines := strings.SplitN(strings.TrimSpace(result), "\n", 2)
+	if len(lines) > 0 {
+		firstLine = strings.TrimSpace(lines[0])
+	}
+	lineCount := strings.Count(result, "\n") + 1
+	suffix := ""
+	if lineCount > 1 {
+		suffix = fmt.Sprintf(" … +%d lines", lineCount-1)
+	}
+	if len([]rune(firstLine)) > toolResultMaxChars {
+		firstLine = string([]rune(firstLine)[:toolResultMaxChars])
+		suffix = "…"
+	}
+	fmt.Printf("  %s %s%s\n",
+		stDim.Render("◁"),
+		stDim.Render(firstLine),
+		stDim.Render(suffix),
+	)
 }
 
 // ── File diff display ─────────────────────────────────────────────────────────

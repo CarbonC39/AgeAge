@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 
 	"ageage/config"
@@ -189,7 +190,7 @@ func (e *PipelineExecutor) mergeOutputs(node skills.PipelineNode, out map[string
 
 // execForeach iterates a node over an array pipeline variable.
 // After all iterations, per-output-key values are collected as slices and
-// written to e.vars. Parallel execution is used when node.Concurrency > 1.
+// written to e.vars. Parallel execution is used when Config.Pipeline.ForeachConcurrency > 1.
 func (e *PipelineExecutor) execForeach(ctx context.Context, node skills.PipelineNode) error {
 	arrayVal := e.resolveValue(node.Foreach, nil, -1)
 	if arrayVal == nil {
@@ -214,7 +215,8 @@ func (e *PipelineExecutor) execForeach(ctx context.Context, node skills.Pipeline
 
 	outputAccum := make(map[string][]interface{}, len(node.Outputs))
 
-	if node.Concurrency <= 1 {
+	concurrency := e.factory.Config.Pipeline.ForeachConcurrency
+	if concurrency <= 1 {
 		// ── Sequential path ───────────────────────────────────────────────
 		for idx, item := range items {
 			if ctx.Err() != nil {
@@ -249,7 +251,7 @@ func (e *PipelineExecutor) execForeach(ctx context.Context, node skills.Pipeline
 		defer subCancel()
 
 		resCh := make(chan iterResult, len(items))
-		sem := make(chan struct{}, node.Concurrency)
+		sem := make(chan struct{}, concurrency)
 
 		for i, it := range items {
 			go func(idx int, item interface{}) {
@@ -357,7 +359,7 @@ func (e *PipelineExecutor) execAutoNode(ctx context.Context, node skills.Pipelin
 
 	e.debugf("Auto▷", "%s  tool=%s", node.ID, node.Tool)
 
-	result, err := e.sharedReg.Execute(node.Tool, argsJSON)
+	result, err := e.sharedReg.Execute(ctx, node.Tool, argsJSON)
 	if err != nil {
 		return "", fmt.Errorf("auto node %q: tool %q failed: %w", node.ID, node.Tool, err)
 	}
@@ -636,17 +638,31 @@ func (e *PipelineExecutor) lookupSkill(name string) *skills.Skill {
 }
 
 // applyNodeModel sets the sub-agent's LLM client based on node complexity.
-// Falls back to the factory's default client if the required model is not configured.
+// Checks [pipeline.models] first; falls back to [router] model settings.
+// No-ops if complexity is empty or no matching model is configured.
 func (e *PipelineExecutor) applyNodeModel(subAgent *Agent, complexity string) {
 	if complexity == "" {
 		return
 	}
+	pm := e.factory.Config.Pipeline.Models
 	var targetModel config.ModelConfig
 	switch TaskComplexity(strings.ToLower(complexity)) {
 	case TaskComplex:
-		targetModel = e.factory.Config.Router.StrongModel
+		if pm.Complex.Model != "" {
+			targetModel = pm.Complex
+		} else {
+			targetModel = e.factory.Config.Router.StrongModel
+		}
 	case TaskMedium:
-		targetModel = e.factory.Config.Router.MediumModel
+		if pm.Medium.Model != "" {
+			targetModel = pm.Medium
+		} else {
+			targetModel = e.factory.Config.Router.MediumModel
+		}
+	case TaskSimple:
+		if pm.Simple.Model != "" {
+			targetModel = pm.Simple
+		}
 	}
 	if targetModel.Model == "" {
 		return
@@ -664,8 +680,12 @@ func (e *PipelineExecutor) applyNodeModel(subAgent *Agent, complexity string) {
 // Accumulated context from prior nodes is prepended; then the interpolated prompt.
 // Pipeline status is NOT included — sub-agents don't need infrastructure info.
 func (e *PipelineExecutor) buildNodePrompt(node skills.PipelineNode, foreachItem interface{}, foreachIdx int) string {
+	const maxContextChars = 8000
 	var parts []string
 	if ctx := strings.Join(e.contexts, "\n\n"); ctx != "" {
+		if runes := []rune(ctx); len(runes) > maxContextChars {
+			ctx = string(runes[:maxContextChars]) + "\n\n[...context truncated...]"
+		}
 		parts = append(parts, "[Context from previous pipeline nodes]\n"+ctx)
 	}
 	if node.Prompt != "" {
@@ -715,7 +735,8 @@ func (e *PipelineExecutor) resolveValue(val interface{}, foreachItem interface{}
 			key := strings.TrimPrefix(v, "$vars.")
 			return e.vars[key]
 		default:
-			return v // literal
+			// Expand any {{$vars.x}} / {{$foreach.*}} tokens embedded in literals.
+			return e.interpolatePrompt(v, foreachItem, foreachIdx)
 		}
 	case map[string]interface{}:
 		resolved := make(map[string]interface{}, len(v))
@@ -734,18 +755,40 @@ func (e *PipelineExecutor) resolveValue(val interface{}, foreachItem interface{}
 	}
 }
 
-// interpolatePrompt replaces {{$vars.x}} and {{$foreach.*}} tokens in a template.
+// interpolatePrompt replaces template tokens in a string.
+// Supported forms (both are equivalent):
+//
+//	{{$vars.x}}  or  $vars.x
+//	{{$foreach.current}}  or  $foreach.current
+//	{{$foreach.index}}    or  $foreach.index
+//	{{$config.workspace}}
 func (e *PipelineExecutor) interpolatePrompt(tmpl string, foreachItem interface{}, foreachIdx int) string {
 	result := tmpl
 	if foreachIdx >= 0 {
-		result = strings.ReplaceAll(result, "{{$foreach.current}}", fmt.Sprintf("%v", foreachItem))
-		result = strings.ReplaceAll(result, "{{$foreach.index}}", fmt.Sprintf("%d", foreachIdx))
+		foreachStr := fmt.Sprintf("%v", foreachItem)
+		foreachIdxStr := fmt.Sprintf("%d", foreachIdx)
+		result = strings.ReplaceAll(result, "{{$foreach.current}}", foreachStr)
+		result = strings.ReplaceAll(result, "$foreach.current", foreachStr)
+		result = strings.ReplaceAll(result, "{{$foreach.index}}", foreachIdxStr)
+		result = strings.ReplaceAll(result, "$foreach.index", foreachIdxStr)
 	}
 	if e.factory != nil {
-		result = strings.ReplaceAll(result, "{{$config.workspace}}", e.factory.Config.EffectiveWorkDir())
+		workDir := e.factory.Config.EffectiveWorkDir()
+		result = strings.ReplaceAll(result, "{{$config.workspace}}", workDir)
+		result = strings.ReplaceAll(result, "$config.workspace", workDir)
 	}
-	for k, v := range e.vars {
-		result = strings.ReplaceAll(result, "{{$vars."+k+"}}", fmt.Sprintf("%v", v))
+	// Sort keys by length descending so that longer names (e.g. "foobar") are
+	// replaced before shorter prefixes (e.g. "foo"), preventing "$vars.foo" from
+	// clobbering the "foo" portion inside "$vars.foobar" on a lucky map iteration.
+	varKeys := make([]string, 0, len(e.vars))
+	for k := range e.vars {
+		varKeys = append(varKeys, k)
+	}
+	sort.Slice(varKeys, func(i, j int) bool { return len(varKeys[i]) > len(varKeys[j]) })
+	for _, k := range varKeys {
+		val := fmt.Sprintf("%v", e.vars[k])
+		result = strings.ReplaceAll(result, "{{$vars."+k+"}}", val)
+		result = strings.ReplaceAll(result, "$vars."+k, val)
 	}
 	return result
 }

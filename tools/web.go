@@ -2,6 +2,7 @@ package tools
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
@@ -93,7 +94,7 @@ func (t *WebFetchTool) Parameters() map[string]interface{} {
 	}
 }
 
-func (t *WebFetchTool) Execute(args json.RawMessage) (string, error) {
+func (t *WebFetchTool) Execute(_ context.Context, args json.RawMessage) (string, error) {
 	var params struct {
 		URL string `json:"url"`
 	}
@@ -296,7 +297,7 @@ func (t *WebSearchTool) Parameters() map[string]any {
 	}
 }
 
-func (t *WebSearchTool) Execute(args json.RawMessage) (string, error) {
+func (t *WebSearchTool) Execute(_ context.Context, args json.RawMessage) (string, error) {
 	var params struct {
 		Query string `json:"query"`
 	}

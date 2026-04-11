@@ -32,11 +32,11 @@ type RouterResult struct {
 
 // Router classifies user intent and selects appropriate tools/model.
 type Router struct {
-	cfg         *config.Config
-	client      *llm.Client
-	skills      []skills.Skill
-	debug       bool
-	soulContent string // Content of AGENT.md for context
+	cfg          *config.Config
+	client       *llm.Client
+	skills       []skills.Skill
+	debug        bool
+	agentContent string // Content of AGENT.md for routing context
 }
 
 // NewRouter creates a new Router.
@@ -48,11 +48,11 @@ func NewRouter(cfg *config.Config, client *llm.Client, loadedSkills []skills.Ski
 	}
 
 	return &Router{
-		cfg:         cfg,
-		client:      client,
-		skills:      loadedSkills,
-		debug:       debug,
-		soulContent: agentContent,
+		cfg:          cfg,
+		client:       client,
+		skills:       loadedSkills,
+		debug:        debug,
+		agentContent: agentContent,
 	}
 }
 
@@ -123,8 +123,8 @@ func (r *Router) Route(ctx context.Context, userInput string, availableTools []s
 	routerPrompt := r.buildRouterPrompt(availableTools)
 
 	var fullSystemPrompt string
-	if r.soulContent != "" {
-		fullSystemPrompt = r.soulContent + "\n\n" + routerPrompt
+	if r.agentContent != "" {
+		fullSystemPrompt = r.agentContent + "\n\n" + routerPrompt
 	} else {
 		fullSystemPrompt = routerPrompt
 	}

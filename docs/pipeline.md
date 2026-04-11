@@ -83,25 +83,15 @@ If omitted from `vars`, a variable is `nil` until written by a node.
 
 ### Reference syntax
 
-Use these in `inputs` values and `foreach`:
+Both the bare (`$vars.x`) and brace (`{{$vars.x}}`) forms work identically in **both** `inputs` values and `prompt` strings:
 
 | Syntax | Resolves to |
 |--------|-------------|
-| `$vars.name` | The current value of pipeline variable `name` |
-| `$foreach.current` | The current iteration item (foreach nodes only) |
+| `$vars.name` or `{{$vars.name}}` | The current value of pipeline variable `name` |
+| `$foreach.current` or `{{$foreach.current}}` | The current iteration item (foreach nodes only) |
 | `$foreach.current.field` | A named field of the current item (when items are maps) |
-| `$foreach.index` | The zero-based iteration index (int) |
-
-### Template syntax
-
-Use these inside `prompt` strings:
-
-| Template | Resolves to |
-|----------|-------------|
-| `{{$vars.name}}` | Pipeline variable `name` (as string) |
-| `{{$foreach.current}}` | Current foreach item |
-| `{{$foreach.index}}` | Current foreach index |
-| `{{$config.workspace}}` | The workspace directory path |
+| `$foreach.index` or `{{$foreach.index}}` | The zero-based iteration index (int) |
+| `$config.workspace` or `{{$config.workspace}}` | The workspace directory path |
 
 ---
 
@@ -116,7 +106,6 @@ Every node in the `pipeline` list supports these fields:
 | `id` | string | **required** | Unique node name. Shown in the pipeline progress display. |
 | `type` | string | `agent` | `agent` (LLM-driven) or `auto` (direct tool call). |
 | `foreach` | string | — | A `$vars.name` reference to an array. The node runs once per item. |
-| `concurrency` | int | `0` | Max parallel foreach iterations. `0` or `1` = sequential. |
 | `inputs` | map | — | Arguments passed to the node. String values are resolved as variable references. |
 | `outputs` | map | — | Maps pipeline var names ← node output keys. |
 | `validate` | string | — | `not_empty`: fail if any resolved input is empty. |
@@ -268,12 +257,17 @@ pipeline:
 
 ### Foreach — process in parallel
 
-Add `concurrency` to run iterations simultaneously:
+Set `foreach_concurrency` in `[pipeline]` config to run iterations simultaneously:
+
+```toml
+# ageage.toml
+[pipeline]
+foreach_concurrency = 4  # up to 4 simultaneous sub-agents per foreach node
+```
 
 ```yaml
 - id: analyze_articles
   foreach: $vars.article_urls
-  concurrency: 4 # up to 4 simultaneous sub-agents
   tools:
     - web_fetch
   prompt: |
@@ -516,7 +510,6 @@ pipeline:
     type: auto
     tool: web_search
     foreach: $vars.queries
-    concurrency: 3
     inputs:
       query: $foreach.current
     outputs:
@@ -526,7 +519,6 @@ pipeline:
     type: auto
     tool: web_fetch
     foreach: $vars.search_results
-    concurrency: 3
     inputs:
       url: $foreach.current
     outputs:
@@ -534,7 +526,6 @@ pipeline:
 
   - id: extract_facts
     foreach: $vars.articles
-    concurrency: 3
     no_context: true # pure extraction, no workspace context needed
     output_context: true # findings flow forward automatically
     prompt: |
@@ -554,6 +545,41 @@ pipeline:
     outputs:
       report: result
 ```
+
+---
+
+## Configuration
+
+Pipeline behaviour is controlled through the `[pipeline]` section of `ageage.toml`.
+
+### `[pipeline]`
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `foreach_concurrency` | int | `0` | Max parallel iterations for `foreach` nodes. `0` or `1` = sequential. |
+
+```toml
+[pipeline]
+foreach_concurrency = 4
+```
+
+### `[pipeline.models]`
+
+Override which LLM model is used for each node complexity level. Takes precedence over the `[router]` model settings.
+
+```toml
+[pipeline.models.simple]
+model = "gpt-4o-mini"
+
+[pipeline.models.medium]
+model = "gpt-4o"
+
+[pipeline.models.complex]
+model = "o3"
+api_key = "sk-..."  # optional: different provider
+```
+
+If a complexity level is not set here, the corresponding `[router]` model is used as a fallback (e.g. `[router.strong]` for `complex`). If neither is configured, the base `[llm]` model is used.
 
 ---
 

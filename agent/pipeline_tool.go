@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 
@@ -66,7 +67,7 @@ func (t *NodeCompleteTool) Parameters() map[string]interface{} {
 }
 
 
-func (t *NodeCompleteTool) Execute(args json.RawMessage) (string, error) {
+func (t *NodeCompleteTool) Execute(_ context.Context, args json.RawMessage) (string, error) {
 	if t.finished {
 		return "", fmt.Errorf("node_complete already called for this node")
 	}

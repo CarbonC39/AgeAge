@@ -26,20 +26,29 @@ func NewSummarizer(cfg *config.Config, client *llm.Client, debug bool) *Summariz
 }
 
 // ShouldSummarize returns true if the messages exceed the threshold.
-// It counts user/assistant message pairs (excluding system and tool messages).
+// Counts assistant messages: each LLM iteration produces exactly one, whether
+// it comes from a new user turn (multi-turn chat) or a tool-call round (sub-agents).
+// This ensures the threshold applies equally to main agents and pipeline/delegate
+// sub-agents, which have only one user message but can accumulate many iterations.
 func (s *Summarizer) ShouldSummarize(messages []llm.Message) bool {
 	if !s.cfg.Summarize.Enabled {
 		return false
 	}
 
-	pairs := 0
+	rounds := 0
 	for _, m := range messages {
-		if m.Role == "user" {
-			pairs++
+		if m.Role == "assistant" {
+			rounds++
 		}
 	}
 
-	return pairs > s.cfg.Summarize.Threshold
+	return rounds > s.cfg.Summarize.Threshold
+}
+
+// SetClient replaces the LLM client used to build the summarization client.
+// Called by Agent.SetLLMClient so the summarizer tracks credential changes.
+func (s *Summarizer) SetClient(client *llm.Client) {
+	s.client = client
 }
 
 // Summarize compresses older messages into a summary, keeping recent messages intact.

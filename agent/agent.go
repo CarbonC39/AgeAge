@@ -57,8 +57,9 @@ type Agent struct {
 	browserSess         *tools.BrowserSession          // Non-nil when browser_* tools are injected; closed after Run
 	runUsage            llm.Usage                      // Accumulated token usage for the current Run(); reset each call
 	tmpMgr              *TmpManager                    // Manages tmp files created by attachment converters
-	ToolStartCallback   func(name, args string)        // Optional: called just before each tool executes (CLI spinner/diff display)
-	ToolEndCallback     func(name string)              // Optional: called just after each tool completes
+	ToolStartCallback   func(name, args string)         // Optional: called just before each tool executes (CLI spinner/diff display)
+	ToolEndCallback     func(name string)               // Optional: called just after each tool completes
+	ToolResultCallback  func(name, result string)       // Optional: called with the tool's output after execution
 }
 
 // NewAgent creates a new agent instance.
@@ -74,10 +75,6 @@ func NewAgent(cfg *config.Config, client *llm.Client, registry *tools.Registry, 
 		messages:      make([]llm.Message, 0, 64),
 		tmpMgr:        newTmpManager(cfg.Workspace),
 		InjectContext: true, // on by default; explicitly disabled for delegate sub-agents
-	}
-
-	if cfg.Router.Enabled {
-		ag.router = NewRouter(cfg, client, loadedSkills, debug)
 	}
 
 	if cfg.Summarize.Enabled {
@@ -517,15 +514,15 @@ func (a *Agent) RunWithParts(ctx context.Context, userInput string, parts []llm.
 	// ALWAYS include finish_task.
 	neededTools = ensureFinishTask(neededTools)
 
-	// Delegation tool injection logic.
-	if a.cfg.SubAgent.Enabled {
+	// Delegation tool injection (main agent only; sub-agents must not recurse).
+	if !a.IsSubAgent {
 		if a.router != nil {
-			// If router is active, only inject for medium/complex.
+			// With a router: only inject for medium/complex tasks.
 			if routerResult != nil && (routerResult.Complexity == TaskMedium || routerResult.Complexity == TaskComplex) {
 				neededTools = append(neededTools, "delegate")
 			}
 		} else {
-			// No router: always available if enabled.
+			// No router: always available.
 			neededTools = append(neededTools, "delegate")
 		}
 	}
@@ -605,9 +602,12 @@ func (a *Agent) RunWithParts(ctx context.Context, userInput string, parts []llm.
 			if a.ToolStartCallback != nil {
 				a.ToolStartCallback(tc.Function.Name, string(rawArgs))
 			}
-			res, execErr := a.registry.Execute(tc.Function.Name, rawArgs)
+			res, execErr := a.registry.Execute(ctx, tc.Function.Name, rawArgs)
 			if a.ToolEndCallback != nil {
 				a.ToolEndCallback(tc.Function.Name)
+			}
+			if a.ToolResultCallback != nil {
+				a.ToolResultCallback(tc.Function.Name, res)
 			}
 			a.debugLog("Tool◁", "%s  %s", tc.Function.Name, truncateStr(res, 600))
 			a.debugBlankLine()
@@ -1141,8 +1141,13 @@ func (a *Agent) SetChannelID(channelID string) {
 }
 
 // SetLLMClient overrides the LLM client for this agent.
+// Also updates the summarizer's client so it uses matching credentials
+// if the new client connects to a different API provider.
 func (a *Agent) SetLLMClient(client *llm.Client) {
 	a.client = client
+	if a.summarizer != nil {
+		a.summarizer.SetClient(client)
+	}
 }
 
 // GetChannelID returns the current channel ID.

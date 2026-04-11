@@ -1,8 +1,10 @@
 package tools
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 )
 
 // AskUserTool pauses pipeline/agent execution and asks the user a question.
@@ -55,7 +57,7 @@ type askUserArgs struct {
 	Options  []string `json:"options"`
 }
 
-func (t *AskUserTool) Execute(args json.RawMessage) (string, error) {
+func (t *AskUserTool) Execute(ctx context.Context, args json.RawMessage) (string, error) {
 	var a askUserArgs
 	if err := json.Unmarshal(args, &a); err != nil {
 		return "", fmt.Errorf("invalid arguments: %w", err)
@@ -76,7 +78,7 @@ func (t *AskUserTool) Execute(args json.RawMessage) (string, error) {
 	if notifyFn != nil {
 		notifyFn(a.Question, a.Options)
 	} else {
-		// Plain-text fallback (no custom notify configured).
+		// Plain-text fallback (no custom notify configured — should not happen in normal use).
 		msg := "❓ " + a.Question
 		for i, opt := range a.Options {
 			msg += fmt.Sprintf("\n  %d. %s", i+1, opt)
@@ -84,15 +86,21 @@ func (t *AskUserTool) Execute(args json.RawMessage) (string, error) {
 		if len(a.Options) > 0 {
 			msg += "\nType a number or your answer:"
 		}
-		fmt.Println(msg)
+		fmt.Fprintln(os.Stderr, msg)
 	}
 
-	// Block until the user replies or the request is cancelled.
-	answer, ok := <-respCh
-	if !ok {
-		return "", fmt.Errorf("user input cancelled")
+	// Block until the user replies, the request is cancelled externally, or the
+	// agent's context is cancelled (e.g. /stop or pipeline timeout).
+	select {
+	case answer, ok := <-respCh:
+		if !ok {
+			return "", fmt.Errorf("user input cancelled")
+		}
+		return answer, nil
+	case <-ctx.Done():
+		t.Manager.Cancel(t.ChannelID) // clean up pending entry
+		return "", fmt.Errorf("user input cancelled: %w", ctx.Err())
 	}
-	return answer, nil
 }
 
 func (t *AskUserTool) resolveNotifyFunc() func(string, []string) {

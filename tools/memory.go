@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -47,7 +48,7 @@ func (t *MemoryStoreTool) Parameters() map[string]any {
 	}
 }
 
-func (t *MemoryStoreTool) Execute(args json.RawMessage) (string, error) {
+func (t *MemoryStoreTool) Execute(_ context.Context, args json.RawMessage) (string, error) {
 	var params struct {
 		Content string `json:"content"`
 		Tags    string `json:"tags"`
@@ -113,7 +114,7 @@ func (t *MemoryRecallTool) Parameters() map[string]any {
 	}
 }
 
-func (t *MemoryRecallTool) Execute(args json.RawMessage) (string, error) {
+func (t *MemoryRecallTool) Execute(_ context.Context, args json.RawMessage) (string, error) {
 	var params struct {
 		Query string `json:"query"`
 	}
@@ -200,7 +201,7 @@ func (t *MemoryForgetTool) Parameters() map[string]interface{} {
 	}
 }
 
-func (t *MemoryForgetTool) Execute(args json.RawMessage) (string, error) {
+func (t *MemoryForgetTool) Execute(_ context.Context, args json.RawMessage) (string, error) {
 	var params struct {
 		ID string `json:"id"`
 	}

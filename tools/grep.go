@@ -2,6 +2,7 @@ package tools
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -57,7 +58,7 @@ type GrepArgs struct {
 	ContextLines  int    `json:"context_lines"`
 }
 
-func (t *GrepTool) Execute(args json.RawMessage) (string, error) {
+func (t *GrepTool) Execute(_ context.Context, args json.RawMessage) (string, error) {
 	var a GrepArgs
 	if err := json.Unmarshal(args, &a); err != nil {
 		return "", fmt.Errorf("invalid arguments: %w", err)

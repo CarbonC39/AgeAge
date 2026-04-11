@@ -30,13 +30,13 @@ func (t *MCPTool) Parameters() map[string]interface{} {
 	return schema
 }
 
-func (t *MCPTool) Execute(args json.RawMessage) (string, error) {
+func (t *MCPTool) Execute(ctx context.Context, args json.RawMessage) (string, error) {
 	var arguments map[string]any
 	if err := json.Unmarshal(args, &arguments); err != nil {
 		return "", fmt.Errorf("failed to parse arguments: %w", err)
 	}
 
-	result, err := t.Session.CallTool(context.Background(), &mcp.CallToolParams{
+	result, err := t.Session.CallTool(ctx, &mcp.CallToolParams{
 		Name:      t.Tool.Name,
 		Arguments: arguments,
 	})

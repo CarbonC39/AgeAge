@@ -103,6 +103,9 @@ func NewFactory(configPath string, debug bool) (*AgentFactory, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to load config: %w", err)
 	}
+	if err := cfg.EnsureDirs(); err != nil {
+		return nil, err
+	}
 
 	if cfg.LLM.APIKey == "" {
 		cfg.LLM.APIKey = os.Getenv("AGEAGE_API_KEY")
@@ -367,10 +370,8 @@ func (f *AgentFactory) CreateAgentFiltered(confirmMgr *tools.ConfirmationManager
 	}
 
 	// Delegation tool.
-	if f.Config.SubAgent.Enabled {
-		if shouldRegisterTool("delegate") {
-			registry.Register(&DelegateTool{factory: f, registry: registry})
-		}
+	if shouldRegisterTool("delegate") {
+		registry.Register(&DelegateTool{factory: f, registry: registry})
 	}
 
 	// MCP Tools (external).
@@ -399,6 +400,13 @@ func (f *AgentFactory) CreateAgentFiltered(confirmMgr *tools.ConfirmationManager
 	ag.ConfirmationMgr = confirmMgr
 	if channelID != "" {
 		ag.SetChannelID(channelID)
+	}
+
+	// Router is only useful for the main agent. Sub-agents (allowedTools != nil)
+	// always set IsSubAgent=true and the router is guarded by !IsSubAgent, so
+	// creating it would waste the AGENT.md read and allocate memory for nothing.
+	if allowedTools == nil && f.Config.Router.Enabled {
+		ag.router = NewRouter(f.Config, f.LLMClient, f.GetSkills(), f.Debug)
 	}
 
 	// If allowedTools is provided, also register any skill-only tools requested.

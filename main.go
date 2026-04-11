@@ -59,6 +59,7 @@ func main() {
 	}
 	cliCmd.Flags().StringP("config", "c", "", "Path to config.toml (default: ./config.toml or ./workspace/config.toml)")
 	cliCmd.Flags().Bool("soul", false, "Inject SOUL.md personality (default false in CLI mode)")
+	cliCmd.Flags().BoolP("think", "T", false, "Show reasoning model think-blocks inline (default: show summary only)")
 	rootCmd.AddCommand(cliCmd)
 
 	// --- ageage connect ---
@@ -224,11 +225,28 @@ max_iterations = 20
 mode = "supervised"
 
 [subagent]
-enabled = true
 max_iterations = 10
 timeout = 300
 
 [subagent.model]
+# model = ""
+# api_key = ""
+# base_url = ""
+
+[pipeline]
+# foreach_concurrency = 4  # max parallel foreach iterations; 0 or 1 = sequential
+
+[pipeline.models.simple]
+# model = ""
+# api_key = ""
+# base_url = ""
+
+[pipeline.models.medium]
+# model = ""
+# api_key = ""
+# base_url = ""
+
+[pipeline.models.complex]
 # model = ""
 # api_key = ""
 # base_url = ""
@@ -915,6 +933,7 @@ func runCLI(cmd *cobra.Command, args []string) error {
 	configPath, _ := cmd.Flags().GetString("config")
 	configPath = findConfigFile(configPath)
 	soulFlag, _ := cmd.Flags().GetBool("soul")
+	showThink, _ := cmd.Flags().GetBool("think")
 
 	factory, err := agent.NewFactory(configPath, debugFlag)
 	if err != nil {
@@ -975,6 +994,11 @@ func runCLI(cmd *cobra.Command, args []string) error {
 			}
 			fmt.Println("  (Type your answer, or /stop to cancel)")
 		}
+		// Pipeline node progress: print each status update on its own line.
+		newAg.NotifyFunc = func(msg string) {
+			fmt.Println()
+			fmt.Println(stGray.Render("  ◈ ") + stDim.Render(msg))
+		}
 		return newAg
 	}
 
@@ -1001,7 +1025,11 @@ func runCLI(cmd *cobra.Command, args []string) error {
 	}
 
 	ui := newCLIUI(factory.Config.LLM.Model)
+	thinkFilter := &ThinkStreamFilter{showThink: showThink}
 	ui.printBanner()
+	if showThink {
+		ui.printInfo("Think-blocks: expanded  (--think)")
+	}
 	if len(ag.Messages()) > 0 {
 		ui.printInfo(fmt.Sprintf("Resumed session '%s'.", activeSessionID))
 	}
@@ -1012,8 +1040,38 @@ func runCLI(cmd *cobra.Command, args []string) error {
 	go func() {
 		scanner := bufio.NewScanner(os.Stdin)
 		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+		var accum strings.Builder
+		inBlock := false
 		for scanner.Scan() {
-			inputCh <- scanner.Text()
+			raw := scanner.Text()
+			if inBlock {
+				if strings.TrimSpace(raw) == "```" {
+					inBlock = false
+					inputCh <- strings.TrimRight(accum.String(), "\n")
+					accum.Reset()
+				} else {
+					accum.WriteString(raw + "\n")
+					fmt.Print(stGray.Render("... ▸ "))
+				}
+				continue
+			}
+			if strings.TrimSpace(raw) == "```" {
+				inBlock = true
+				fmt.Print(stGray.Render("... ▸ "))
+				continue
+			}
+			if strings.HasSuffix(raw, "\\") {
+				accum.WriteString(strings.TrimSuffix(raw, "\\") + "\n")
+				fmt.Print(stGray.Render("... ▸ "))
+				continue
+			}
+			if accum.Len() > 0 {
+				accum.WriteString(raw)
+				inputCh <- accum.String()
+				accum.Reset()
+			} else {
+				inputCh <- raw
+			}
 		}
 		close(inputCh)
 	}()
@@ -1162,6 +1220,67 @@ func runCLI(cmd *cobra.Command, args []string) error {
 				}
 				ui.printPrompt()
 
+			case "/think":
+				if thinkFilter.LastThink == "" {
+					ui.printInfo("No think-block captured yet.")
+				} else {
+					fmt.Println()
+					fmt.Println(stGray.Render("┌── last thinking ") + stDim.Render(line(34)))
+					for _, l := range strings.Split(strings.TrimSpace(thinkFilter.LastThink), "\n") {
+						fmt.Println(stDim.Render("│ " + l))
+					}
+					fmt.Println(stGray.Render("└" + line(50)))
+					fmt.Println()
+				}
+				ui.printPrompt()
+
+			case "/skills":
+				skills := factory.GetSkills()
+				if len(skills) == 0 {
+					ui.printInfo("No skills loaded.")
+				} else {
+					fmt.Println()
+					for _, s := range skills {
+						tag := ""
+						if s.IsPipeline() {
+							tag = stDim.Render(" [pipeline]")
+						}
+						fmt.Printf("  %s  %s%s\n",
+							stBlue.Render("/"+s.CommandName()),
+							stGray.Render(s.Description),
+							tag,
+						)
+					}
+					fmt.Println()
+				}
+				ui.printPrompt()
+
+			case "/help":
+				fmt.Println()
+				helpLines := [][]string{
+					{"/help", "Show this help"},
+					{"/clear", "Clear conversation history"},
+					{"/stop", "Interrupt a running task"},
+					{"/think", "Print the last reasoning think-block"},
+					{"/skills", "List available skills"},
+					{"/summarize", "Compress conversation history"},
+					{"/session", "Show current session"},
+					{"/session list", "List all sessions"},
+					{"/session new [name]", "Create and switch to a new session"},
+					{"/session switch <name>", "Switch to an existing session"},
+					{"/session delete <name>", "Delete a session"},
+					{"exit / quit", "Exit AgeAge"},
+					{"@/path/to/file", "Attach a file to your message"},
+				}
+				for _, row := range helpLines {
+					fmt.Printf("  %s  %s\n",
+						stBlue.Render(fmt.Sprintf("%-28s", row[0])),
+						stGray.Render(row[1]),
+					)
+				}
+				fmt.Println()
+				ui.printPrompt()
+
 			default:
 				// Parse @path file attachments from input.
 				cleanText, parts, warnings := agent.ParseCLIInput(input, factory.Config, ag.TmpManager())
@@ -1200,32 +1319,36 @@ func runCLI(cmd *cobra.Command, args []string) error {
 					case "ask_user":
 						spinner.Stop() // AskUserNotify will print the question
 					default:
-						label := name
-						spinner.Update("Running " + label + "…")
+						spinner.Update("Running " + name + "…")
 					}
 				}
 				ag.ToolEndCallback = func(name string) {
-					// After non-diff tools finish, resume thinking spinner.
 					switch name {
 					case "file_write", "file_edit":
-						// Spinner already stopped for diff display; restart for next step.
 						spinner.Start("Thinking…")
 					default:
 						spinner.Update("Thinking…")
 					}
 				}
+				ag.ToolResultCallback = func(name, result string) {
+					ui.printToolResult(name, result)
+				}
 
+				thinkFilter.Reset()
 				agentCh = make(chan agentResult, 1)
 				go func(text string, ps []llm.ContentPart, ch chan agentResult) {
 					streamed := false
-					result, err := ag.RunWithParts(context.Background(), text, ps, func(token string) {
+					// inner: the real output function, stops spinner on first token.
+					thinkFilter.inner = func(token string) {
 						if !streamed {
-							spinner.Stop() // clear spinner before first streamed token
+							spinner.Stop()
 							streamed = true
 						}
 						fmt.Print(token)
-					})
-					spinner.Stop() // ensure cleared if no tokens were streamed
+					}
+					result, err := ag.RunWithParts(context.Background(), text, ps, thinkFilter.Wrap())
+					thinkFilter.Flush()
+					spinner.Stop()
 					ch <- agentResult{result, streamed, err}
 				}(cleanText, parts, agentCh)
 			}

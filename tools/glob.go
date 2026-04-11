@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -47,7 +48,7 @@ type GlobArgs struct {
 	BasePath string `json:"base_path"`
 }
 
-func (t *GlobTool) Execute(args json.RawMessage) (string, error) {
+func (t *GlobTool) Execute(_ context.Context, args json.RawMessage) (string, error) {
 	var a GlobArgs
 	if err := json.Unmarshal(args, &a); err != nil {
 		return "", fmt.Errorf("invalid arguments: %w", err)

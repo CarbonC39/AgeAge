@@ -114,6 +114,7 @@ var delegateBlacklist = map[string]bool{
 // runSkillDelegate creates and runs a sub-agent with the given model config.
 // It always strips delegation tools from the allowed-tools list.
 func runSkillDelegate(
+	ctx context.Context,
 	factory *AgentFactory,
 	registry *tools.Registry,
 	a SubAgentArgs,
@@ -151,7 +152,7 @@ func runSkillDelegate(
 		if factory.Debug {
 			fmt.Printf("  ⤷  %-10s pre-tool: %s\n", label, a.PreTool)
 		}
-		preResult, err := registry.Execute(a.PreTool, a.PreToolArgs)
+		preResult, err := registry.Execute(ctx, a.PreTool, a.PreToolArgs)
 		if err != nil {
 			return "", fmt.Errorf("pre_tool %q failed: %w", a.PreTool, err)
 		}
@@ -161,15 +162,15 @@ func runSkillDelegate(
 		)
 	}
 
-	// Run with optional timeout.
-	ctx := context.Background()
+	// Cap with SubAgent.Timeout if configured; inherit parent ctx so /stop propagates.
+	execCtx := ctx
 	if factory.Config.SubAgent.Timeout > 0 {
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, time.Duration(factory.Config.SubAgent.Timeout)*time.Second)
+		execCtx, cancel = context.WithTimeout(ctx, time.Duration(factory.Config.SubAgent.Timeout)*time.Second)
 		defer cancel()
 	}
 
-	result, err := subAgent.Run(ctx, a.Task, nil)
+	result, err := subAgent.Run(execCtx, a.Task, nil)
 	if err != nil {
 		if strings.Contains(err.Error(), "maximum iterations") {
 			return "", fmt.Errorf("%s sub-agent hit iteration limit: %w", label, err)
@@ -203,10 +204,10 @@ func (t *EscalateTool) Description() string {
 
 func (t *EscalateTool) Parameters() map[string]interface{} { return delegateToolParams() }
 
-func (t *EscalateTool) Execute(args json.RawMessage) (string, error) {
+func (t *EscalateTool) Execute(ctx context.Context, args json.RawMessage) (string, error) {
 	var a SubAgentArgs
 	if err := json.Unmarshal(args, &a); err != nil {
 		return "", fmt.Errorf("invalid arguments: %w", err)
 	}
-	return runSkillDelegate(t.factory, t.registry, a, t.factory.Config.Router.StrongModel, "Escalate")
+	return runSkillDelegate(ctx, t.factory, t.registry, a, t.factory.Config.Router.StrongModel, "Escalate")
 }

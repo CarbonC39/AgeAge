@@ -75,6 +75,11 @@ type PipelineNode struct {
 	// Complexity selects the LLM model: "simple", "medium", or "complex".
 	Complexity string `yaml:"complexity"`
 
+	// FallbackComplexity is the model complexity to retry with when the primary
+	// model call fails (e.g. API error, model unavailable). Valid values are the
+	// same as Complexity. Ignored if empty or if the error is a cancellation.
+	FallbackComplexity string `yaml:"fallback_complexity"`
+
 	// InjectSoul controls whether SOUL.md is included in the node's system prompt.
 	InjectSoul bool `yaml:"inject_soul"`
 

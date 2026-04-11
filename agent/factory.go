@@ -73,7 +73,8 @@ func (f *AgentFactory) WatchSkills(ctx context.Context) {
 	}
 }
 
-// latestSkillMod returns the most recent modification time of any .md file in dir.
+// latestSkillMod returns the most recent modification time of any skill file
+// (.md, .yaml, .yml) in dir.
 func (f *AgentFactory) latestSkillMod(dir string) time.Time {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -81,7 +82,8 @@ func (f *AgentFactory) latestSkillMod(dir string) time.Time {
 	}
 	var latest time.Time
 	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
+		ext := strings.ToLower(filepath.Ext(e.Name()))
+		if e.IsDir() || (ext != ".md" && ext != ".yaml" && ext != ".yml") {
 			continue
 		}
 		info, err := e.Info()

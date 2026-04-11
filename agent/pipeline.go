@@ -401,6 +401,10 @@ func (e *PipelineExecutor) execAutoNode(ctx context.Context, node skills.Pipelin
 // node can report structured outputs and context back to the executor.
 // Outputs are written to `out` keyed by pipeline var name.
 // Returns (context_string, error).
+//
+// When node.FallbackComplexity is set and the primary run returns an LLM error
+// (not a context cancellation or node_complete failure), the node is retried
+// once using the fallback model.
 func (e *PipelineExecutor) execAgentNode(ctx context.Context, node skills.PipelineNode, foreachItem interface{}, foreachIdx int, out map[string]interface{}) (string, error) {
 	// Resolve the node's Skill (if specified).
 	var nodeSkill *skills.Skill
@@ -426,6 +430,57 @@ func (e *PipelineExecutor) execAgentNode(ctx context.Context, node skills.Pipeli
 		filteredTools = UniqueStrings(toolList)
 	}
 
+	// Build the task prompt once; it is the same for all attempts.
+	taskPrompt := e.buildNodePrompt(node, foreachItem, foreachIdx)
+	if len(node.Outputs) > 0 {
+		var keys []string
+		for _, k := range node.Outputs {
+			keys = append(keys, k)
+		}
+		taskPrompt += fmt.Sprintf(
+			"\n\n---\nIMPORTANT: Call node_complete when done. Expected keys in the 'vars' argument: %s.",
+			strings.Join(keys, ", "),
+		)
+	}
+
+	// Attempt execution, retrying with fallback_complexity on LLM errors.
+	complexities := []string{node.Complexity}
+	if node.FallbackComplexity != "" {
+		complexities = append(complexities, node.FallbackComplexity)
+	}
+
+	var lastErr error
+	for attempt, complexity := range complexities {
+		if attempt > 0 {
+			e.debugf("Fallback", "%s  attempt %d failed (%s) → retrying with complexity=%s", node.ID, attempt, lastErr, complexity)
+		}
+		nodeCtx, nodeOut, err := e.runAgentNodeAttempt(ctx, node, nodeSkill, filteredTools, taskPrompt, complexity)
+		if err == nil {
+			for k, v := range nodeOut {
+				out[k] = v
+			}
+			return nodeCtx, nil
+		}
+		// Do not retry on context cancellation — the user or timeout killed the run.
+		if ctx.Err() != nil {
+			return "", err
+		}
+		lastErr = err
+	}
+	return "", lastErr
+}
+
+// runAgentNodeAttempt performs a single execution attempt for an agent node
+// using the given complexity (which may differ from node.Complexity on retry).
+// Returns (context_string, output_map, error).
+func (e *PipelineExecutor) runAgentNodeAttempt(
+	ctx context.Context,
+	node skills.PipelineNode,
+	nodeSkill *skills.Skill,
+	filteredTools []string,
+	taskPrompt string,
+	complexity string,
+) (string, map[string]interface{}, error) {
 	// Create an isolated sub-agent. Sub-agents in pipelines:
 	//   - Do NOT get pipeline todo callbacks (would conflict with pipeline's own display).
 	//   - Do NOT load skills (IsSubAgent=true skips skill-only tool injection).
@@ -439,8 +494,8 @@ func (e *PipelineExecutor) execAgentNode(ctx context.Context, node skills.Pipeli
 		subAgent.MaxIterations = e.factory.Config.SubAgent.MaxIterations
 	}
 
-	// Apply model from node complexity.
-	e.applyNodeModel(subAgent, node.Complexity)
+	// Apply model from complexity (node or fallback).
+	e.applyNodeModel(subAgent, complexity)
 
 	// Pre-inject the system prompt. RunWithParts checks len(messages)==0 to
 	// determine the first turn; setting it here tells RunWithParts that the
@@ -456,21 +511,6 @@ func (e *PipelineExecutor) execAgentNode(ctx context.Context, node skills.Pipeli
 		resultCh:      resultCh,
 		finishTool:    subAgent.finishTool,
 	})
-
-	// Build the task prompt. Prepend accumulated context from prior nodes.
-	taskPrompt := e.buildNodePrompt(node, foreachItem, foreachIdx)
-
-	// Remind the agent about expected output keys (reduces hallucinated key names).
-	if len(node.Outputs) > 0 {
-		var keys []string
-		for _, k := range node.Outputs {
-			keys = append(keys, k)
-		}
-		taskPrompt += fmt.Sprintf(
-			"\n\n---\nIMPORTANT: Call node_complete when done. Expected keys in the 'vars' argument: %s.",
-			strings.Join(keys, ", "),
-		)
-	}
 
 	e.debugf("Agent▷", "%s  %q", node.ID, truncateStr(taskPrompt, 200))
 
@@ -505,22 +545,24 @@ func (e *PipelineExecutor) execAgentNode(ctx context.Context, node skills.Pipeli
 		if reason == "" {
 			reason = "node reported failure without a reason"
 		}
-		return "", fmt.Errorf("%s", reason)
+		// node_complete(failure) is a deliberate agent decision — do not retry.
+		return "", nil, fmt.Errorf("%s", reason)
 	}
 
 	// Surface LLM errors that node_complete didn't mask.
 	if runErr != nil {
-		return "", fmt.Errorf("agent node %q: %w", node.ID, runErr)
+		return "", nil, fmt.Errorf("agent node %q: %w", node.ID, runErr)
 	}
 
 	e.debugf("Agent◁", "%s  vars=%v", node.ID, nodeResult.Vars)
 
+	out := make(map[string]interface{}, len(node.Outputs))
 	for pipelineVar, nodeOutputKey := range node.Outputs {
 		if v, ok := nodeResult.Vars[nodeOutputKey]; ok {
 			out[pipelineVar] = v
 		}
 	}
-	return nodeResult.Context, nil
+	return nodeResult.Context, out, nil
 }
 
 // execNestedPipeline runs a pipeline skill referenced from a node's Skill field.

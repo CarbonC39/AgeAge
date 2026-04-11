@@ -21,6 +21,8 @@ No node can see another node's internal reasoning or history. They can only see 
 
 Pipeline skills are standalone `.yaml` files in the `skills/` directory. They are **not** Markdown files with frontmatter — the entire file is YAML.
 
+> **Hot reload**: changes to `.yaml` (and `.yml`) pipeline files are detected automatically alongside `.md` skill changes. No restart required.
+
 ```yaml
 # skills/my-pipeline.yaml
 name: my-pipeline
@@ -127,6 +129,7 @@ Every node in the `pipeline` list supports these fields:
 | `skill` | string | — | Activate a named skill inside this node. May reference another pipeline skill (nested, max 1 level). |
 | `tools` | list | — | Tool allowlist for this node. If empty and no skill, all global tools are available. |
 | `complexity` | string | — | `simple` / `medium` / `complex`. Selects the LLM model for this node. |
+| `fallback_complexity` | string | — | Fallback model complexity if the primary model call fails (e.g. API error). Same values as `complexity`. |
 | `inject_soul` | bool | `false` | Whether to include `SOUL.md` in this node's system prompt. |
 | `no_context` | bool | `false` | Suppress `.ageage/CONTEXT.md` injection for this node. |
 | `output_context` | bool | `false` | Allow this node to pass a context string to all subsequent nodes via `node_complete`. |
@@ -363,6 +366,48 @@ pipeline:
 
 Nesting is limited to **1 level deep**. A pipeline skill running inside a node cannot itself invoke another pipeline skill.
 
+### `ask_user` — pause for human input
+
+Use the `ask_user` skill-only tool to pause the pipeline and request input from the user. Execution blocks until the user replies. If the user sends `/stop` or `/session abort`, the pending request is cancelled and the pipeline stops.
+
+In channels that support interactive elements (e.g. Telegram), options are rendered as clickable buttons.
+
+```yaml
+name: content-approver
+description: "Draft content, then ask the user for approval before publishing."
+pipeline:
+  - id: draft
+    prompt: |
+      Write a short announcement post about: {{$vars.input}}
+    outputs:
+      draft: result
+
+  - id: review
+    tools:
+      - ask_user
+    prompt: |
+      The draft is ready:
+
+      {{$vars.draft}}
+
+      Ask the user whether to publish, revise, or discard it.
+      Use ask_user with options: ["Publish", "Revise", "Discard"]
+      Then call node_complete with:
+      - status: "success"
+      - vars.decision: the user's choice
+    outputs:
+      decision: decision
+
+  - id: act
+    prompt: |
+      The user chose: {{$vars.decision}}
+      Draft: {{$vars.draft}}
+
+      Carry out the decision.
+```
+
+`ask_user` is a **skill-only tool** — it must be listed explicitly in the node's `tools` field.
+
 ### Validate inputs before running
 
 Use `validate: not_empty` to fail fast if required inputs are missing:
@@ -436,7 +481,25 @@ After all nodes complete, the pipeline determines its final result in this order
 - All remaining nodes are marked as **skipped** in the progress display.
 - The error message is surfaced to the user.
 
-There is no retry or partial recovery — design pipelines so that each node is robust enough to succeed on its own, or use `validate: not_empty` to surface missing data early.
+### Model fallback
+
+When a node's primary model is unavailable or returns an API error, you can configure an automatic retry with a different model using `fallback_complexity`:
+
+```yaml
+- id: synthesize
+  complexity: complex          # try the strong model first
+  fallback_complexity: simple  # fall back to the base model on API failure
+  prompt: |
+    Synthesize the findings into a final report.
+  outputs:
+    report: result
+```
+
+The fallback only triggers on **LLM API errors** (model unavailable, rate limit, network failure). It does not retry if:
+- The agent deliberately called `node_complete` with `status: "failure"`
+- The pipeline context was cancelled (e.g. user sent `/stop`)
+
+Design pipelines so that each node is robust enough to succeed on its own, or use `validate: not_empty` to surface missing data early.
 
 ---
 
@@ -474,8 +537,6 @@ pipeline:
     concurrency: 3
     no_context: true # pure extraction, no workspace context needed
     output_context: true # findings flow forward automatically
-    tools:
-      - finish_task # not needed — node_complete is injected automatically
     prompt: |
       Extract the 3 most important facts from this article:
 

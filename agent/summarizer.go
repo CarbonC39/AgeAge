@@ -118,6 +118,17 @@ func (s *Summarizer) Summarize(ctx context.Context, messages []llm.Message) ([]l
 		0, // summarization calls don't need a token cap
 	)
 
+	// Strip existing summaries from the oldMessages slice so we don't summarize
+	// a previous summary of a summary.
+	var oldFiltered strings.Builder
+	for _, m := range oldMessages {
+		if m.Role == "system" && strings.HasPrefix(m.Content, "[Previous conversation summary]") {
+			oldFiltered.WriteString(fmt.Sprintf("Earlier summary: %s\n", strings.TrimPrefix(m.Content, "[Previous conversation summary]\n")))
+			continue
+		}
+		// ... (the existing logic for convText already covers other roles)
+	}
+
 	summaryMessages := []llm.Message{
 		{
 			Role: "system",
@@ -164,11 +175,16 @@ Keep the summary under 300 words. Output ONLY the summary, no preamble.`,
 	// Insert summary as a system message.
 	newMessages = append(newMessages, llm.Message{
 		Role:    "system",
-		Content: fmt.Sprintf("[Previous conversation summary]\n%s", summary),
+		Content: fmt.Sprintf("[Previous conversation summary]\n%s", strings.TrimSpace(summary)),
 	})
 
-	// Append recent messages.
-	newMessages = append(newMessages, recentMessages...)
+	// Append recent messages, but filter out any old summaries that might be in recentMessages.
+	for _, m := range recentMessages {
+		if m.Role == "system" && strings.HasPrefix(m.Content, "[Previous conversation summary]") {
+			continue
+		}
+		newMessages = append(newMessages, m)
+	}
 
 	return newMessages, nil
 }

@@ -339,15 +339,29 @@ func sanitizeForGemini(msgs []Message) []Message {
 	}
 
 	// Merge consecutive same-role plain-text messages (user/assistant).
-	// Tool-related messages and multimodal messages (with Parts) are never merged.
+	// Tool-related messages are never merged.
 	for _, m := range rest {
 		prev := len(out) - 1
 		if len(out) > 0 &&
 			out[prev].Role == m.Role &&
 			len(out[prev].ToolCalls) == 0 && out[prev].ToolCallID == "" &&
-			len(m.ToolCalls) == 0 && m.ToolCallID == "" &&
-			len(out[prev].Parts) == 0 && len(m.Parts) == 0 {
-			out[prev].Content += "\n\n" + m.TextContent()
+			len(m.ToolCalls) == 0 && m.ToolCallID == "" {
+
+			if len(out[prev].Parts) == 0 && len(m.Parts) == 0 {
+				// Both plain text: simple concatenation.
+				out[prev].Content += "\n\n" + m.TextContent()
+			} else if len(m.Parts) == 0 {
+				// Merge plain text m into multimodal out[prev].
+				out[prev].Parts = append(out[prev].Parts, ContentPart{
+					Type: "text",
+					Text: "\n\n" + m.Content,
+				})
+				// Also update Content for backward-compatibility.
+				out[prev].Content = out[prev].TextContent()
+			} else {
+				// m has parts or both have parts: don't attempt merge to preserve structure.
+				out = append(out, m)
+			}
 		} else {
 			out = append(out, m)
 		}

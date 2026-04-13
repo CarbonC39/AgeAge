@@ -33,6 +33,7 @@ type AgentFactory struct {
 	InjectSoul      bool                          // Passed to each created agent; true in serve/connect, false in CLI
 	OnAlwaysAllow   func(operation string)        // Optional: called when user selects "a" (always-allow) in CLI confirm
 
+	mcpMu    sync.RWMutex // Bug Fix 2: Protect MCPSessions
 	skillsMu sync.RWMutex
 	Skills   []skills.Skill
 }
@@ -195,6 +196,60 @@ func NewFactory(configPath string, debug bool) (*AgentFactory, error) {
 	}, nil
 }
 
+// ensureMCPSessions checks existing MCP sessions and attempts to reconnect
+// to any servers that are missing or unresponsive.
+func (f *AgentFactory) ensureMCPSessions() {
+	if !f.Config.MCP.Enabled {
+		return
+	}
+
+	if f.MCPSessions == nil {
+		f.MCPSessions = make(map[string]*mcp.ClientSession)
+	}
+
+	for name, srv := range f.Config.MCP.Servers {
+		existing, ok := f.MCPSessions[name]
+		if ok && existing != nil {
+			// Basic connectivity check: try to list tools with a very short timeout.
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			_, err := existing.ListTools(ctx, nil)
+			cancel()
+			if err == nil {
+				continue // Session is healthy.
+			}
+			if f.Debug {
+				fmt.Printf("⚠️  MCP server %s unresponsive, reconnecting: %v\n", name, err)
+			}
+		}
+
+		// Reconnect.
+		if f.Debug {
+			fmt.Printf("🔌 (Re)connecting to MCP Server: %s (%s %s)...\n", name, srv.Command, strings.Join(srv.Args, " "))
+		}
+
+		client := mcp.NewClient(&mcp.Implementation{
+			Name:    "AgeAge",
+			Version: "1.0.0",
+		}, nil)
+
+		cmd := exec.Command(srv.Command, srv.Args...)
+		cmd.Env = os.Environ()
+		for k, v := range srv.Env {
+			cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", k, v))
+		}
+
+		transport := &mcp.CommandTransport{Command: cmd}
+		session, err := client.Connect(context.Background(), transport, nil)
+		if err != nil {
+			if f.Debug {
+				fmt.Printf("⚠️  Failed to (re)connect to MCP server %s: %s\n", name, err)
+			}
+			continue
+		}
+		f.MCPSessions[name] = session
+	}
+}
+
 // CreateAgent instantiates a new Agent with fresh tools.
 func (f *AgentFactory) CreateAgent(confirmMgr *tools.ConfirmationManager, channelID string) *Agent {
 	return f.CreateAgentFiltered(confirmMgr, channelID, nil)
@@ -202,6 +257,8 @@ func (f *AgentFactory) CreateAgent(confirmMgr *tools.ConfirmationManager, channe
 
 // CreateAgentFiltered instantiates a new Agent with a subset of tools if allowedTools is provided.
 func (f *AgentFactory) CreateAgentFiltered(confirmMgr *tools.ConfirmationManager, channelID string, allowedTools []string) *Agent {
+	f.ensureMCPSessions() // Bug Fix 6: Reconnect dead MCP servers.
+
 	registry := tools.NewRegistry()
 
 	finishTool := &tools.FinishTool{}
@@ -410,6 +467,7 @@ func (f *AgentFactory) CreateAgentFiltered(confirmMgr *tools.ConfirmationManager
 	// creating it would waste the AGENT.md read and allocate memory for nothing.
 	if allowedTools == nil && f.Config.Router.Enabled {
 		ag.router = NewRouter(f.Config, f.LLMClient, f.GetSkills(), f.Debug)
+		ag.router.InjectSoul = ag.InjectSoul
 	}
 
 	// If allowedTools is provided, also register any skill-only tools requested.

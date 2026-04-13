@@ -115,9 +115,22 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	ag := s.factory.CreateAgent(nil, "")
 
-	// Seed agent with previous history, omitting the very last user message.
+	// Seed agent with previous history, omitting the very last user message and
+	// stripping any system message the client sent. AgeAge always rebuilds the
+	// system prompt via buildSystemPrompt so that SOUL.md, AGENT.md, and context
+	// are correctly injected regardless of what the client supplied.
 	if lastUserIdx > 0 {
-		ag.SetMessages(req.Messages[:lastUserIdx])
+		history := req.Messages[:lastUserIdx]
+		filtered := make([]llm.Message, 0, len(history))
+		for _, m := range history {
+			if m.Role != "system" {
+				filtered = append(filtered, m)
+			}
+		}
+		ag.SetMessages(filtered)
+	} else if lastUserIdx == 0 {
+		// No history, just the user message.
+		ag.SetMessages(nil)
 	}
 
 	lastMsg := req.Messages[lastUserIdx]

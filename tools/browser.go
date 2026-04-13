@@ -122,9 +122,10 @@ func (s *BrowserSession) timeout() time.Duration {
 // ── Playwright backend ───────────────────────────────────────────────────────
 
 type playwrightBackend struct {
-	pw      *playwright.Playwright
-	browser playwright.Browser
-	page    playwright.Page
+	pw          *playwright.Playwright
+	context     playwright.BrowserContext
+	page        playwright.Page
+	userDataDir string
 }
 
 func newPlaywrightBackend(cfg *config.BrowserConfig) (*playwrightBackend, error) {
@@ -134,32 +135,48 @@ func newPlaywrightBackend(cfg *config.BrowserConfig) (*playwrightBackend, error)
 		return nil, fmt.Errorf("playwright: failed to start: %w", err)
 	}
 
-	launchOpts := playwright.BrowserTypeLaunchOptions{
+	// Create a unique temporary directory for this browser session.
+	// This prevents port/lock conflicts when multiple agents run in parallel.
+	userDataDir, err := os.MkdirTemp("", "ageage-browser-*")
+	if err != nil {
+		pw.Stop() //nolint:errcheck
+		return nil, fmt.Errorf("playwright: failed to create user data dir: %w", err)
+	}
+
+	launchOpts := playwright.BrowserTypeLaunchPersistentContextOptions{
 		Headless: playwright.Bool(cfg.Headless),
 	}
 
-	var browser playwright.Browser
+	var context playwright.BrowserContext
 	switch cfg.BrowserType {
 	case "firefox":
-		browser, err = pw.Firefox.Launch(launchOpts)
+		context, err = pw.Firefox.LaunchPersistentContext(userDataDir, launchOpts)
 	case "webkit":
-		browser, err = pw.WebKit.Launch(launchOpts)
+		context, err = pw.WebKit.LaunchPersistentContext(userDataDir, launchOpts)
 	default: // "chromium"
-		browser, err = pw.Chromium.Launch(launchOpts)
+		context, err = pw.Chromium.LaunchPersistentContext(userDataDir, launchOpts)
 	}
 	if err != nil {
-		pw.Stop() //nolint:errcheck
-		return nil, fmt.Errorf("playwright: failed to launch browser: %w", err)
+		os.RemoveAll(userDataDir) //nolint:errcheck
+		pw.Stop()                 //nolint:errcheck
+		return nil, fmt.Errorf("playwright: failed to launch browser context: %w", err)
 	}
 
-	page, err := browser.NewPage()
-	if err != nil {
-		browser.Close() //nolint:errcheck
-		pw.Stop()       //nolint:errcheck
-		return nil, fmt.Errorf("playwright: failed to create page: %w", err)
+	pages := context.Pages()
+	var page playwright.Page
+	if len(pages) > 0 {
+		page = pages[0]
+	} else {
+		page, err = context.NewPage()
+		if err != nil {
+			context.Close()           //nolint:errcheck
+			os.RemoveAll(userDataDir) //nolint:errcheck
+			pw.Stop()                 //nolint:errcheck
+			return nil, fmt.Errorf("playwright: failed to create page: %w", err)
+		}
 	}
 
-	return &playwrightBackend{pw: pw, browser: browser, page: page}, nil
+	return &playwrightBackend{pw: pw, context: context, page: page, userDataDir: userDataDir}, nil
 }
 
 func (b *playwrightBackend) Navigate(rawURL, waitUntil string, timeout time.Duration) (string, string, error) {
@@ -299,8 +316,11 @@ func (b *playwrightBackend) Content(format, selector string, timeout time.Durati
 
 func (b *playwrightBackend) Close() {
 	b.page.Close()    //nolint:errcheck
-	b.browser.Close() //nolint:errcheck
+	b.context.Close() //nolint:errcheck
 	b.pw.Stop()       //nolint:errcheck
+	if b.userDataDir != "" {
+		os.RemoveAll(b.userDataDir) //nolint:errcheck
+	}
 }
 
 // ── agent-browser backend ────────────────────────────────────────────────────

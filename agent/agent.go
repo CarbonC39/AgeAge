@@ -424,8 +424,13 @@ func (a *Agent) RunWithParts(ctx context.Context, userInput string, parts []llm.
 		}
 	}
 
-	// --- First-turn system prompt (now that skill is known) ---
-	if isFirstTurn {
+	// --- System prompt initialization/refresh ---
+	// In serve/connect mode, history may be loaded before Run starts (SetMessages).
+	// We must ensure the system prompt is updated with the active skill or
+	// current personality (InjectSoul) even if it's not the first turn.
+	if len(a.messages) > 0 && a.messages[0].Role == "system" {
+		a.messages[0].Content = a.buildSystemPrompt(matchedSkill)
+	} else if isFirstTurn {
 		sysMsg := llm.Message{
 			Role:    "system",
 			Content: a.buildSystemPrompt(matchedSkill),
@@ -559,6 +564,8 @@ func (a *Agent) RunWithParts(ctx context.Context, userInput string, parts []llm.
 
 	// --- Execution loop ---
 	fallbackUsed := false
+	defer a.gcTmp() // Ensure cleanup on any exit path.
+
 	for i := 0; i < a.MaxIterations; i++ {
 		// Check for cancellation.
 		if ctx.Err() != nil {
@@ -576,23 +583,20 @@ func (a *Agent) RunWithParts(ctx context.Context, userInput string, parts []llm.
 		callMessages := a.buildCallMessages()
 
 		// inflightResults[idx] receives the tool result for tool call at position idx.
-		// Tools dispatched progressively (during streaming) or in parallel (after
-		// stream) write their results here; the main goroutine drains them in order.
 		type toolExecResult struct {
-			result string
+			result  string
 			execErr error
 		}
 		inflightResults := make(map[int]chan toolExecResult)
 
-		// Determine effective parallelism (0/1 = sequential).
+		// Determine effective parallelism.
 		maxPar := a.cfg.Agent.MaxParallelTools
 		if maxPar <= 0 {
 			maxPar = 1
 		}
 		sem := make(chan struct{}, maxPar)
 
-		// dispatchTool executes a single tool call in the current goroutine and
-		// returns its result. Fires ToolStart/EndCallback around execution.
+		// dispatchTool executes a single tool call.
 		dispatchTool := func(tc llm.ToolCall) (string, error) {
 			var rawArgs json.RawMessage
 			if err2 := jsonutil.ParseToolArgs(tc.Function.Arguments, &rawArgs); err2 != nil {
@@ -614,11 +618,27 @@ func (a *Agent) RunWithParts(ctx context.Context, userInput string, parts []llm.
 			return res, execErr
 		}
 
-		// For streaming calls, wire a progressive callback that starts tool
-		// execution as soon as each tool call's JSON arguments are complete.
+		// For streaming calls, wire a progressive callback.
+		// Bug Fix 1: Sequential dependency in streaming.
+		// If we are in parallel mode (maxPar > 1), we check for mutations.
+		// To be safe, if we detect multiple tool calls in a stream, and we suspect
+		// dependencies, we can either serialize them or defer them.
 		var toolCallStreamCb llm.ToolCallStreamCb
 		if streamCb != nil && maxPar > 1 {
 			toolCallStreamCb = func(idx int, call llm.ToolCall) {
+				// We don't know the FULL list of tools yet in a stream.
+				// If the model is known to emit dependent tools (like file_write followed by bash),
+				// progressive execution is risky.
+				// For now, we allow progressive execution only for non-mutation tools.
+				n := call.Function.Name
+				isMutation := n == "file_write" || n == "file_edit" || n == "bash"
+
+				if isMutation {
+					// Don't start mutation tools progressively; let the main loop
+					// handle them after the stream ends (where they might be serialized).
+					return
+				}
+
 				ch := make(chan toolExecResult, 1)
 				inflightResults[idx] = ch
 				go func() {
@@ -676,6 +696,23 @@ func (a *Agent) RunWithParts(ctx context.Context, userInput string, parts []llm.
 			}
 
 			return "", fmt.Errorf("LLM call failed at iteration %d: %w", i+1, err)
+		}
+
+		// Bug Fix 2: Dependency Detection (Corrected placement).
+		// If this turn contains both a file mutation tool (write/edit) and an
+		// execution/read tool (bash, file_read, web_fetch), we must be careful.
+		// For simplicity, if ANY mutation tool is present, we serialize the batch.
+		hasMutation := false
+		for _, tc := range assistantMsg.ToolCalls {
+			if n := tc.Function.Name; n == "file_write" || n == "file_edit" || n == "bash" {
+				hasMutation = true
+				break
+			}
+		}
+		if hasMutation {
+			maxPar = 1 // Serialize this specific turn.
+			// Re-create sem with new capacity.
+			sem = make(chan struct{}, maxPar)
 		}
 
 		// Strip <think> blocks and store assistant message.
@@ -782,6 +819,7 @@ func (a *Agent) runPipelineSkill(ctx context.Context, skill *skills.Skill, input
 		skill,
 		a.factory,
 		input,
+		a.SessionDir, // Pass session dir (Bug Fix 1)
 		0,
 		a.TodoSendFunc,
 		a.TodoEditFunc,
@@ -1082,10 +1120,29 @@ func (a *Agent) buildCallMessages() []llm.Message {
 			fmt.Fprintf(&sb, "\n<todos>\n%s</todos>", todos)
 		}
 	}
-	ctx := llm.Message{Role: "user", Content: sb.String()}
-	out := make([]llm.Message, len(a.messages)+1)
+
+	ctxStr := sb.String()
+	// Create a copy of the message history to avoid mutating a.messages directly.
+	out := make([]llm.Message, len(a.messages))
 	copy(out, a.messages)
-	out[len(a.messages)] = ctx
+
+	// To keep the API happy (alternating roles) and the context effective:
+	// 1. If the last message is from User, append the context to it.
+	// 2. Otherwise, append a new User message with the context.
+	if len(out) > 0 && out[len(out)-1].Role == "user" {
+		lastIdx := len(out) - 1
+		if len(out[lastIdx].Parts) > 0 {
+			out[lastIdx].Parts = append(append([]llm.ContentPart{}, out[lastIdx].Parts...), llm.ContentPart{
+				Type: "text",
+				Text: "\n\n" + ctxStr,
+			})
+		} else {
+			out[lastIdx].Content += "\n\n" + ctxStr
+		}
+	} else {
+		out = append(out, llm.Message{Role: "user", Content: ctxStr})
+	}
+
 	return out
 }
 

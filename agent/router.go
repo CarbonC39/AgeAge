@@ -37,14 +37,22 @@ type Router struct {
 	skills       []skills.Skill
 	debug        bool
 	agentContent string // Content of AGENT.md for routing context
+	soulContent  string // Content of SOUL.md (personality)
+	InjectSoul   bool   // Whether to inject soulContent into the prompt
 }
 
 // NewRouter creates a new Router.
 func NewRouter(cfg *config.Config, client *llm.Client, loadedSkills []skills.Skill, debug bool) *Router {
-	// Read AGENT.md for routing context (behavioral rules, not persona).
+	// Read AGENT.md for routing context (behavioral rules).
 	agentContent := ""
 	if data, err := os.ReadFile(cfg.AgentPath()); err == nil {
 		agentContent = strings.TrimSpace(string(data))
+	}
+
+	// Read SOUL.md for persona.
+	soulContent := ""
+	if data, err := os.ReadFile(cfg.SOULPath()); err == nil {
+		soulContent = strings.TrimSpace(string(data))
 	}
 
 	return &Router{
@@ -53,6 +61,7 @@ func NewRouter(cfg *config.Config, client *llm.Client, loadedSkills []skills.Ski
 		skills:       loadedSkills,
 		debug:        debug,
 		agentContent: agentContent,
+		soulContent:  soulContent,
 	}
 }
 
@@ -117,20 +126,24 @@ JSON Output:
 }
 
 // Route classifies the user input and returns routing decisions.
-// It no longer performs regex skill matching — skill selection is done by the
-// router LLM from the full skill catalog injected into the prompt.
 func (r *Router) Route(ctx context.Context, userInput string, availableTools []string, history []llm.Message) (*RouterResult, error) {
 	routerPrompt := r.buildRouterPrompt(availableTools)
 
-	var fullSystemPrompt string
-	if r.agentContent != "" {
-		fullSystemPrompt = r.agentContent + "\n\n" + routerPrompt
-	} else {
-		fullSystemPrompt = routerPrompt
+	var sb strings.Builder
+	if r.InjectSoul && r.soulContent != "" {
+		sb.WriteString("## Personality & Behavior\n\n")
+		sb.WriteString(r.soulContent)
+		sb.WriteString("\n\n")
 	}
+	if r.agentContent != "" {
+		sb.WriteString("## Agent Directives\n\n")
+		sb.WriteString(r.agentContent)
+		sb.WriteString("\n\n")
+	}
+	sb.WriteString(routerPrompt)
 
 	messages := []llm.Message{
-		{Role: "system", Content: fullSystemPrompt},
+		{Role: "system", Content: sb.String()},
 	}
 	messages = append(messages, r.filterHistoryForRouter(history)...)
 
@@ -146,11 +159,25 @@ func (r *Router) Route(ctx context.Context, userInput string, availableTools []s
 
 	resp, err := routerClient.ChatCompletionJSON(ctx, messages, r.cfg.LLM.Temperature)
 	if err != nil {
-		return nil, fmt.Errorf("router call failed: %w", err)
+		if r.debug {
+			fmt.Printf("  ◆  %-10s router call failed, falling back to medium: %v\n", "Router", err)
+		}
+		return &RouterResult{
+			Complexity:    TaskMedium,
+			RequiredTools: availableTools,
+			Reasoning:     "router LLM call failed",
+		}, nil
 	}
 
-	if len(resp.Choices) == 0 {
-		return nil, fmt.Errorf("router returned empty response")
+	if len(resp.Choices) == 0 || resp.Choices[0].Message.Content == "" {
+		if r.debug {
+			fmt.Printf("  ◆  %-10s router returned empty response, falling back to medium\n", "Router")
+		}
+		return &RouterResult{
+			Complexity:    TaskMedium,
+			RequiredTools: availableTools,
+			Reasoning:     "router returned empty response",
+		}, nil
 	}
 
 	content := resp.Choices[0].Message.Content
@@ -176,8 +203,6 @@ func (r *Router) Route(ctx context.Context, userInput string, availableTools []s
 }
 
 // filterHistoryForRouter filters conversation history for router context.
-// Keeps only recent user/assistant pairs to provide enough context without
-// overwhelming the router.
 func (r *Router) filterHistoryForRouter(history []llm.Message) []llm.Message {
 	var filtered []llm.Message
 	maxHistoryForRouter := r.cfg.Router.MaxHistory
@@ -201,8 +226,6 @@ func (r *Router) filterHistoryForRouter(history []llm.Message) []llm.Message {
 }
 
 // parseRouterResponse parses and validates the router's JSON response.
-// It verifies that the selected skill name actually exists in the loaded skill
-// list to prevent the router from hallucinating skill names.
 func (r *Router) parseRouterResponse(content string) (*RouterResult, error) {
 	var result RouterResult
 	if err := jsonutil.ParseToolArgs(content, &result); err != nil {
@@ -217,12 +240,12 @@ func (r *Router) parseRouterResponse(content string) (*RouterResult, error) {
 		result.Complexity = TaskMedium
 	}
 
-	// Validate skill: clear the field if the router hallucinated a name.
+	// Validate skill.
 	if result.Skill != "" {
 		found := false
 		for _, s := range r.skills {
 			if strings.EqualFold(s.Name, result.Skill) {
-				result.Skill = s.Name // normalise to canonical name
+				result.Skill = s.Name
 				found = true
 				break
 			}

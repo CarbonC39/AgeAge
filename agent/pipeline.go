@@ -34,10 +34,11 @@ type PipelineExecutor struct {
 	factory   *AgentFactory
 	sharedReg *tools.Registry // parent registry; used by auto nodes for direct tool calls
 
-	vars      map[string]interface{} // live pipeline variable state
-	contexts  []string               // accumulated context strings from output_context nodes
-	nestDepth int                    // 0 = top-level; nested pipeline skills run at depth 1
-	debug     bool
+	vars       map[string]interface{} // live pipeline variable state
+	contexts   []string               // accumulated context strings from output_context nodes
+	sessionDir string                 // directory for the active session (Bug Fix 1)
+	nestDepth  int                    // 0 = top-level; nested pipeline skills run at depth 1
+	debug      bool
 
 	// Todo notification callbacks — mirror the parent Agent fields.
 	sendFn        func(text string) string
@@ -60,6 +61,7 @@ func NewPipelineExecutor(
 	skill *skills.Skill,
 	factory *AgentFactory,
 	input string,
+	sessionDir string,
 	nestDepth int,
 	sendFn func(text string) string,
 	editFn func(msgID, text string) error,
@@ -89,6 +91,7 @@ func NewPipelineExecutor(
 		factory:       factory,
 		sharedReg:     sharedReg,
 		vars:          vars,
+		sessionDir:    sessionDir,
 		nestDepth:     nestDepth,
 		debug:         factory.Debug,
 		sendFn:        sendFn,
@@ -489,6 +492,7 @@ func (e *PipelineExecutor) runAgentNodeAttempt(
 	//   - Do NOT run the router.
 	subAgent := e.factory.CreateAgentFiltered(e.confirmMgr, e.channelID, filteredTools)
 	subAgent.IsSubAgent = true
+	subAgent.SessionDir = e.sessionDir // Bug Fix 1: Inherit session context to share state.
 	subAgent.InjectSoul = node.InjectSoul
 	subAgent.InjectContext = !node.NoContext // default true; opt-out per node with no_context: true
 	subAgent.AskUserNotify = e.askUserNotify // propagate so ask_user tool can reach the user
@@ -591,6 +595,7 @@ func (e *PipelineExecutor) execNestedPipeline(ctx context.Context, node skills.P
 		nestedSkill,
 		e.factory,
 		initialInput,
+		e.sessionDir, // Pass session dir (Bug Fix 1)
 		e.nestDepth+1,
 		nil, nil, nil, nil, // no independent todo display for nested pipelines
 		e.confirmMgr,

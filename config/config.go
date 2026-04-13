@@ -231,7 +231,6 @@ type MatrixConfig struct {
 	AccessToken  string   `toml:"access_token"`
 	RoomIDs      []string `toml:"room_ids"`      // Rooms to monitor; empty = all joined rooms
 	AllowedUsers []string `toml:"allowed_users"` // Matrix user IDs (e.g. "@alice:matrix.org"); empty = allow all
-	AutoThread   bool     `toml:"auto_thread"`   // Create a new thread for each top-level message (default true)
 }
 
 // ServerConfig holds HTTP server settings.
@@ -311,11 +310,6 @@ func DefaultConfig() *Config {
 		Server: ServerConfig{
 			Host: "127.0.0.1",
 			Port: 8080,
-		},
-		Channels: ChannelConfig{
-			Matrix: MatrixConfig{
-				AutoThread: true,
-			},
 		},
 	}
 }

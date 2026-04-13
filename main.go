@@ -764,6 +764,56 @@ func startChannels(factory *agent.AgentFactory) (*channel.Manager, int) {
 
 		// /session commands.
 		if strings.HasPrefix(textLow, "/session") {
+			parts := strings.Fields(text)
+			sub := ""
+			if len(parts) >= 2 {
+				sub = strings.ToLower(parts[1])
+			}
+
+			// /session new from a top-level Matrix message: start a thread-based session.
+			// The user's command event becomes the thread root; the bot's reply lives inside it.
+			if sub == "new" && msg.ChannelType == "matrix" && msg.ThreadID == "" {
+				name := ""
+				if len(parts) >= 3 {
+					name = strings.Join(parts[2:], "-")
+				} else {
+					agentMu.Lock()
+					name = fmt.Sprintf("session-%d", len(agents))
+					agentMu.Unlock()
+				}
+
+				// Session lives under a thread-based chatKey keyed to the user's event.
+				threadChatKey := msg.ChannelType + ":" + msg.ChannelID + ":t:" + msg.ReplyTo
+				threadPrefix := agent.SanitizeSessionID(threadChatKey)
+				newFullID := threadPrefix
+				if name != "" && name != "default" {
+					newFullID = threadPrefix + "-" + agent.SanitizeSessionID(name)
+				}
+
+				agentMu.Lock()
+				currentSessionID := chatSessionID(chatKey)
+				if curAg, ok := agents[currentSessionID]; ok {
+					_ = sm.SaveHistory(currentSessionID, curAg.Messages())
+				}
+				if err := sm.EnsureSession(newFullID); err != nil {
+					agentMu.Unlock()
+					return respond(msg, fmt.Sprintf("❌ Failed to create session: %s", err))
+				}
+				// Use room-level channelID for agent callbacks (not the :t:-encoded key).
+				newAg := makeChatAgent(msg.ChannelType+":"+msg.ChannelID, newFullID)
+				agents[newFullID] = newAg
+				activeSessions[threadChatKey] = newFullID
+				chatKeyBySessionID[newFullID] = threadChatKey
+				agentMu.Unlock()
+
+				// Reply inside the newly created thread.
+				replyText := fmt.Sprintf("✅ Session **%s** started. Continue in this thread.", name)
+				if mx, ok := channelsByType["matrix"].(*channel.MatrixChannel); ok {
+					_ = mx.SendInThread(msg.ChannelID, msg.ReplyTo, msg.ReplyTo, replyText)
+				}
+				return ""
+			}
+
 			return respond(msg, handleSessionCmd(chatKey, text))
 		}
 
@@ -841,7 +891,7 @@ func startChannels(factory *agent.AgentFactory) (*channel.Manager, int) {
 			defer func() { _ = ti.SendTyping(msg.ChannelID, false) }()
 		}
 
-		// Reaction: ⏳ while processing, replaced with ✅ or ❌ on finish.
+		// Reaction: ⏳ while processing; silently removed on success, ❌ on error.
 		var reactEventID string
 		if r, ok := channelsByType[msg.ChannelType].(channel.Reactor); ok {
 			reactEventID, _ = r.React(msg.ChannelID, msg.ReplyTo, "⏳")
@@ -854,15 +904,13 @@ func startChannels(factory *agent.AgentFactory) (*channel.Manager, int) {
 		// Save history after every run (best-effort; ignore errors).
 		_ = sm.SaveHistory(sessionID, ag.Messages())
 
-		// Update reaction to show outcome.
+		// Remove ⏳; add ❌ only on error.
 		if reactEventID != "" {
 			if r, ok := channelsByType[msg.ChannelType].(channel.Reactor); ok {
 				_ = r.Unreact(msg.ChannelID, reactEventID)
-				emoji := "✅"
 				if err != nil {
-					emoji = "❌"
+					_, _ = r.React(msg.ChannelID, msg.ReplyTo, "❌")
 				}
-				_, _ = r.React(msg.ChannelID, msg.ReplyTo, emoji)
 			}
 		}
 
@@ -917,7 +965,6 @@ func startChannels(factory *agent.AgentFactory) (*channel.Manager, int) {
 				cfg.Channels.Matrix.AccessToken,
 				cfg.Channels.Matrix.RoomIDs,
 				cfg.Channels.Matrix.AllowedUsers,
-				cfg.Channels.Matrix.AutoThread,
 				opts,
 			)
 			manager.Register(mx)

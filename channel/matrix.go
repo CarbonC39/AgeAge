@@ -18,7 +18,6 @@ type MatrixChannel struct {
 	Token        string   // Access token
 	RoomIDs      []string // Rooms to monitor; empty = all joined rooms
 	AllowedUsers []string // Matrix user IDs allowed to interact; empty = allow all
-	AutoThread   bool     // Create a new thread for each top-level message
 	Options      ChannelOptions
 	client       *http.Client
 	stopCh       chan struct{}
@@ -27,14 +26,13 @@ type MatrixChannel struct {
 }
 
 // NewMatrix creates a new Matrix channel.
-func NewMatrix(homeserver, userID, accessToken string, roomIDs []string, allowedUsers []string, autoThread bool, opts ChannelOptions) *MatrixChannel {
+func NewMatrix(homeserver, userID, accessToken string, roomIDs []string, allowedUsers []string, opts ChannelOptions) *MatrixChannel {
 	return &MatrixChannel{
 		Homeserver:   strings.TrimRight(homeserver, "/"),
 		UserID:       userID,
 		Token:        accessToken,
 		RoomIDs:      roomIDs,
 		AllowedUsers: allowedUsers,
-		AutoThread:   autoThread,
 		Options:      opts,
 		client:       &http.Client{Timeout: 60 * time.Second},
 		stopCh:       make(chan struct{}),
@@ -135,12 +133,10 @@ func (m *MatrixChannel) Start(handler MessageHandler) error {
 					continue
 				}
 
-				// Determine thread ID: use existing thread root or create new thread.
+				// Determine thread ID: set only when message is already in a thread.
 				threadID := ""
 				if relType == "m.thread" {
 					threadID, _ = relatesTo["event_id"].(string)
-				} else if m.AutoThread {
-					threadID = event.EventID // top-level message starts its own thread
 				}
 
 				// Capture loop-local values for closure safety.
@@ -160,7 +156,7 @@ func (m *MatrixChannel) Start(handler MessageHandler) error {
 
 				incoming.Respond = func(text string) error {
 					if capturedThreadID != "" {
-						return m.sendInThread(capturedRoomID, capturedThreadID, capturedEventID, text)
+						return m.SendInThread(capturedRoomID, capturedThreadID, capturedEventID, text)
 					}
 					return m.Send(capturedRoomID, text)
 				}
@@ -170,7 +166,7 @@ func (m *MatrixChannel) Start(handler MessageHandler) error {
 					// Fallback for handlers that return a string instead of calling Respond.
 					if reply != "" {
 						if msg.ThreadID != "" {
-							_ = m.sendInThread(msg.ChannelID, msg.ThreadID, msg.ReplyTo, reply)
+							_ = m.SendInThread(msg.ChannelID, msg.ThreadID, msg.ReplyTo, reply)
 						} else {
 							_ = m.Send(msg.ChannelID, reply)
 						}
@@ -235,8 +231,8 @@ func (m *MatrixChannel) sendRaw(roomID, text string) (string, error) {
 	return m.sendEvent(roomID, "m.room.message", content)
 }
 
-// sendInThread sends text inside a Matrix thread, splitting if necessary.
-func (m *MatrixChannel) sendInThread(roomID, threadRootID, latestEventID, text string) error {
+// SendInThread sends text inside a Matrix thread, splitting if necessary.
+func (m *MatrixChannel) SendInThread(roomID, threadRootID, latestEventID, text string) error {
 	chunks := splitMessages(text, 4000)
 	replyTo := latestEventID
 	for i, chunk := range chunks {

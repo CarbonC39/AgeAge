@@ -118,6 +118,9 @@ func NewFactory(configPath string, debug bool) (*AgentFactory, error) {
 		return nil, fmt.Errorf("LLM API key not configured. Set it in config.toml or AGEAGE_API_KEY / OPENAI_API_KEY environment variable")
 	}
 
+	// Resolve optional search API keys from environment variables.
+	cfg.WebSearch.ResolveSearchAPIKeys()
+
 	clientLLM := llm.NewClient(cfg.LLM.APIKey, cfg.LLM.BaseURL, cfg.LLM.Model, debug, cfg.LLM.MaxTokens)
 
 	sec := security.NewChecker(

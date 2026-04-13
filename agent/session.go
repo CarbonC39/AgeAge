@@ -7,7 +7,9 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
+	"time"
 
 	"ageage/llm"
 )
@@ -25,8 +27,9 @@ type SessionManager struct {
 
 // SessionInfo describes a single session for listing.
 type SessionInfo struct {
-	ID           string // full session ID (directory name)
-	MessageCount int    // number of user+assistant messages in history
+	ID         string    // full session ID (directory name)
+	TurnCount  int       // number of completed user→assistant turns
+	ModTime    time.Time // last-modified time of the session directory
 }
 
 // historyRecord is the on-disk representation of a single llm.Message.
@@ -94,8 +97,7 @@ func (sm *SessionManager) EnsureSession(id string) error {
 	return nil
 }
 
-// List returns all sessions present in the sessions directory.
-// Sessions are returned in directory-enumeration order (typically alphabetical).
+// List returns all sessions sorted by modification time (newest first).
 func (sm *SessionManager) List() ([]SessionInfo, error) {
 	entries, err := os.ReadDir(sm.sessionsDir)
 	if err != nil {
@@ -110,17 +112,49 @@ func (sm *SessionManager) List() ([]SessionInfo, error) {
 			continue
 		}
 		id := e.Name()
-		count := 0
+
+		// Count turns (each turn = one user message + one assistant reply).
+		turns := 0
 		if msgs, err := sm.LoadHistory(id); err == nil {
 			for _, m := range msgs {
-				if m.Role == "user" || m.Role == "assistant" {
-					count++
+				if m.Role == "user" {
+					turns++
 				}
 			}
 		}
-		infos = append(infos, SessionInfo{ID: id, MessageCount: count})
+
+		// Use history.jsonl mtime as proxy for last-active time.
+		modTime := time.Time{}
+		if fi, err := os.Stat(sm.HistoryPath(id)); err == nil {
+			modTime = fi.ModTime()
+		}
+
+		infos = append(infos, SessionInfo{ID: id, TurnCount: turns, ModTime: modTime})
 	}
+
+	// Sort newest first.
+	sort.Slice(infos, func(i, j int) bool {
+		return infos[i].ModTime.After(infos[j].ModTime)
+	})
 	return infos, nil
+}
+
+// FindByPrefix returns sessions whose ID starts with the given prefix.
+// Returns (exact match, prefix matches, error). Used for tab-style disambiguation.
+func (sm *SessionManager) FindByPrefix(prefix string) (exact *SessionInfo, prefixMatches []SessionInfo, err error) {
+	all, err := sm.List()
+	if err != nil {
+		return nil, nil, err
+	}
+	for i, si := range all {
+		if si.ID == prefix {
+			copy := all[i]
+			exact = &copy
+		} else if strings.HasPrefix(si.ID, prefix) {
+			prefixMatches = append(prefixMatches, all[i])
+		}
+	}
+	return exact, prefixMatches, nil
 }
 
 // ListWithPrefix returns only sessions whose IDs start with prefix.
@@ -139,10 +173,24 @@ func (sm *SessionManager) ListWithPrefix(prefix string) ([]SessionInfo, error) {
 			} else if si.ID == prefix {
 				display = "default"
 			}
-			filtered = append(filtered, SessionInfo{ID: display, MessageCount: si.MessageCount})
+			filtered = append(filtered, SessionInfo{ID: display, TurnCount: si.TurnCount, ModTime: si.ModTime})
 		}
 	}
 	return filtered, nil
+}
+
+// Rename moves a session directory from oldID to newID.
+// Returns an error if newID already exists or oldID does not exist.
+func (sm *SessionManager) Rename(oldID, newID string) error {
+	oldDir := sm.SessionDir(oldID)
+	newDir := sm.SessionDir(newID)
+	if _, err := os.Stat(oldDir); os.IsNotExist(err) {
+		return fmt.Errorf("session %q does not exist", oldID)
+	}
+	if _, err := os.Stat(newDir); err == nil {
+		return fmt.Errorf("session %q already exists", newID)
+	}
+	return os.Rename(oldDir, newDir)
 }
 
 // Delete removes a session directory permanently.

@@ -18,6 +18,7 @@ type MatrixChannel struct {
 	Token        string   // Access token
 	RoomIDs      []string // Rooms to monitor; empty = all joined rooms
 	AllowedUsers []string // Matrix user IDs allowed to interact; empty = allow all
+	AutoThread   bool     // Create a new thread for each top-level message
 	Options      ChannelOptions
 	client       *http.Client
 	stopCh       chan struct{}
@@ -26,13 +27,14 @@ type MatrixChannel struct {
 }
 
 // NewMatrix creates a new Matrix channel.
-func NewMatrix(homeserver, userID, accessToken string, roomIDs []string, allowedUsers []string, opts ChannelOptions) *MatrixChannel {
+func NewMatrix(homeserver, userID, accessToken string, roomIDs []string, allowedUsers []string, autoThread bool, opts ChannelOptions) *MatrixChannel {
 	return &MatrixChannel{
 		Homeserver:   strings.TrimRight(homeserver, "/"),
 		UserID:       userID,
 		Token:        accessToken,
 		RoomIDs:      roomIDs,
 		AllowedUsers: allowedUsers,
+		AutoThread:   autoThread,
 		Options:      opts,
 		client:       &http.Client{Timeout: 60 * time.Second},
 		stopCh:       make(chan struct{}),
@@ -67,9 +69,7 @@ func (m *MatrixChannel) Start(handler MessageHandler) error {
 	}
 
 	// Advance the since token to the current server position so the main loop
-	// only receives truly new events. Retry until the sync succeeds — if we
-	// enter the main loop with since="" a full sync would return recent
-	// history and re-process already-handled messages.
+	// only receives truly new events.
 	for {
 		select {
 		case <-m.stopCh:
@@ -99,7 +99,6 @@ func (m *MatrixChannel) Start(handler MessageHandler) error {
 			continue
 		}
 
-		// Process only new user messages (not history)
 		for roomID, roomData := range syncResp.Rooms.Join {
 			if len(m.RoomIDs) > 0 && !roomSet[roomID] {
 				continue
@@ -124,27 +123,59 @@ func (m *MatrixChannel) Start(handler MessageHandler) error {
 				}
 
 				if !m.isAllowedUser(event.Sender) {
-					continue // silently ignore non-whitelisted users
+					continue
 				}
 
-				msg := IncomingMessage{
+				// Parse m.relates_to to determine thread context.
+				relatesTo, _ := event.Content["m.relates_to"].(map[string]interface{})
+				relType, _ := relatesTo["rel_type"].(string)
+
+				// Skip edit events — they are not new messages.
+				if relType == "m.replace" {
+					continue
+				}
+
+				// Determine thread ID: use existing thread root or create new thread.
+				threadID := ""
+				if relType == "m.thread" {
+					threadID, _ = relatesTo["event_id"].(string)
+				} else if m.AutoThread {
+					threadID = event.EventID // top-level message starts its own thread
+				}
+
+				// Capture loop-local values for closure safety.
+				capturedRoomID := roomID
+				capturedEventID := event.EventID
+				capturedThreadID := threadID
+
+				incoming := IncomingMessage{
 					ChannelType: "matrix",
 					ChannelID:   roomID,
 					SenderID:    event.Sender,
 					SenderName:  event.Sender,
 					Text:        body,
 					ReplyTo:     event.EventID,
+					ThreadID:    threadID,
 				}
 
-				process := func(incoming IncomingMessage) {
-					reply := handler(incoming)
-					if reply != "" {
-						m.Send(incoming.ChannelID, reply)
+				incoming.Respond = func(text string) error {
+					if capturedThreadID != "" {
+						return m.sendInThread(capturedRoomID, capturedThreadID, capturedEventID, text)
 					}
+					return m.Send(capturedRoomID, text)
 				}
 
-				// Always run in a goroutine to avoid blocking the sync loop.
-				go process(msg)
+				go func(msg IncomingMessage) {
+					reply := handler(msg)
+					// Fallback for handlers that return a string instead of calling Respond.
+					if reply != "" {
+						if msg.ThreadID != "" {
+							_ = m.sendInThread(msg.ChannelID, msg.ThreadID, msg.ReplyTo, reply)
+						} else {
+							_ = m.Send(msg.ChannelID, reply)
+						}
+					}
+				}(incoming)
 			}
 		}
 
@@ -160,46 +191,86 @@ func (m *MatrixChannel) Stop() error {
 	return nil
 }
 
-// Send sends a Markdown-formatted message to a Matrix room.
-// Matrix supports org.matrix.custom.html format for rich text.
+// Send sends a Markdown-formatted message to a Matrix room, splitting long
+// messages at paragraph boundaries if needed.
 func (m *MatrixChannel) Send(roomID, text string) error {
-	_, err := m.SendMessage(roomID, text)
-	return err
+	for i, chunk := range splitMessages(text, 4000) {
+		if i > 0 {
+			time.Sleep(300 * time.Millisecond)
+		}
+		if _, err := m.sendRaw(roomID, chunk); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // SendMessage sends a message and returns the event ID assigned by the server.
+// Implements the Editable interface. For long messages, returns the last event ID.
 func (m *MatrixChannel) SendMessage(roomID, text string) (string, error) {
-	txnID := fmt.Sprintf("ageage_%d", time.Now().UnixNano())
+	chunks := splitMessages(text, 4000)
+	var lastID string
+	var err error
+	for i, chunk := range chunks {
+		if i > 0 {
+			time.Sleep(300 * time.Millisecond)
+		}
+		lastID, err = m.sendRaw(roomID, chunk)
+		if err != nil {
+			return lastID, err
+		}
+	}
+	return lastID, nil
+}
 
+// sendRaw sends a single (unsplit) message to a room and returns its event ID.
+func (m *MatrixChannel) sendRaw(roomID, text string) (string, error) {
 	htmlBody := markdownToHTML(text)
-	payload := map[string]interface{}{
+	content := map[string]any{
 		"msgtype":        "m.text",
 		"body":           text,
 		"format":         "org.matrix.custom.html",
 		"formatted_body": htmlBody,
 	}
+	return m.sendEvent(roomID, "m.room.message", content)
+}
 
-	path := fmt.Sprintf("/_matrix/client/v3/rooms/%s/send/m.room.message/%s",
-		roomID, txnID)
-
-	respBytes, err := m.doRequest("PUT", path, payload)
-	if err != nil {
-		return "", err
+// sendInThread sends text inside a Matrix thread, splitting if necessary.
+func (m *MatrixChannel) sendInThread(roomID, threadRootID, latestEventID, text string) error {
+	chunks := splitMessages(text, 4000)
+	replyTo := latestEventID
+	for i, chunk := range chunks {
+		if i > 0 {
+			time.Sleep(300 * time.Millisecond)
+		}
+		htmlBody := markdownToHTML(chunk)
+		content := map[string]any{
+			"msgtype":        "m.text",
+			"body":           chunk,
+			"format":         "org.matrix.custom.html",
+			"formatted_body": htmlBody,
+			"m.relates_to": map[string]any{
+				"rel_type": "m.thread",
+				"event_id": threadRootID,
+				"m.in_reply_to": map[string]any{
+					"event_id": replyTo,
+				},
+			},
+		}
+		eventID, err := m.sendEvent(roomID, "m.room.message", content)
+		if err != nil {
+			return err
+		}
+		// Each subsequent chunk replies to the previous one to maintain order.
+		if eventID != "" {
+			replyTo = eventID
+		}
 	}
-
-	var result struct {
-		EventID string `json:"event_id"`
-	}
-	if err := json.Unmarshal(respBytes, &result); err != nil {
-		return "", nil // non-fatal: message was sent, we just lost the ID
-	}
-	return result.EventID, nil
+	return nil
 }
 
 // EditMessage replaces the content of a previously sent Matrix event using m.replace.
 func (m *MatrixChannel) EditMessage(roomID, eventID, text string) error {
-	txnID := fmt.Sprintf("ageage_edit_%d", time.Now().UnixNano())
-
 	htmlBody := markdownToHTML(text)
 	payload := map[string]interface{}{
 		"msgtype": "m.text",
@@ -217,16 +288,80 @@ func (m *MatrixChannel) EditMessage(roomID, eventID, text string) error {
 		},
 	}
 
-	path := fmt.Sprintf("/_matrix/client/v3/rooms/%s/send/m.room.message/%s",
-		roomID, txnID)
-
-	_, err := m.doRequest("PUT", path, payload)
+	_, err := m.sendEvent(roomID, "m.room.message", payload)
 	return err
 }
 
 func (m *MatrixChannel) Reply(roomID, replyToID, text string) error {
-	// Matrix doesn't have simple reply-to in the basic API; just send.
 	return m.Send(roomID, text)
+}
+
+// SendTyping sends or clears a typing indicator in a room.
+// Implements the TypingIndicator interface.
+func (m *MatrixChannel) SendTyping(channelID string, typing bool) error {
+	path := fmt.Sprintf("/_matrix/client/v3/rooms/%s/typing/%s", channelID, m.UserID)
+	payload := map[string]any{"typing": typing}
+	if typing {
+		payload["timeout"] = 30000
+	}
+	_, err := m.doRequest("PUT", path, payload)
+	return err
+}
+
+// SendReadReceipt marks an event as read.
+// Implements the ReadReceiptSender interface.
+func (m *MatrixChannel) SendReadReceipt(channelID, eventID string) error {
+	path := fmt.Sprintf("/_matrix/client/v3/rooms/%s/receipt/m.read/%s", channelID, eventID)
+	_, err := m.doRequest("POST", path, map[string]any{})
+	return err
+}
+
+// React adds an emoji reaction to an event and returns the reaction event ID.
+// Implements the Reactor interface.
+func (m *MatrixChannel) React(channelID, eventID, emoji string) (string, error) {
+	content := map[string]any{
+		"m.relates_to": map[string]any{
+			"rel_type": "m.annotation",
+			"event_id": eventID,
+			"key":      emoji,
+		},
+	}
+	return m.sendEvent(channelID, "m.reaction", content)
+}
+
+// Unreact removes a reaction by redacting the reaction event.
+// Implements the Reactor interface.
+func (m *MatrixChannel) Unreact(channelID, reactionEventID string) error {
+	txnID := fmt.Sprintf("ageage_redact_%d", time.Now().UnixNano())
+	path := fmt.Sprintf("/_matrix/client/v3/rooms/%s/redact/%s/%s", channelID, reactionEventID, txnID)
+	_, err := m.doRequest("PUT", path, map[string]any{})
+	return err
+}
+
+// splitMessages splits text into chunks of at most maxLen runes, preferring
+// paragraph breaks (\n\n) when they fall in the second half of the chunk.
+func splitMessages(text string, maxLen int) []string {
+	runes := []rune(text)
+	if len(runes) <= maxLen {
+		return []string{text}
+	}
+	var chunks []string
+	for len(runes) > 0 {
+		if len(runes) <= maxLen {
+			chunks = append(chunks, string(runes))
+			break
+		}
+		chunk := string(runes[:maxLen])
+		// Prefer to break at a paragraph boundary in the back half of the chunk.
+		if idx := strings.LastIndex(chunk, "\n\n"); idx > maxLen/2 {
+			chunks = append(chunks, string(runes[:idx]))
+			runes = []rune(strings.TrimLeft(string(runes[idx:]), "\n"))
+		} else {
+			chunks = append(chunks, chunk)
+			runes = runes[maxLen:]
+		}
+	}
+	return chunks
 }
 
 // --- Matrix API types ---
@@ -250,6 +385,23 @@ type matrixEvent struct {
 	Sender  string                 `json:"sender"`
 	EventID string                 `json:"event_id"`
 	Content map[string]interface{} `json:"content"`
+}
+
+// sendEvent sends a Matrix state/message event and returns the assigned event ID.
+func (m *MatrixChannel) sendEvent(roomID, eventType string, content map[string]any) (string, error) {
+	txnID := fmt.Sprintf("ageage_%d", time.Now().UnixNano())
+	path := fmt.Sprintf("/_matrix/client/v3/rooms/%s/send/%s/%s", roomID, eventType, txnID)
+	respBytes, err := m.doRequest("PUT", path, content)
+	if err != nil {
+		return "", err
+	}
+	var result struct {
+		EventID string `json:"event_id"`
+	}
+	if err := json.Unmarshal(respBytes, &result); err != nil {
+		return "", nil // non-fatal: message was sent, we just lost the ID
+	}
+	return result.EventID, nil
 }
 
 func (m *MatrixChannel) doRequest(method, path string, body interface{}) ([]byte, error) {

@@ -311,6 +311,28 @@ func (t *WebSearchTool) Execute(_ context.Context, args json.RawMessage) (string
 	}
 
 	switch t.Cfg.Backend {
+	case "tavily":
+		if t.Cfg.TavilyAPIKey == "" {
+			fmt.Println("  ⚠  web_search: tavily_api_key not set, falling back to DuckDuckGo")
+			return t.searchViaDuckDuckGo(query)
+		}
+		result, err := t.searchViaTavily(query)
+		if err != nil {
+			fmt.Printf("  ⚠  web_search: Tavily failed (%s), falling back to DuckDuckGo\n", err)
+			return t.searchViaDuckDuckGo(query)
+		}
+		return result, nil
+	case "brave":
+		if t.Cfg.BraveAPIKey == "" {
+			fmt.Println("  ⚠  web_search: brave_api_key not set, falling back to DuckDuckGo")
+			return t.searchViaDuckDuckGo(query)
+		}
+		result, err := t.searchViaBrave(query)
+		if err != nil {
+			fmt.Printf("  ⚠  web_search: Brave Search failed (%s), falling back to DuckDuckGo\n", err)
+			return t.searchViaDuckDuckGo(query)
+		}
+		return result, nil
 	case "searxng":
 		result, err := t.searchViaSearXNG(query)
 		if err != nil {
@@ -505,6 +527,177 @@ func cleanInlineHTML(s string) string {
 	s = replacer.Replace(s)
 
 	return strings.TrimSpace(s)
+}
+
+func (t *WebSearchTool) searchViaTavily(query string) (string, error) {
+	maxResults := t.Cfg.MaxSearchResults
+	if maxResults <= 0 {
+		maxResults = 10
+	}
+
+	reqBody, err := json.Marshal(map[string]interface{}{
+		"api_key":      t.Cfg.TavilyAPIKey,
+		"query":        query,
+		"max_results":  maxResults,
+		"search_depth": "basic",
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to build Tavily request: %w", err)
+	}
+
+	client := newRobustHTTPClient(15 * time.Second)
+	req, err := http.NewRequest("POST", "https://api.tavily.com/search", bytes.NewReader(reqBody))
+	if err != nil {
+		return "", fmt.Errorf("failed to create Tavily request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", defaultUserAgent)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("Tavily request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1*1024*1024))
+	if err != nil {
+		return "", fmt.Errorf("failed to read Tavily response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		// Surface the error message from the API body when available.
+		var apiErr struct {
+			Detail string `json:"detail"`
+			Error  string `json:"error"`
+		}
+		if json.Unmarshal(body, &apiErr) == nil {
+			msg := apiErr.Detail
+			if msg == "" {
+				msg = apiErr.Error
+			}
+			if msg != "" {
+				return "", fmt.Errorf("Tavily HTTP %d: %s", resp.StatusCode, msg)
+			}
+		}
+		return "", fmt.Errorf("Tavily HTTP %d", resp.StatusCode)
+	}
+
+	var tavilyResp struct {
+		Results []struct {
+			Title   string  `json:"title"`
+			URL     string  `json:"url"`
+			Content string  `json:"content"`
+			Score   float64 `json:"score"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal(body, &tavilyResp); err != nil {
+		return "", fmt.Errorf("failed to parse Tavily response: %w", err)
+	}
+
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "Search results for: %s\n\n", query)
+	count := 0
+	for _, r := range tavilyResp.Results {
+		if count >= maxResults {
+			break
+		}
+		if t.isBlocked(r.URL) {
+			continue
+		}
+		fmt.Fprintf(&sb, "%d. %s\n", count+1, r.Title)
+		fmt.Fprintf(&sb, "   URL: %s\n", r.URL)
+		if r.Content != "" {
+			fmt.Fprintf(&sb, "   %s\n", r.Content)
+		}
+		sb.WriteString("\n")
+		count++
+	}
+
+	if count == 0 {
+		return fmt.Sprintf("No results found for: %s", query), nil
+	}
+	return sb.String(), nil
+}
+
+func (t *WebSearchTool) searchViaBrave(query string) (string, error) {
+	maxResults := t.Cfg.MaxSearchResults
+	if maxResults <= 0 {
+		maxResults = 10
+	}
+	if maxResults > 20 {
+		maxResults = 20 // Brave API cap per request
+	}
+
+	searchURL := fmt.Sprintf("https://api.search.brave.com/res/v1/web/search?q=%s&count=%d",
+		url.QueryEscape(query), maxResults)
+
+	client := newRobustHTTPClient(15 * time.Second)
+	req, err := http.NewRequest("GET", searchURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to create Brave request: %w", err)
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Accept-Encoding", "gzip")
+	req.Header.Set("X-Subscription-Token", t.Cfg.BraveAPIKey)
+	req.Header.Set("User-Agent", defaultUserAgent)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("Brave Search request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1*1024*1024))
+	if err != nil {
+		return "", fmt.Errorf("failed to read Brave response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		var apiErr struct {
+			Message string `json:"message"`
+		}
+		if json.Unmarshal(body, &apiErr) == nil && apiErr.Message != "" {
+			return "", fmt.Errorf("Brave Search HTTP %d: %s", resp.StatusCode, apiErr.Message)
+		}
+		return "", fmt.Errorf("Brave Search HTTP %d", resp.StatusCode)
+	}
+
+	var braveResp struct {
+		Web struct {
+			Results []struct {
+				Title       string `json:"title"`
+				URL         string `json:"url"`
+				Description string `json:"description"`
+			} `json:"results"`
+		} `json:"web"`
+	}
+	if err := json.Unmarshal(body, &braveResp); err != nil {
+		return "", fmt.Errorf("failed to parse Brave response: %w", err)
+	}
+
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "Search results for: %s\n\n", query)
+	count := 0
+	for _, r := range braveResp.Web.Results {
+		if count >= maxResults {
+			break
+		}
+		if t.isBlocked(r.URL) {
+			continue
+		}
+		fmt.Fprintf(&sb, "%d. %s\n", count+1, r.Title)
+		fmt.Fprintf(&sb, "   URL: %s\n", r.URL)
+		if r.Description != "" {
+			fmt.Fprintf(&sb, "   %s\n", r.Description)
+		}
+		sb.WriteString("\n")
+		count++
+	}
+
+	if count == 0 {
+		return fmt.Sprintf("No results found for: %s", query), nil
+	}
+	return sb.String(), nil
 }
 
 func (t *WebSearchTool) searchViaSearXNG(query string) (string, error) {

@@ -145,14 +145,21 @@ Searches the web and returns result snippets with titles and URLs.
 |--------------|-----------------------------------------------------|
 | `duckduckgo` | Scrapes DuckDuckGo HTML results (default, no API key needed). |
 | `searxng`    | Queries a self-hosted [SearXNG](https://searxng.org) instance via JSON API. |
+| `tavily`     | [Tavily Search API](https://tavily.com) — AI-optimised results, free tier available. |
+| `brave`      | [Brave Search API](https://brave.com/search/api/) — independent index, free tier (2000 req/mo). |
+
+All backends fall back to DuckDuckGo automatically if the API key is missing or the request fails.
 
 **Config:**
 ```toml
 [web_search]
-backend         = "duckduckgo"
-searxng_url     = "http://localhost:8080"  # Required for searxng backend
+backend         = "duckduckgo"   # or "tavily" / "brave" / "searxng"
 max_results     = 10
 blocked_domains = ["example.com"]
+
+searxng_url     = "http://localhost:8080"
+tavily_api_key  = ""   # or set TAVILY_API_KEY env var
+brave_api_key   = ""   # or set BRAVE_API_KEY env var
 ```
 
 ---

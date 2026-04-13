@@ -137,10 +137,23 @@ type BashConfig struct {
 
 // WebSearchConfig holds web search tool settings.
 type WebSearchConfig struct {
-	Backend          string   `toml:"backend"`         // "duckduckgo" or "searxng"
+	Backend          string   `toml:"backend"`         // "duckduckgo", "searxng", "tavily", or "brave"
 	SearXNGURL       string   `toml:"searxng_url"`     // SearXNG instance URL
+	TavilyAPIKey     string   `toml:"tavily_api_key"`  // Tavily Search API key; falls back to TAVILY_API_KEY env var
+	BraveAPIKey      string   `toml:"brave_api_key"`   // Brave Search API key; falls back to BRAVE_API_KEY env var
 	MaxSearchResults int      `toml:"max_results"`     // Maximum number of search results to return
 	BlockedDomains   []string `toml:"blocked_domains"` // List of domains to exclude from search results
+}
+
+// ResolveSearchAPIKeys fills empty API key fields from environment variables.
+// Called after LoadConfig so config-file values always take precedence.
+func (c *WebSearchConfig) ResolveSearchAPIKeys() {
+	if c.TavilyAPIKey == "" {
+		c.TavilyAPIKey = os.Getenv("TAVILY_API_KEY")
+	}
+	if c.BraveAPIKey == "" {
+		c.BraveAPIKey = os.Getenv("BRAVE_API_KEY")
+	}
 }
 
 // WebFetchConfig holds web fetch tool settings.
@@ -218,6 +231,7 @@ type MatrixConfig struct {
 	AccessToken  string   `toml:"access_token"`
 	RoomIDs      []string `toml:"room_ids"`      // Rooms to monitor; empty = all joined rooms
 	AllowedUsers []string `toml:"allowed_users"` // Matrix user IDs (e.g. "@alice:matrix.org"); empty = allow all
+	AutoThread   bool     `toml:"auto_thread"`   // Create a new thread for each top-level message (default true)
 }
 
 // ServerConfig holds HTTP server settings.
@@ -297,6 +311,11 @@ func DefaultConfig() *Config {
 		Server: ServerConfig{
 			Host: "127.0.0.1",
 			Port: 8080,
+		},
+		Channels: ChannelConfig{
+			Matrix: MatrixConfig{
+				AutoThread: true,
+			},
 		},
 	}
 }

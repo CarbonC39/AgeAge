@@ -14,7 +14,12 @@ type IncomingMessage struct {
 	SenderName  string // Display name
 	Text        string // Message content
 	ReplyTo     string // Message ID to reply to (if applicable)
-	ThreadID    string // Thread/topic ID within the channel (Discord threads, etc.); empty if not in a thread
+	ThreadID    string // Thread/topic ID within the channel; empty if not in a thread
+
+	// Respond, when set, is called by the handler to send a reply via the
+	// correct channel-specific path (e.g. inside a Matrix thread). When nil,
+	// the handler returns a plain string which the channel sends via Send().
+	Respond func(text string) error
 }
 
 // ChannelOptions holds common settings passed to all channel connectors.
@@ -60,6 +65,26 @@ type InteractiveChannel interface {
 	// SendQuestion sends a question to channelID. If options is non-empty and
 	// the channel supports interactive elements, they are rendered as buttons.
 	SendQuestion(channelID, question string, options []string) error
+}
+
+// TypingIndicator is an optional interface for channels that support sending
+// typing notifications to let users know the bot is working.
+type TypingIndicator interface {
+	SendTyping(channelID string, typing bool) error
+}
+
+// ReadReceiptSender is an optional interface for channels that support
+// sending read receipts to acknowledge that a message was seen.
+type ReadReceiptSender interface {
+	SendReadReceipt(channelID, eventID string) error
+}
+
+// Reactor is an optional interface for channels that support emoji reactions.
+// React returns the platform-native ID of the reaction event so it can be
+// removed later via Unreact.
+type Reactor interface {
+	React(channelID, eventID, emoji string) (string, error)
+	Unreact(channelID, reactionEventID string) error
 }
 
 // MessageHandler is called when a message is received from a channel.

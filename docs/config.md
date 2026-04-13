@@ -191,20 +191,47 @@ auto_allow_commands = ["git", "ls", "cat"]
 
 ```toml
 [web_search]
-backend        = "duckduckgo"
-max_results    = 10
+backend         = "duckduckgo"
+max_results     = 10
 blocked_domains = []
-searxng_url    = ""
+
+# SearXNG backend
+searxng_url     = ""
+
+# Tavily backend (https://tavily.com)
+tavily_api_key  = ""   # or set TAVILY_API_KEY env var
+
+# Brave Search backend (https://brave.com/search/api/)
+brave_api_key   = ""   # or set BRAVE_API_KEY env var
 ```
 
-| Key              | Type        | Default         | Description |
-|------------------|-------------|-----------------|-------------|
-| `backend`        | string      | `"duckduckgo"`  | `"duckduckgo"` (no setup required) or `"searxng"` (requires a running instance). |
-| `max_results`    | int         | `10`            | Maximum search results returned per query. |
-| `blocked_domains`| string list | `[]`            | Domains to exclude from results (e.g. `["youtube.com", "csdn.net"]`). Subdomain matching is included. |
-| `searxng_url`    | string      | `""`            | Full URL of your SearXNG instance (required when `backend = "searxng"`). |
+| Key               | Type        | Default        | Description |
+|-------------------|-------------|----------------|-------------|
+| `backend`         | string      | `"duckduckgo"` | Search backend: `"duckduckgo"`, `"searxng"`, `"tavily"`, or `"brave"`. |
+| `max_results`     | int         | `10`           | Maximum results returned per query (Brave caps at 20). |
+| `blocked_domains` | string list | `[]`           | Domains to exclude (e.g. `["youtube.com"]`). Subdomain matching included. |
+| `searxng_url`     | string      | `""`           | Full URL of your SearXNG instance (required for `backend = "searxng"`). |
+| `tavily_api_key`  | string      | `""`           | Tavily API key. Falls back to `TAVILY_API_KEY` env var. |
+| `brave_api_key`   | string      | `""`           | Brave Search API key. Falls back to `BRAVE_API_KEY` env var. |
 
-When `backend = "searxng"` and SearXNG is unreachable or returns an error, the tool automatically falls back to DuckDuckGo.
+### Backends
+
+| Backend      | Quality | Rate limits | Setup |
+|--------------|---------|-------------|-------|
+| `duckduckgo` | Good    | Scraping; may rate-limit | None |
+| `searxng`    | Good    | Self-hosted | Running SearXNG instance |
+| `tavily`     | Excellent | API quota (free tier available) | [tavily.com](https://tavily.com) API key |
+| `brave`      | Excellent | API quota (free tier: 2000 req/mo) | [brave.com/search/api](https://brave.com/search/api/) API key |
+
+### Fallback behaviour
+
+All configured backends fall back to DuckDuckGo on failure:
+
+- **`tavily`** — falls back if `tavily_api_key` is empty or the API returns an error.
+- **`brave`** — falls back if `brave_api_key` is empty or the API returns an error.
+- **`searxng`** — falls back if the instance is unreachable or returns a non-200 response.
+
+A warning is printed to stdout whenever a fallback occurs.
 
 ---
 

@@ -279,9 +279,9 @@ Non-file `@tokens` (e.g. email addresses) are left as-is in the message text.
 
 | Mode | Command | Description |
 |---|---|---|
-| **Interactive CLI** | `ageage cli` | REPL with `/clear`, `/stop`, `/summarize` commands. Lipgloss UI with token usage display. Use `--soul` to enable SOUL.md persona. Attach files with `@path` syntax. |
-| **HTTP API** | `ageage serve <dir>` | OpenAI-compatible `/v1/chat/completions` endpoint (streaming supported). Per-conversation agent state keyed on session ID. |
-| **IM channels** | `ageage connect` | Telegram, Discord, Matrix. Per-user agent state; `/clear`, `/stop`, `/summarize` commands work in-chat. Supervised confirmations are sent as interactive messages. |
+| **Interactive CLI** | `ageage cli` | REPL with `/clear`, `/stop`, `/summarize`, `/session` commands. Lipgloss UI with token usage display. Use `--soul` to enable SOUL.md persona. Attach files with `@path` syntax. |
+| **HTTP API** | `ageage serve <dir>` | OpenAI-compatible `/v1/chat/completions` endpoint (streaming + CORS). Compatible with SillyTavern, OpenWebUI, and similar clients. |
+| **IM channels** | `ageage connect` | Telegram, Discord, Matrix. Per-chat session management; typing indicators and emoji status reactions; Matrix thread sessions; `/session`, `/sessions`, `/cred` commands in-chat. |
 | **MCP server** | `ageage mcp` | Exposes all registered tools as MCP tools over stdio. AgeAge itself becomes a tool provider for other AI systems. |
 
 ---
@@ -293,7 +293,45 @@ Every bash command and file path passes through `security.Checker` before execut
 - **`blocked_commands`** — substring blocklist (e.g. `rm -rf /`)
 - **`allowed_roots`** — if non-empty, file ops are restricted to these directories
 - **`forbidden_roots`** — always-denied path prefixes
+- **Hardcoded blocked files** — `credentials.toml` is unconditionally blocked regardless of any config (added via `sec.BlockFile()` in the factory at startup)
 - **Supervised mode** — destructive tools prompt for `y / n / a` (always) confirmation before executing; `bash.auto_allow_commands` defines prefix patterns that skip confirmation
+
+### Credential system
+
+AgeAge stores named credentials encrypted with AES-256-GCM alongside `config.toml`. The master key is auto-generated on first use and stored at `os.UserConfigDir()/ageage/master.key` (separate from the workspace so the credential file cannot be decrypted even if the workspace is leaked).
+
+The agent never sees credential values. Instead, it uses `{{cred:name}}` placeholders in tool call arguments; substitution happens in-memory just before each tool executes and tool results are scrubbed before being stored in conversation history.
+
+Three independent layers prevent the agent from reading `credentials.toml` directly:
+1. The security checker's hardcoded blocked-file list (covers `file_read`, `file_write`, `file_edit`)
+2. The `dispatchTool` pre-check on raw JSON args (covers `bash` and any other tool)
+3. A system prompt declaration telling the agent the file is off-limits
+
+**CLI management:**
+
+```sh
+ageage cred keygen          # Show where the auto-generated master key is stored
+ageage cred list            # List credential names (never values)
+ageage cred add <name>      # Prompt for value (no terminal echo)
+ageage cred set <name> val  # Inline set (use 'add' for sensitive input)
+ageage cred remove <name>   # Remove a credential
+```
+
+**IM management** (via `/cred` channel commands):
+
+```
+/cred list          — list stored names
+/cred remove <name> — remove a credential
+/cred reload        — hot-reload credentials from disk after CLI changes
+```
+
+`/cred add` and `/cred set` are hardcoded to fail in IM — passwords must never travel over chat logs.
+
+**Agent usage:**
+
+```
+Run the deployment script using the server password in {{cred:deploy_pass}}
+```
 
 ---
 
@@ -304,18 +342,24 @@ ageage/
 ├── agent/
 │   ├── agent.go        # Core agent loop, RunWithParts, skill injection
 │   ├── attachment.go   # CLI @path file attachment processing + converter runner
-│   ├── factory.go      # AgentFactory — config, LLM client, tool registry
+│   ├── credentials.go  # Session manager (part of agent package)
+│   ├── factory.go      # AgentFactory — config, LLM client, tool registry, CredMgr
 │   ├── router.go       # Intent router (complexity classification + tool selection)
+│   ├── session.go      # Session manager — history persistence, Trash()
 │   ├── skill_tools.go  # Skill-only tool factories (grep, glob, browser_*, …)
 │   ├── subagent.go     # delegate/escalate tool implementations
 │   ├── summarizer.go   # Conversation summarizer
 │   └── tmpmanager.go   # Temp file lifecycle manager for converter output
-├── channel/        # IM connectors (Telegram, Discord, Matrix)
+├── channel/        # IM connectors (Telegram, Discord, Matrix) + optional interfaces
 ├── config/         # TOML config loading and structs
+├── creds/
+│   ├── encrypt.go  # AES-256-GCM encrypt/decrypt helpers
+│   ├── key.go      # Master key auto-generation and loading
+│   └── manager.go  # CredentialManager — store, Substitute, Scrub, PromptHint
 ├── docs/           # config.md, skills.md, tools.md
 ├── jsonutil/       # Robust JSON parser for LLM-generated tool arguments
 ├── llm/            # OpenAI-compatible HTTP client + Gemini compatibility layer
-├── security/       # Command and path safety checker
+├── security/       # Command and path safety checker (BlockFile support)
 ├── server/         # HTTP API server (OpenAI-compatible) and MCP server
 ├── skills/         # Skill loader and hot-reload watcher
 ├── tools/

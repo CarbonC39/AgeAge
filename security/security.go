@@ -12,6 +12,7 @@ type Checker struct {
 	allowedRoots    []string
 	forbiddenRoots  []string
 	workspace       string
+	blockedFiles    []string // hardcoded per-file blocks (e.g. credentials.toml)
 }
 
 // NewChecker creates a new security checker.
@@ -64,6 +65,17 @@ func (c *Checker) IsCommandSafe(cmd string) (bool, string) {
 // Workspace returns the configured workspace root (canonical absolute path).
 func (c *Checker) Workspace() string { return c.workspace }
 
+// BlockFile permanently blocks access to the given file path.
+// This is a hardcoded protection that cannot be overridden by config.
+// Canonicalises the path via filepath.Clean before storing.
+func (c *Checker) BlockFile(path string) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		abs = filepath.Clean(path)
+	}
+	c.blockedFiles = append(c.blockedFiles, abs)
+}
+
 // resolvePath converts path to an absolute path without resolving symlinks.
 // Relative paths are resolved against the workspace root, NOT the process CWD.
 // Absolute paths are cleaned and returned unchanged.
@@ -109,7 +121,15 @@ func (c *Checker) CheckPath(path string) (string, error) {
 		}
 	}
 
-	// Step 3: check forbidden roots (highest priority).
+	// Step 3a: check hardcoded blocked files (highest priority, not configurable).
+	cleanResolved := filepath.Clean(resolved)
+	for _, blocked := range c.blockedFiles {
+		if cleanResolved == blocked {
+			return "", fmt.Errorf("path %q is system-protected and cannot be accessed by the agent", resolved)
+		}
+	}
+
+	// Step 3b: check forbidden roots (high priority).
 	for _, forbidden := range c.forbiddenRoots {
 		if isSubPath(resolved, forbidden) {
 			return "", fmt.Errorf("path %q is inside forbidden root %q", resolved, forbidden)

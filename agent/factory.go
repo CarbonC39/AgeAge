@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"ageage/config"
+	"ageage/creds"
 	"ageage/llm"
 	"ageage/security"
 	"ageage/skills"
@@ -32,6 +33,7 @@ type AgentFactory struct {
 	MCPSessions     map[string]*mcp.ClientSession // Active MCP sessions
 	InjectSoul      bool                          // Passed to each created agent; true in serve/connect, false in CLI
 	OnAlwaysAllow   func(operation string)        // Optional: called when user selects "a" (always-allow) in CLI confirm
+	CredMgr         *creds.Manager                // Optional: nil when credentials feature is unavailable
 
 	mcpMu    sync.RWMutex // Bug Fix 2: Protect MCPSessions
 	skillsMu sync.RWMutex
@@ -183,6 +185,18 @@ func NewFactory(configPath string, debug bool) (*AgentFactory, error) {
 		}
 	}
 
+	// Initialise credential manager (optional; warn and continue on failure).
+	credMgr, err := creds.NewManager(cfg.CredentialsPath())
+	if err != nil {
+		fmt.Printf("⚠️  Warning: credentials unavailable: %s\n", err)
+		credMgr = nil
+	}
+	// Hardcode-block the credentials file path in the security checker so that
+	// file_read / file_write / file_edit tools cannot touch it.
+	if credMgr != nil {
+		sec.BlockFile(cfg.CredentialsPath())
+	}
+
 	return &AgentFactory{
 		Config:          cfg,
 		Skills:          loadedSkills,
@@ -193,6 +207,7 @@ func NewFactory(configPath string, debug bool) (*AgentFactory, error) {
 		UserInputMgr:    tools.NewUserInputManager(),
 		HasMemories:     hasMemories,
 		MCPSessions:     mcpSessions,
+		CredMgr:         credMgr,
 	}, nil
 }
 
@@ -458,6 +473,7 @@ func (f *AgentFactory) CreateAgentFiltered(confirmMgr *tools.ConfirmationManager
 	ag.factory = f
 	ag.InjectSoul = f.InjectSoul
 	ag.ConfirmationMgr = confirmMgr
+	ag.CredMgr = f.CredMgr
 	if channelID != "" {
 		ag.SetChannelID(channelID)
 	}

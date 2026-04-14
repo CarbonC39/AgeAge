@@ -16,11 +16,14 @@ import (
 
 	"ageage/agent"
 	"ageage/channel"
+	"ageage/config"
+	"ageage/creds"
 	"ageage/llm"
 	"ageage/security"
 	"ageage/server"
 	"ageage/tools"
 
+	"github.com/charmbracelet/x/term"
 	"github.com/spf13/cobra"
 )
 
@@ -89,6 +92,50 @@ func main() {
 	}
 	mcpCmd.Flags().StringP("config", "c", "", "Path to config.toml")
 	rootCmd.AddCommand(mcpCmd)
+
+	// --- ageage cred ---
+	credCmd := &cobra.Command{
+		Use:   "cred",
+		Short: "Manage stored credentials",
+	}
+	credCmd.PersistentFlags().StringP("config", "c", "", "Path to config.toml")
+
+	credKeygenCmd := &cobra.Command{
+		Use:   "keygen",
+		Short: "Show the path of the auto-generated master key",
+		RunE:  runCredKeygen,
+	}
+
+	credListCmd := &cobra.Command{
+		Use:   "list",
+		Short: "List stored credential names",
+		RunE:  runCredList,
+	}
+
+	credAddCmd := &cobra.Command{
+		Use:   "add <name>",
+		Short: "Add or update a credential (prompts for value, no terminal echo)",
+		Args:  cobra.ExactArgs(1),
+		RunE:  runCredAdd,
+	}
+
+	credSetCmd := &cobra.Command{
+		Use:   "set <name> <value>",
+		Short: "Add or update a credential (value inline — use 'add' for sensitive input)",
+		Args:  cobra.ExactArgs(2),
+		RunE:  runCredSet,
+	}
+
+	credRemoveCmd := &cobra.Command{
+		Use:     "remove <name>",
+		Aliases: []string{"rm"},
+		Short:   "Remove a stored credential",
+		Args:    cobra.ExactArgs(1),
+		RunE:    runCredRemove,
+	}
+
+	credCmd.AddCommand(credKeygenCmd, credListCmd, credAddCmd, credSetCmd, credRemoveCmd)
+	rootCmd.AddCommand(credCmd)
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
@@ -594,6 +641,18 @@ func startChannels(factory *agent.AgentFactory) (*channel.Manager, int) {
 			sub = strings.ToLower(parts[1])
 		}
 
+		// Normalize aliases.
+		switch sub {
+		case "ls":
+			sub = "list"
+		case "n":
+			sub = "new"
+		case "sw":
+			sub = "switch"
+		case "rm", "delete":
+			sub = "remove"
+		}
+
 		switch sub {
 		case "": // /session — show current session
 			infos, _ := sm.ListWithPrefix(defaultPrefix)
@@ -672,25 +731,25 @@ func startChannels(factory *agent.AgentFactory) (*channel.Manager, int) {
 			agentMu.Unlock()
 			return fmt.Sprintf("✅ Switched to session **%s**.", toDisplayName(newFullID))
 
-		case "delete":
+		case "remove":
 			if len(parts) < 3 {
-				return "Usage: /session delete <name>"
+				return "Usage: /session remove <name>"
 			}
 			name := strings.Join(parts[2:], "-")
 			delFullID := toFullID(name)
 			if delFullID == currentSessionID {
-				return "❌ Cannot delete the active session. Switch to another session first."
+				return "❌ Cannot remove the active session."
 			}
 			agentMu.Lock()
 			delete(agents, delFullID)
 			agentMu.Unlock()
-			if err := sm.Delete(delFullID); err != nil {
-				return fmt.Sprintf("❌ Failed to delete session: %s", err)
+			if err := sm.Trash(delFullID); err != nil {
+				return fmt.Sprintf("❌ Failed to remove session: %s", err)
 			}
-			return fmt.Sprintf("🗑️ Deleted session **%s**.", toDisplayName(delFullID))
+			return fmt.Sprintf("🗑️ Removed session **%s**.", toDisplayName(delFullID))
 
 		default:
-			return "Usage: /session [list | new [name] | switch <name> | delete <name>]"
+			return "Usage: /session [list|ls | new|n [name] | switch|sw <name> | remove|rm <name>]"
 		}
 	}
 
@@ -762,62 +821,14 @@ func startChannels(factory *agent.AgentFactory) (*channel.Manager, int) {
 			fmt.Printf("\n  ▸ [%s] %s: %s\n", msg.ChannelType, msg.SenderName, msg.Text)
 		}
 
-		// /session commands.
-		if strings.HasPrefix(textLow, "/session") {
-			parts := strings.Fields(text)
-			sub := ""
-			if len(parts) >= 2 {
-				sub = strings.ToLower(parts[1])
-			}
-
-			// /session new from a top-level Matrix message: start a thread-based session.
-			// The user's command event becomes the thread root; the bot's reply lives inside it.
-			if sub == "new" && msg.ChannelType == "matrix" && msg.ThreadID == "" {
-				name := ""
-				if len(parts) >= 3 {
-					name = strings.Join(parts[2:], "-")
-				} else {
-					agentMu.Lock()
-					name = fmt.Sprintf("session-%d", len(agents))
-					agentMu.Unlock()
-				}
-
-				// Session lives under a thread-based chatKey keyed to the user's event.
-				threadChatKey := msg.ChannelType + ":" + msg.ChannelID + ":t:" + msg.ReplyTo
-				threadPrefix := agent.SanitizeSessionID(threadChatKey)
-				newFullID := threadPrefix
-				if name != "" && name != "default" {
-					newFullID = threadPrefix + "-" + agent.SanitizeSessionID(name)
-				}
-
-				agentMu.Lock()
-				currentSessionID := chatSessionID(chatKey)
-				if curAg, ok := agents[currentSessionID]; ok {
-					_ = sm.SaveHistory(currentSessionID, curAg.Messages())
-				}
-				if err := sm.EnsureSession(newFullID); err != nil {
-					agentMu.Unlock()
-					return respond(msg, fmt.Sprintf("❌ Failed to create session: %s", err))
-				}
-				// Use room-level channelID for agent callbacks (not the :t:-encoded key).
-				newAg := makeChatAgent(msg.ChannelType+":"+msg.ChannelID, newFullID)
-				agents[newFullID] = newAg
-				activeSessions[threadChatKey] = newFullID
-				chatKeyBySessionID[newFullID] = threadChatKey
-				agentMu.Unlock()
-
-				// Reply inside the newly created thread.
-				replyText := fmt.Sprintf("✅ Session **%s** started. Continue in this thread.", name)
-				if mx, ok := channelsByType["matrix"].(*channel.MatrixChannel); ok {
-					_ = mx.SendInThread(msg.ChannelID, msg.ReplyTo, msg.ReplyTo, replyText)
-				}
-				return ""
-			}
-
-			return respond(msg, handleSessionCmd(chatKey, text))
+		// /cred commands — never routed through the agent.
+		// /cred set and /cred add are blocked in IM to prevent passwords appearing in chat logs.
+		if strings.HasPrefix(textLow, "/cred") {
+			return respond(msg, handleCredChanCmd(msg, factory.CredMgr, text))
 		}
 
 		// /sessions — list sessions for this room with matrix.to links.
+		// Must come before the /session prefix check below.
 		if textLow == "/sessions" {
 			roomPrefix := agent.SanitizeSessionID(msg.ChannelType + ":" + msg.ChannelID)
 			infos, err := sm.ListWithPrefix(roomPrefix)
@@ -855,6 +866,47 @@ func startChannels(factory *agent.AgentFactory) (*channel.Manager, int) {
 			return respond(msg, strings.TrimRight(sb.String(), "\n"))
 		}
 
+		// /session commands.
+		if strings.HasPrefix(textLow, "/session") {
+			parts := strings.Fields(text)
+			sub := ""
+			if len(parts) >= 2 {
+				sub = strings.ToLower(parts[1])
+			}
+
+			// /session new from a top-level Matrix message: start a thread-based session.
+			// The user's command event becomes the thread root; the bot replies inside it.
+			if sub == "new" && msg.ChannelType == "matrix" && msg.ThreadID == "" {
+				// Session ID = SanitizeSessionID(threadChatKey) — no name suffix so that
+				// after a restart, incoming messages in the thread map to the same session.
+				threadChatKey := msg.ChannelType + ":" + msg.ChannelID + ":t:" + msg.ReplyTo
+				newFullID := agent.SanitizeSessionID(threadChatKey)
+
+				agentMu.Lock()
+				currentSessionID := chatSessionID(chatKey)
+				if curAg, ok := agents[currentSessionID]; ok {
+					_ = sm.SaveHistory(currentSessionID, curAg.Messages())
+				}
+				if err := sm.EnsureSession(newFullID); err != nil {
+					agentMu.Unlock()
+					return respond(msg, fmt.Sprintf("❌ Failed to create session: %s", err))
+				}
+				// Use room-level channelID for agent callbacks (not the :t:-encoded key).
+				newAg := makeChatAgent(msg.ChannelType+":"+msg.ChannelID, newFullID)
+				agents[newFullID] = newAg
+				activeSessions[threadChatKey] = newFullID
+				chatKeyBySessionID[newFullID] = threadChatKey
+				agentMu.Unlock()
+
+				if mx, ok := channelsByType["matrix"].(*channel.MatrixChannel); ok {
+					_ = mx.SendInThread(msg.ChannelID, msg.ReplyTo, msg.ReplyTo, "✅ New session started. Continue in this thread.")
+				}
+				return ""
+			}
+
+			return respond(msg, handleSessionCmd(chatKey, text))
+		}
+
 		switch textLow {
 		case "/clear":
 			agentMu.Lock()
@@ -877,11 +929,14 @@ func startChannels(factory *agent.AgentFactory) (*channel.Manager, int) {
 
 		case "/help":
 			return respond(msg, "Available commands:\n"+
-				"/clear — Clear conversation history\n"+
+				"/clear — Clear conversation history (keeps session)\n"+
 				"/stop — Stop the current task\n"+
 				"/summarize — Summarize conversation\n"+
 				"/sessions — List sessions for this room\n"+
-				"/session — Manage sessions (list, new, switch, delete)\n"+
+				"/session list|ls — List sessions\n"+
+				"/session new|n [name] — Start a new session\n"+
+				"/session switch|sw <name> — Switch to a session\n"+
+				"/session remove|rm <name> — Remove a session (moves to trash)\n"+
 				"/help — Show this help")
 		}
 
@@ -1647,6 +1702,70 @@ func runCLI(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// handleCredChanCmd processes /cred commands received from an IM channel.
+// /cred set and /cred add are always rejected in IM to prevent passwords
+// appearing in chat histories.
+func handleCredChanCmd(_ channel.IncomingMessage, mgr *creds.Manager, rawInput string) string {
+	if mgr == nil {
+		return "❌ Credentials unavailable (initialization failed at startup)."
+	}
+
+	parts := strings.Fields(rawInput)
+	sub := ""
+	if len(parts) >= 2 {
+		sub = strings.ToLower(parts[1])
+	}
+
+	// Normalize aliases.
+	switch sub {
+	case "ls":
+		sub = "list"
+	case "rm", "delete":
+		sub = "remove"
+	}
+
+	switch sub {
+	case "list":
+		names := mgr.List()
+		if len(names) == 0 {
+			return "No credentials stored."
+		}
+		var sb strings.Builder
+		fmt.Fprintf(&sb, "**Stored credentials** (%d):\n", len(names))
+		for _, n := range names {
+			fmt.Fprintf(&sb, "• `%s`\n", n)
+		}
+		return strings.TrimRight(sb.String(), "\n")
+
+	case "set", "add":
+		// Hardcoded block — never allow credential values to travel over IM.
+		return "❌ Adding credentials via IM is not permitted (passwords must not appear in chat logs).\nUse `ageage cred add <name>` on the command line."
+
+	case "remove":
+		if len(parts) < 3 {
+			return "Usage: /cred remove <name>"
+		}
+		name := parts[2]
+		if err := mgr.Remove(name); err != nil {
+			return fmt.Sprintf("❌ %s", err)
+		}
+		return fmt.Sprintf("✅ Credential `%s` removed.", name)
+
+	case "reload":
+		if err := mgr.Reload(); err != nil {
+			return fmt.Sprintf("❌ Reload failed: %s", err)
+		}
+		names := mgr.List()
+		return fmt.Sprintf("✅ Credentials reloaded (%d stored).", len(names))
+
+	case "":
+		return "Usage: /cred [list|ls | remove|rm <name> | reload]"
+
+	default:
+		return "Usage: /cred [list|ls | remove|rm <name> | reload]\n_(Adding credentials via IM is not allowed — use `ageage cred add` on the CLI.)_"
+	}
+}
+
 // fmtAge returns a short human-readable description of how long ago t was.
 // Used in session listings (e.g. "2h ago", "3d ago", "just now").
 func fmtAge(t time.Time) string {
@@ -1788,4 +1907,101 @@ func runMCP(cmd *cobra.Command, args []string) error {
 
 	mcpSrv := server.NewMCPServer(factory)
 	return mcpSrv.Start()
+}
+
+// --- ageage cred ---
+
+// credMgrFromCmd loads config and initialises a CredentialManager.
+// The cred subcommands use this instead of a full AgentFactory.
+func credMgrFromCmd(cmd *cobra.Command) (*creds.Manager, error) {
+	configPath, _ := cmd.Flags().GetString("config")
+	if configPath == "" {
+		// Walk up to the parent to find the persistent flag.
+		configPath, _ = cmd.Root().PersistentFlags().GetString("config")
+	}
+	configPath = findConfigFile(configPath)
+	cfg, err := config.LoadConfig(configPath)
+	if err != nil {
+		return nil, fmt.Errorf("load config: %w", err)
+	}
+	return creds.NewManager(cfg.CredentialsPath())
+}
+
+func runCredKeygen(cmd *cobra.Command, args []string) error {
+	path, err := creds.KeyFilePath()
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Master key location: %s\n", path)
+	fmt.Println("(Auto-generated on first use. Keep this file private.)")
+	return nil
+}
+
+func runCredList(cmd *cobra.Command, args []string) error {
+	mgr, err := credMgrFromCmd(cmd)
+	if err != nil {
+		return err
+	}
+	names := mgr.List()
+	if len(names) == 0 {
+		fmt.Println("No credentials stored.")
+		return nil
+	}
+	fmt.Printf("Stored credentials (%d):\n", len(names))
+	for _, n := range names {
+		fmt.Printf("  • %s\n", n)
+	}
+	return nil
+}
+
+func runCredAdd(cmd *cobra.Command, args []string) error {
+	name := args[0]
+	mgr, err := credMgrFromCmd(cmd)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "Value for %q (input hidden): ", name)
+	valBytes, err := term.ReadPassword(os.Stdin.Fd())
+	fmt.Fprintln(os.Stderr) // newline after hidden input
+	if err != nil {
+		// Fallback: read normally when not on a TTY (e.g. piped input).
+		fmt.Fprintf(os.Stderr, "(no TTY — reading value from stdin): ")
+		reader := bufio.NewReader(os.Stdin)
+		line, _ := reader.ReadString('\n')
+		valBytes = []byte(strings.TrimRight(line, "\r\n"))
+	}
+	if len(valBytes) == 0 {
+		return fmt.Errorf("value must not be empty")
+	}
+	if err := mgr.Set(name, string(valBytes)); err != nil {
+		return err
+	}
+	fmt.Printf("✓ Credential %q saved.\n", name)
+	return nil
+}
+
+func runCredSet(cmd *cobra.Command, args []string) error {
+	name, value := args[0], args[1]
+	mgr, err := credMgrFromCmd(cmd)
+	if err != nil {
+		return err
+	}
+	if err := mgr.Set(name, value); err != nil {
+		return err
+	}
+	fmt.Printf("✓ Credential %q saved.\n", name)
+	return nil
+}
+
+func runCredRemove(cmd *cobra.Command, args []string) error {
+	name := args[0]
+	mgr, err := credMgrFromCmd(cmd)
+	if err != nil {
+		return err
+	}
+	if err := mgr.Remove(name); err != nil {
+		return err
+	}
+	fmt.Printf("✓ Credential %q removed.\n", name)
+	return nil
 }

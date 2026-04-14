@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"ageage/config"
+	"ageage/creds"
 	"ageage/jsonutil"
 	"ageage/llm"
 	"ageage/skills"
@@ -60,6 +61,7 @@ type Agent struct {
 	ToolStartCallback   func(name, args string)         // Optional: called just before each tool executes (CLI spinner/diff display)
 	ToolEndCallback     func(name string)               // Optional: called just after each tool completes
 	ToolResultCallback  func(name, result string)       // Optional: called with the tool's output after execution
+	CredMgr             *creds.Manager                  // Optional: substitutes {{cred:x}} in tool args, scrubs results
 }
 
 // NewAgent creates a new agent instance.
@@ -233,6 +235,13 @@ func (a *Agent) buildSystemPrompt(matchedSkill *skills.Skill) string {
 				sb.WriteString(trimmed)
 				sb.WriteString("\n\n")
 			}
+		}
+	}
+
+	// Credential placeholder hint (only when credentials are configured).
+	if a.CredMgr != nil {
+		if hint := a.CredMgr.PromptHint(); hint != "" {
+			sb.WriteString(hint)
 		}
 	}
 
@@ -602,11 +611,33 @@ func (a *Agent) RunWithParts(ctx context.Context, userInput string, parts []llm.
 			if err2 := jsonutil.ParseToolArgs(tc.Function.Arguments, &rawArgs); err2 != nil {
 				rawArgs = json.RawMessage(tc.Function.Arguments)
 			}
+
+			// Credential security: block direct file access and substitute placeholders.
+			if a.CredMgr != nil {
+				argsStr := string(rawArgs)
+				// Block access to credentials file (defense-in-depth: security checker
+				// already blocks file tools; this catches bash and other tools).
+				if a.CredMgr.ContainsCredPath(argsStr) {
+					return "error: direct access to the credentials file is system-protected and not permitted", nil
+				}
+				// Replace {{cred:name}} placeholders with actual values.
+				if substituted := a.CredMgr.Substitute(argsStr); substituted != argsStr {
+					rawArgs = json.RawMessage(substituted)
+				}
+			}
+
 			a.debugLog("Tool▷", "%s  %s", tc.Function.Name, briefActionSummary(tc.Function.Name, tc.Function.Arguments))
 			if a.ToolStartCallback != nil {
 				a.ToolStartCallback(tc.Function.Name, string(rawArgs))
 			}
 			res, execErr := a.registry.Execute(ctx, tc.Function.Name, rawArgs)
+
+			// Scrub any credential values that leaked into the tool result before
+			// they are stored in conversation history.
+			if a.CredMgr != nil {
+				res = a.CredMgr.Scrub(res)
+			}
+
 			if a.ToolEndCallback != nil {
 				a.ToolEndCallback(tc.Function.Name)
 			}

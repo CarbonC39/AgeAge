@@ -372,6 +372,73 @@ Default blocked commands: `rm -rf /`, `rm -rf /*`, `mkfs`, `dd if=`, `:(){ :|:& 
 
 **Path resolution:** All file paths are first resolved against the workspace root (if relative), then all symlinks are followed to obtain the canonical path. The canonical path is what is checked against `allowed_roots` / `forbidden_roots` and what is used for the actual OS operation — a symlink inside the workspace that points outside it is denied.
 
+**Hardcoded blocks:** `credentials.toml` is unconditionally blocked from all file tools regardless of any config setting. This cannot be overridden.
+
+---
+
+## Credentials
+
+AgeAge can store named secrets (API tokens, passwords, SSH keys) encrypted alongside `config.toml`. The agent references them via `{{cred:name}}` placeholders — it never sees the actual values.
+
+### Storage and encryption
+
+| Item | Location |
+|------|----------|
+| Encrypted credential store | `<workspace>/credentials.toml` (binary, AES-256-GCM) |
+| Master key | `os.UserConfigDir()/ageage/master.key` (hex, 0600) |
+
+The master key is **auto-generated** on first use. It lives outside the workspace so that `credentials.toml` cannot be decrypted if only the workspace is leaked. Back up `master.key` separately if you need portability.
+
+### CLI management
+
+```sh
+ageage cred keygen               # Show master key path (auto-generated if missing)
+ageage cred list                 # List stored credential names (never values)
+ageage cred add <name>           # Prompt for value with no terminal echo
+ageage cred set <name> <value>   # Inline set (for scripts / non-interactive use)
+ageage cred remove <name>        # Delete a credential
+```
+
+All commands accept `-c <path>` to specify a config file (same as other `ageage` commands).
+
+### IM channel management
+
+```
+/cred list           — list stored names
+/cred remove <name>  — remove a credential
+/cred reload         — hot-reload from disk (after CLI edits while the bot is running)
+```
+
+`/cred set` and `/cred add` are **permanently blocked** in IM — credential values must never appear in chat logs.
+
+### Agent usage
+
+When credentials are stored, the agent's system prompt is automatically extended with a list of available names:
+
+```
+## Stored Credentials
+Use `{{cred:name}}` as a placeholder in tool call arguments. Available names:
+- {{cred:deploy_key}}
+- {{cred:db_password}}
+The credentials file is system-protected. Do not attempt to read it directly.
+```
+
+The agent uses the placeholder in tool arguments:
+
+```
+Run the deploy script: bash("./deploy.sh --password {{cred:deploy_pass}}")
+```
+
+Substitution happens in-memory immediately before tool execution. Tool results are scrubbed — any credential value that appears in a tool's stdout/stderr is replaced with `[REDACTED]` before being stored in conversation history.
+
+### Security layers
+
+Three independent mechanisms prevent the agent from reading `credentials.toml`:
+
+1. **Security checker** — `credentials.toml`'s absolute path is added to the hardcoded blocked-file list at startup. `file_read`, `file_write`, and `file_edit` are rejected before execution.
+2. **Tool dispatch pre-check** — the raw JSON arguments of every tool call are scanned for the credentials file path before execution. Matches are rejected with an error returned to the agent.
+3. **System prompt declaration** — the agent is told the file is system-protected and not to attempt direct access.
+
 ---
 
 ## `[mcp]`
@@ -410,26 +477,76 @@ parallel = false
 
 | Key        | Type | Default | Description |
 |------------|------|---------|-------------|
-| `parallel` | bool | `false` | Process messages from all users concurrently. When `false`, messages are queued. |
+| `parallel` | bool | `false` | Process messages from all users concurrently. When `false`, messages are queued per chat. |
+
+### Channel UX features
+
+All IM channels share these UX behaviours when the platform supports them:
+
+| Feature | Telegram | Discord | Matrix |
+|---------|----------|---------|--------|
+| Typing indicator (keep-alive) | ✅ | ✅ | ✅ |
+| ⏳ reaction while processing | ✅ | ✅ | ✅ |
+| ❌ reaction on error | ✅ | ✅ | ✅ |
+| Read receipts | — | — | ✅ |
+| Thread sessions | Topics (supergroups) | — | ✅ |
+
+### In-chat commands
+
+These commands are handled directly in the channel handler and never routed through the agent.
+
+| Command | Description |
+|---------|-------------|
+| `/clear` | Clear conversation history for the current session (session stays). |
+| `/stop` | Abort the running agent task. |
+| `/summarize` | Compress conversation history into a summary. |
+| `/sessions` | List all sessions for this room/chat, newest first. Matrix sessions include a `matrix.to` link to jump to the thread. |
+| `/session list\|ls` | List sessions scoped to this chat. |
+| `/session new\|n [name]` | Create a new session and switch to it. On Matrix top-level messages, the bot's reply starts a thread — continue in that thread to stay in the session. |
+| `/session switch\|sw <name>` | Switch to an existing session (prefix matching supported). |
+| `/session remove\|rm <name>` | Move a session to the OS trash (fallback: permanent delete). Cannot remove the currently active session. |
+| `/cred list\|ls` | List stored credential names. |
+| `/cred remove\|rm <name>` | Remove a credential. |
+| `/cred reload` | Hot-reload credentials from disk (after CLI edits). |
+| `/help` | Show available commands. |
+
+> **Session scope:** In channel mode each chat (room/channel/DM) has its own session namespace. A session named `research` in one Telegram chat is independent from `research` in another. Matrix threads each get their own isolated session that resumes automatically after a restart.
 
 ### `[channels.telegram]`
 
 ```toml
 [channels.telegram]
-enabled   = true
-bot_token = "123456:ABC-..."
+enabled       = true
+bot_token     = "123456:ABC-..."
+allowed_users = []   # Telegram user IDs; empty = allow all
 ```
+
+| Key             | Type        | Default | Description |
+|-----------------|-------------|---------|-------------|
+| `enabled`       | bool        | `false` | Enable Telegram connector. |
+| `bot_token`     | string      | `""`    | Bot token from @BotFather. |
+| `allowed_users` | string list | `[]`    | Telegram user IDs that may interact. Empty = allow everyone. |
+
+Supergroup topics are supported: messages in a topic thread are treated as a separate session from the general chat.
 
 ### `[channels.discord]`
 
 ```toml
 [channels.discord]
-enabled     = true
-bot_token   = "your-discord-bot-token"
-channel_ids = ["123456789012345678"]
+enabled       = true
+bot_token     = "your-discord-bot-token"
+channel_ids   = ["123456789012345678"]
+allowed_users = []
 ```
 
-`channel_ids` restricts the bot to specific channels. Leave empty to respond in any channel.
+| Key             | Type        | Default | Description |
+|-----------------|-------------|---------|-------------|
+| `enabled`       | bool        | `false` | Enable Discord connector. |
+| `bot_token`     | string      | `""`    | Bot token from the Discord developer portal. |
+| `channel_ids`   | string list | `[]`    | Channel IDs to monitor. Required — the bot ignores all other channels. |
+| `allowed_users` | string list | `[]`    | Discord user IDs that may interact. Empty = allow everyone. |
+
+The bot polls each configured channel every 2 seconds for new messages (REST API, no WebSocket gateway required).
 
 ### `[channels.matrix]`
 
@@ -440,7 +557,19 @@ homeserver   = "https://matrix.org"
 user_id      = "@bot:matrix.org"
 access_token = "syt_..."
 room_ids     = ["!roomid:matrix.org"]
+allowed_users = []
 ```
+
+| Key             | Type        | Default | Description |
+|-----------------|-------------|---------|-------------|
+| `enabled`       | bool        | `false` | Enable Matrix connector. |
+| `homeserver`    | string      | `""`    | Full URL of the Matrix homeserver. |
+| `user_id`       | string      | `""`    | Full Matrix user ID of the bot account. |
+| `access_token`  | string      | `""`    | Access token for the bot account. |
+| `room_ids`      | string list | `[]`    | Room IDs to join and monitor. |
+| `allowed_users` | string list | `[]`    | Matrix user IDs that may interact. Empty = allow everyone. |
+
+**Thread sessions:** When a message arrives inside a Matrix thread (`m.thread`), it is automatically routed to a thread-specific session. The session ID is derived deterministically from the thread's root event ID, so history is correctly resumed after a bot restart. Use `/session new` from a top-level message to have the bot create a thread and start a fresh session inside it.
 
 ---
 
@@ -462,8 +591,12 @@ port = 8080
 |-------------------|-------------|
 | `AGEAGE_API_KEY`  | LLM API key (checked before `OPENAI_API_KEY`). |
 | `OPENAI_API_KEY`  | Fallback LLM API key. |
+| `TAVILY_API_KEY`  | Tavily search API key (fallback when not set in config). |
+| `BRAVE_API_KEY`   | Brave Search API key (fallback when not set in config). |
 
-Both are checked only when `[llm].api_key` is not set in the config file.
+`AGEAGE_API_KEY` / `OPENAI_API_KEY` are checked only when `[llm].api_key` is not set in the config file.
+
+The credential master key is **not** read from an environment variable — it is auto-generated and stored at `os.UserConfigDir()/ageage/master.key`. Run `ageage cred keygen` to find its location.
 
 ---
 
@@ -472,6 +605,7 @@ Both are checked only when `[llm].api_key` is not set in the config file.
 ```
 workspace/
 ├── config.toml          # Main configuration
+├── credentials.toml     # Encrypted credential store (AES-256-GCM; binary content)
 ├── data/
 │   ├── AGENT.md         # Behavioural directives — always injected into every agent
 │   ├── SOUL.md          # Agent persona — injected in serve/connect mode (or with --soul in CLI)

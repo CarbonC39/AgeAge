@@ -2,10 +2,12 @@ package channel
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -20,8 +22,10 @@ type DiscordChannel struct {
 	baseURL      string
 	client       *http.Client
 	stopCh       chan struct{}
-	lastMsgIDs   map[string]string // Track last seen message per channel
+	lastMsgIDs   map[string]string          // Track last seen message per channel
 	mu           sync.Mutex
+	typingStop   map[string]context.CancelFunc // channelID → cancel func for keep-alive typing
+	typingMu     sync.Mutex
 }
 
 // NewDiscord creates a new Discord channel.
@@ -35,6 +39,7 @@ func NewDiscord(botToken string, channelIDs []string, allowedUsers []string, opt
 		client:       &http.Client{Timeout: 30 * time.Second},
 		stopCh:       make(chan struct{}),
 		lastMsgIDs:   make(map[string]string),
+		typingStop:   make(map[string]context.CancelFunc),
 	}
 }
 
@@ -65,10 +70,8 @@ func (d *DiscordChannel) Start(handler MessageHandler) error {
 		return fmt.Errorf("failed to get bot user info: %w", err)
 	}
 
-	// Initialize the cursor for every channel so the main loop only sees
-	// messages that arrive after startup. Retry each channel individually
-	// so a single bad channel cannot prevent the others from initialising.
-	// Falls back to "0" when the channel has no messages yet.
+	// Initialise the cursor for every channel so the main loop only sees
+	// messages that arrive after startup.
 	for _, chID := range d.ChannelIDs {
 		for {
 			select {
@@ -86,13 +89,14 @@ func (d *DiscordChannel) Start(handler MessageHandler) error {
 			if len(msgs) > 0 {
 				d.lastMsgIDs[chID] = msgs[0].ID
 			} else {
-				d.lastMsgIDs[chID] = "0" // empty channel; accept all future messages
+				d.lastMsgIDs[chID] = "0"
 			}
 			d.mu.Unlock()
 			break
 		}
 	}
 	fmt.Println("[Discord] Skipped historical messages")
+
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
@@ -107,6 +111,7 @@ func (d *DiscordChannel) Start(handler MessageHandler) error {
 		}
 	}
 }
+
 func (d *DiscordChannel) Stop() error {
 	close(d.stopCh)
 	return nil
@@ -114,9 +119,7 @@ func (d *DiscordChannel) Stop() error {
 
 // Send sends a Markdown-formatted message. Discord natively supports Markdown.
 func (d *DiscordChannel) Send(channelID, text string) error {
-	chunks := splitTextChunks(text, 1900) // Discord limit is 2000.
-
-	for _, chunk := range chunks {
+	for _, chunk := range splitTextChunks(text, 1900) {
 		if err := d.createMessage(channelID, chunk, ""); err != nil {
 			return err
 		}
@@ -124,11 +127,38 @@ func (d *DiscordChannel) Send(channelID, text string) error {
 	return nil
 }
 
-// Reply sends a Markdown-formatted reply. Discord natively supports Markdown.
-func (d *DiscordChannel) Reply(channelID, replyToID, text string) error {
+// SendMessage sends a message and returns the Discord message ID.
+// Implements the Editable interface.
+func (d *DiscordChannel) SendMessage(channelID, text string) (string, error) {
 	chunks := splitTextChunks(text, 1900)
-
+	var firstID string
 	for i, chunk := range chunks {
+		id, err := d.createMessageWithID(channelID, chunk, "")
+		if err != nil {
+			return firstID, err
+		}
+		if i == 0 {
+			firstID = id
+		}
+	}
+	return firstID, nil
+}
+
+// EditMessage replaces a previously sent Discord message.
+// Implements the Editable interface.
+func (d *DiscordChannel) EditMessage(channelID, messageID, text string) error {
+	// Truncate to Discord's limit; edits are single-message only.
+	if len(text) > 1900 {
+		text = text[:1900]
+	}
+	payload := map[string]any{"content": text}
+	_, err := d.doRequest("PATCH", fmt.Sprintf("/channels/%s/messages/%s", channelID, messageID), payload)
+	return err
+}
+
+// Reply sends a Markdown-formatted reply referencing a specific message.
+func (d *DiscordChannel) Reply(channelID, replyToID, text string) error {
+	for i, chunk := range splitTextChunks(text, 1900) {
 		ref := ""
 		if i == 0 {
 			ref = replyToID
@@ -138,6 +168,63 @@ func (d *DiscordChannel) Reply(channelID, replyToID, text string) error {
 		}
 	}
 	return nil
+}
+
+// SendTyping shows a typing indicator in a Discord channel, kept alive until
+// called again with typing=false. Implements TypingIndicator.
+func (d *DiscordChannel) SendTyping(channelID string, typing bool) error {
+	if typing {
+		ctx, cancel := context.WithCancel(context.Background())
+		d.typingMu.Lock()
+		if old, ok := d.typingStop[channelID]; ok {
+			old()
+		}
+		d.typingStop[channelID] = cancel
+		d.typingMu.Unlock()
+		go func() {
+			for {
+				// Discord typing indicator lasts ~10 s; refresh every 8 s.
+				d.doRequest("POST", fmt.Sprintf("/channels/%s/typing", channelID), nil)
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(8 * time.Second):
+				}
+			}
+		}()
+	} else {
+		d.typingMu.Lock()
+		if cancel, ok := d.typingStop[channelID]; ok {
+			cancel()
+			delete(d.typingStop, channelID)
+		}
+		d.typingMu.Unlock()
+	}
+	return nil
+}
+
+// React adds an emoji reaction to a Discord message.
+// Returns a reaction key "messageID|emoji" for use with Unreact.
+// Implements Reactor.
+func (d *DiscordChannel) React(channelID, messageID, emoji string) (string, error) {
+	path := fmt.Sprintf("/channels/%s/messages/%s/reactions/%s/@me",
+		channelID, messageID, url.PathEscape(emoji))
+	_, err := d.doRequest("PUT", path, nil)
+	return messageID + "|" + emoji, err
+}
+
+// Unreact removes an emoji reaction previously added by React.
+// Implements Reactor.
+func (d *DiscordChannel) Unreact(channelID, reactionKey string) error {
+	idx := strings.LastIndex(reactionKey, "|")
+	if idx < 0 {
+		return fmt.Errorf("invalid reaction key: %q", reactionKey)
+	}
+	messageID, emoji := reactionKey[:idx], reactionKey[idx+1:]
+	path := fmt.Sprintf("/channels/%s/messages/%s/reactions/%s/@me",
+		channelID, messageID, url.PathEscape(emoji))
+	_, err := d.doRequest("DELETE", path, nil)
+	return err
 }
 
 // --- Discord API types ---
@@ -193,16 +280,13 @@ func (d *DiscordChannel) getBotUserID() (string, error) {
 	if err != nil {
 		return "", err
 	}
-
 	var user discordUser
 	if err := json.Unmarshal(body, &user); err != nil {
 		return "", err
 	}
-
 	return user.ID, nil
 }
 
-// getLatestMessages returns the latest N messages (newest first), ignoring lastMsgIDs.
 func (d *DiscordChannel) getLatestMessages(channelID string, limit int) ([]discordMessage, error) {
 	path := fmt.Sprintf("/channels/%s/messages?limit=%d", channelID, limit)
 	body, err := d.doRequest("GET", path, nil)
@@ -221,7 +305,6 @@ func (d *DiscordChannel) getMessages(channelID string, limit int) ([]discordMess
 	lastID, ok := d.lastMsgIDs[channelID]
 	d.mu.Unlock()
 
-	// If we have a last position, use "after" to get only newer messages
 	if ok && lastID != "" {
 		path := fmt.Sprintf("/channels/%s/messages?after=%s&limit=%d", channelID, lastID, limit)
 		body, err := d.doRequest("GET", path, nil)
@@ -232,27 +315,35 @@ func (d *DiscordChannel) getMessages(channelID string, limit int) ([]discordMess
 		if err := json.Unmarshal(body, &msgs); err != nil {
 			return nil, err
 		}
-
-		// Discord returns messages oldest first when using "after"
 		return msgs, nil
 	}
 
-	// No last position set, return empty (caller should initialize lastMsgIDs first)
 	return []discordMessage{}, nil
 }
 
 func (d *DiscordChannel) createMessage(channelID, content, replyToID string) error {
-	payload := map[string]interface{}{
-		"content": content,
-	}
+	_, err := d.createMessageWithID(channelID, content, replyToID)
+	return err
+}
+
+func (d *DiscordChannel) createMessageWithID(channelID, content, replyToID string) (string, error) {
+	payload := map[string]any{"content": content}
 	if replyToID != "" {
-		payload["message_reference"] = map[string]interface{}{
+		payload["message_reference"] = map[string]any{
 			"message_id": replyToID,
 		}
+		// fail_if_not_exists=false prevents errors when the referenced message is deleted.
+		payload["message_reference"].(map[string]any)["fail_if_not_exists"] = false
 	}
-
-	_, err := d.doRequest("POST", fmt.Sprintf("/channels/%s/messages", channelID), payload)
-	return err
+	body, err := d.doRequest("POST", fmt.Sprintf("/channels/%s/messages", channelID), payload)
+	if err != nil {
+		return "", err
+	}
+	var msg discordMessage
+	if err := json.Unmarshal(body, &msg); err == nil && msg.ID != "" {
+		return msg.ID, nil
+	}
+	return "", nil
 }
 
 func (d *DiscordChannel) pollChannel(channelID, botID string, handler MessageHandler) {
@@ -261,14 +352,19 @@ func (d *DiscordChannel) pollChannel(channelID, botID string, handler MessageHan
 		return
 	}
 
-	for i := len(msgs) - 1; i >= 0; i-- {
-		msg := msgs[i]
-
+	// Discord returns messages oldest-first when using "after".
+	for _, msg := range msgs {
 		if msg.Author.Bot || msg.Author.ID == botID {
+			d.mu.Lock()
+			d.lastMsgIDs[channelID] = msg.ID
+			d.mu.Unlock()
 			continue
 		}
 
 		if strings.TrimSpace(msg.Content) == "" {
+			d.mu.Lock()
+			d.lastMsgIDs[channelID] = msg.ID
+			d.mu.Unlock()
 			continue
 		}
 
@@ -277,8 +373,11 @@ func (d *DiscordChannel) pollChannel(channelID, botID string, handler MessageHan
 		d.mu.Unlock()
 
 		if !d.isAllowedUser(msg.Author.ID) {
-			continue // silently ignore non-whitelisted users
+			continue
 		}
+
+		capturedChannelID := msg.ChannelID
+		capturedMsgID := msg.ID
 
 		incoming := IncomingMessage{
 			ChannelType: "discord",
@@ -288,15 +387,16 @@ func (d *DiscordChannel) pollChannel(channelID, botID string, handler MessageHan
 			Text:        msg.Content,
 			ReplyTo:     msg.ID,
 		}
-
-		process := func(m IncomingMessage) {
-			reply := handler(m)
-			if reply != "" {
-				d.Reply(m.ChannelID, m.ReplyTo, reply)
-			}
+		incoming.Respond = func(text string) error {
+			return d.Reply(capturedChannelID, capturedMsgID, text)
 		}
 
-		// Always run in a goroutine to avoid blocking the polling loop.
-		go process(incoming)
+		go func(m IncomingMessage) {
+			reply := handler(m)
+			if reply != "" {
+				// Fallback when handler returns a string instead of calling Respond.
+				d.Reply(m.ChannelID, m.ReplyTo, reply)
+			}
+		}(incoming)
 	}
 }

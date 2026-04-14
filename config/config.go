@@ -387,6 +387,11 @@ func (c *Config) ContextMDPath() string {
 	return filepath.Join(c.AgeAgeDirPath(), "CONTEXT.md")
 }
 
+// CredentialsPath returns the path to credentials.toml (encrypted, alongside config.toml).
+func (c *Config) CredentialsPath() string {
+	return filepath.Join(c.Workspace, "credentials.toml")
+}
+
 // WorkspaceSettingsPath returns the path to .ageage/settings.json.
 func (c *Config) WorkspaceSettingsPath() string {
 	return filepath.Join(c.AgeAgeDirPath(), "settings.json")

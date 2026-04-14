@@ -147,17 +147,22 @@ func (r *Router) Route(ctx context.Context, userInput string, availableTools []s
 	}
 	messages = append(messages, r.filterHistoryForRouter(history)...)
 
-	// Use the router (lightweight) model.
+	// Use the router (lightweight) model, falling back to the base LLM on failure.
 	modelName, apiKey, baseURL := r.cfg.Router.RouterModel.Resolve(r.cfg.LLM.Model, r.client.APIKey(), r.client.BaseURL())
-	routerClient := llm.NewClient(
-		apiKey,
-		baseURL,
-		modelName,
-		r.debug,
-		0, // router makes short classification calls; no token limit needed
-	)
+	routerClient := llm.NewClient(apiKey, baseURL, modelName, r.debug, 0)
 
 	resp, err := routerClient.ChatCompletionJSON(ctx, messages, r.cfg.LLM.Temperature)
+	if err != nil {
+		// If a dedicated router model was configured and failed, retry with the base LLM.
+		baseModel, baseKey, baseURL2 := r.cfg.LLM.Model, r.client.APIKey(), r.client.BaseURL()
+		if modelName != baseModel || apiKey != baseKey || baseURL != baseURL2 {
+			if r.debug {
+				fmt.Printf("  ◆  %-10s router model failed (%v), retrying with base LLM\n", "Router", err)
+			}
+			fallbackClient := llm.NewClient(baseKey, baseURL2, baseModel, r.debug, 0)
+			resp, err = fallbackClient.ChatCompletionJSON(ctx, messages, r.cfg.LLM.Temperature)
+		}
+	}
 	if err != nil {
 		if r.debug {
 			fmt.Printf("  ◆  %-10s router call failed, falling back to medium: %v\n", "Router", err)

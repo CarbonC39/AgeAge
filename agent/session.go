@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -197,6 +199,41 @@ func (sm *SessionManager) Rename(oldID, newID string) error {
 // The caller is responsible for ensuring the session is not currently active.
 func (sm *SessionManager) Delete(id string) error {
 	return os.RemoveAll(sm.SessionDir(id))
+}
+
+// Trash moves a session directory to the system trash.
+// Falls back to os.RemoveAll when the trash operation fails.
+func (sm *SessionManager) Trash(id string) error {
+	dir := sm.SessionDir(id)
+	if err := trashDir(dir); err != nil {
+		return os.RemoveAll(dir)
+	}
+	return nil
+}
+
+// trashDir sends a directory to the OS trash/recycle bin.
+func trashDir(dir string) error {
+	switch runtime.GOOS {
+	case "windows":
+		// PowerShell: Shell.Application sends the item to the Recycle Bin.
+		script := fmt.Sprintf(
+			`$sh = New-Object -ComObject Shell.Application; $sh.Namespace(0).ParseName('%s').InvokeVerb('delete')`,
+			strings.ReplaceAll(dir, "'", "''"),
+		)
+		return exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", script).Run()
+	case "darwin":
+		script := fmt.Sprintf(`tell application "Finder" to delete POSIX file "%s"`,
+			strings.ReplaceAll(dir, `"`, `\"`))
+		return exec.Command("osascript", "-e", script).Run()
+	default: // Linux and others
+		if _, err := exec.LookPath("trash-put"); err == nil {
+			return exec.Command("trash-put", dir).Run()
+		}
+		if _, err := exec.LookPath("gio"); err == nil {
+			return exec.Command("gio", "trash", dir).Run()
+		}
+		return fmt.Errorf("no trash utility found")
+	}
 }
 
 // SaveHistory rewrites the history.jsonl for a session with the provided messages.

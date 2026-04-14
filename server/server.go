@@ -15,8 +15,29 @@ import (
 func writeJSONError(w http.ResponseWriter, msg string, code int) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
-	body, _ := json.Marshal(map[string]string{"error": msg})
+	body, _ := json.Marshal(map[string]any{
+		"error": map[string]any{
+			"message": msg,
+			"type":    "invalid_request_error",
+			"code":    code,
+		},
+	})
 	w.Write(body)
+}
+
+// corsMiddleware adds permissive CORS headers required by browser-based clients
+// (SillyTavern, OpenWebUI, etc.).
+func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next(w, r)
+	}
 }
 
 // Server is the OpenAI-compatible HTTP API server.
@@ -34,10 +55,17 @@ func NewServer(factory *agent.AgentFactory, host string, port int) *Server {
 }
 
 // chatCompletionRequest mirrors the OpenAI request format.
+// Unknown fields are accepted and silently ignored for broad client compatibility.
 type chatCompletionRequest struct {
-	Model    string        `json:"model"`
-	Messages []llm.Message `json:"messages"`
-	Stream   bool          `json:"stream"`
+	Model       string        `json:"model"`
+	Messages    []llm.Message `json:"messages"`
+	Stream      bool          `json:"stream"`
+	Temperature *float64      `json:"temperature"`
+	MaxTokens   *int          `json:"max_tokens"`
+	TopP        *float64      `json:"top_p"`
+	N           *int          `json:"n"`
+	Stop        any           `json:"stop"`
+	User        string        `json:"user"`
 }
 
 // chatCompletionResponse mirrors the OpenAI response format.
@@ -59,8 +87,9 @@ type responseChoice struct {
 // Start starts the HTTP server.
 func (s *Server) Start() error {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/chat/completions", s.handleChatCompletions)
-	mux.HandleFunc("/health", s.handleHealth)
+	mux.HandleFunc("/v1/chat/completions", corsMiddleware(s.handleChatCompletions))
+	mux.HandleFunc("/v1/models", corsMiddleware(s.handleModels))
+	mux.HandleFunc("/health", corsMiddleware(s.handleHealth))
 
 	srv := &http.Server{
 		Addr:         s.addr,
@@ -77,6 +106,23 @@ func (s *Server) Start() error {
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+// handleModels returns a minimal /v1/models list. Many OpenAI-compatible
+// clients (SillyTavern, OpenWebUI) call this endpoint before sending a request.
+func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"object": "list",
+		"data": []map[string]any{
+			{
+				"id":       "ageage",
+				"object":   "model",
+				"created":  time.Now().Unix(),
+				"owned_by": "ageage",
+			},
+		},
+	})
 }
 
 func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
@@ -97,9 +143,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Extract the last user message as input (multimodal-aware).
-	var userInput string
-	var userParts []llm.ContentPart
+	// Find the last user message; everything before it is conversation history.
 	lastUserIdx := -1
 	for i := len(req.Messages) - 1; i >= 0; i-- {
 		if req.Messages[i].Role == "user" {
@@ -116,7 +160,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	ag := s.factory.CreateAgent(nil, "")
 
 	// Seed agent with previous history, omitting the very last user message and
-	// stripping any system message the client sent. AgeAge always rebuilds the
+	// stripping any client-provided system message. AgeAge always rebuilds the
 	// system prompt via buildSystemPrompt so that SOUL.md, AGENT.md, and context
 	// are correctly injected regardless of what the client supplied.
 	if lastUserIdx > 0 {
@@ -128,9 +172,6 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		ag.SetMessages(filtered)
-	} else if lastUserIdx == 0 {
-		// No history, just the user message.
-		ag.SetMessages(nil)
 	}
 
 	lastMsg := req.Messages[lastUserIdx]
@@ -138,13 +179,14 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if !s.factory.Config.Multimodal.Vision {
 		lastMsg = lastMsg.StripImageParts()
 	}
-	userInput = lastMsg.TextContent()
+	userInput := lastMsg.TextContent()
+	var userParts []llm.ContentPart
 	if len(lastMsg.Parts) > 0 {
 		userParts = lastMsg.Parts
 	}
 
 	if userInput == "" {
-		writeJSONError(w, "no user message found", http.StatusBadRequest)
+		writeJSONError(w, "empty user message", http.StatusBadRequest)
 		return
 	}
 
@@ -167,11 +209,8 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		Model:   "ageage",
 		Choices: []responseChoice{
 			{
-				Index: 0,
-				Message: llm.Message{
-					Role:    "assistant",
-					Content: result,
-				},
+				Index:        0,
+				Message:      llm.Message{Role: "assistant", Content: result},
 				FinishReason: "stop",
 			},
 		},
@@ -184,29 +223,29 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleStream(w http.ResponseWriter, r *http.Request, ag *agent.Agent, userInput string, userParts []llm.ContentPart) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		http.Error(w, `{"error":"streaming not supported"}`, http.StatusInternalServerError)
+		http.Error(w, `{"error":{"message":"streaming not supported","type":"server_error"}}`, http.StatusInternalServerError)
 		return
 	}
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no") // disable nginx buffering
 
 	id := fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
+	created := time.Now().Unix()
 
-	callback := func(token string) {
+	sendChunk := func(delta map[string]any, finishReason any) {
 		chunk := map[string]any{
 			"id":      id,
 			"object":  "chat.completion.chunk",
-			"created": time.Now().Unix(),
+			"created": created,
 			"model":   "ageage",
 			"choices": []map[string]any{
 				{
-					"index": 0,
-					"delta": map[string]any{
-						"content": token,
-					},
-					"finish_reason": nil,
+					"index":         0,
+					"delta":         delta,
+					"finish_reason": finishReason,
 				},
 			},
 		}
@@ -215,12 +254,32 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request, ag *agent.
 		flusher.Flush()
 	}
 
+	// OpenAI streaming protocol: first chunk carries the role, subsequent
+	// chunks carry content, final chunk carries finish_reason.
+	sendChunk(map[string]any{"role": "assistant", "content": ""}, nil)
+
+	callback := func(token string) {
+		sendChunk(map[string]any{"content": token}, nil)
+	}
+
 	_, err := ag.RunWithParts(r.Context(), userInput, userParts, callback)
 
 	if err != nil {
-		errBody, _ := json.Marshal(map[string]string{"error": err.Error()})
-		fmt.Fprintf(w, "data: %s\n\n", errBody)
+		// Send error as a final data chunk before DONE.
+		errChunk := map[string]any{
+			"id":      id,
+			"object":  "chat.completion.chunk",
+			"created": created,
+			"model":   "ageage",
+			"choices": []map[string]any{},
+			"error":   map[string]any{"message": err.Error(), "type": "server_error"},
+		}
+		data, _ := json.Marshal(errChunk)
+		fmt.Fprintf(w, "data: %s\n\n", data)
 		flusher.Flush()
+	} else {
+		// Final chunk: empty delta + finish_reason.
+		sendChunk(map[string]any{}, "stop")
 	}
 
 	fmt.Fprint(w, "data: [DONE]\n\n")

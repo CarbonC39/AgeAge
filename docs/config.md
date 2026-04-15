@@ -178,12 +178,32 @@ When triggered, messages older than `keep_recent` pairs are condensed into a sin
 
 ```toml
 [bash]
-auto_allow_commands = ["git", "ls", "cat"]
+auto_allow_commands  = ["git", "ls", "cat"]
+max_output_bytes     = 4194304   # 4 MB
+passthrough_env_vars = []
 ```
 
-| Key                   | Type        | Default | Description |
-|-----------------------|-------------|---------|-------------|
-| `auto_allow_commands` | string list | `[]`    | Commands that skip supervised confirmation. Supports prefix matching: `"git"` auto-allows `git status`, `git log`, etc. Only relevant when `agent.mode = "supervised"`. |
+| Key                    | Type        | Default   | Description |
+|------------------------|-------------|-----------|-------------|
+| `auto_allow_commands`  | string list | `[]`      | Commands that skip supervised confirmation. Supports prefix matching: `"git"` auto-allows `git status`, `git log`, etc. Only relevant when `agent.mode = "supervised"`. |
+| `max_output_bytes`     | int         | `4194304` | Hard cap on combined stdout+stderr buffered in memory per command. Output beyond this limit is discarded and a truncation notice is appended. Prevents OOM when the agent runs commands that emit large volumes of data (log tails, bulk conversions, etc.). |
+| `passthrough_env_vars` | string list | `[]`      | Additional env var name prefixes forwarded to subprocesses (case-insensitive). By default subprocesses run with a restricted environment — only a safe allowlist of variables (PATH, HOME, locale, common dev tools) is inherited. Use this to expose project-specific env vars that commands legitimately need. **Do not add vars that contain secrets.** |
+
+### Shell selection
+
+On **Linux / macOS** commands run under `sh -c`. On **Windows**, AgeAge prefers `pwsh` (PowerShell Core 7+) for better POSIX-command compatibility (aliases for `ls`, `cat`, `grep`, etc.); it falls back to `powershell` (Windows PowerShell 5.1) if `pwsh` is not found.
+
+### Environment isolation
+
+Subprocesses receive a restricted environment derived from the parent process. Only variables matching a safe allowlist of prefixes are forwarded:
+
+- Core: `PATH`, `HOME`, `USER`, `SHELL`, `TERM`, `LANG`, `LC_*`, `TMPDIR`, `TEMP`, `TMP`
+- Windows system: `USERNAME`, `USERPROFILE`, `APPDATA`, `SYSTEMROOT`, `WINDIR`, `COMSPEC`, `PATHEXT`, `PSMODULEPATH`
+- Dev tools: `GOPATH`, `GOROOT`, `JAVA_HOME`, `VIRTUAL_ENV`, `CONDA_*`, `PYTHONPATH`, `CARGO_HOME`, `NODE_PATH`, `NODE_ENV`
+- Git identity: `GIT_AUTHOR_*`, `GIT_COMMITTER_*`
+- SSH: `SSH_AUTH_SOCK`, `SSH_AGENT_PID`
+
+Variables whose names end with `_KEY`, `_TOKEN`, `_SECRET`, `_PASSWORD`, `_PASS`, or `_CREDENTIAL` are always blocked regardless of the allowlist, protecting API keys and other secrets that the AgeAge process itself holds (e.g. `OPENAI_API_KEY`).
 
 ---
 

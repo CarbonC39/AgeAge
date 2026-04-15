@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -83,6 +84,15 @@ func main() {
 	}
 	skillsCmd.Flags().StringP("config", "c", "", "Path to config.toml")
 	rootCmd.AddCommand(skillsCmd)
+
+	// --- ageage tools ---
+	toolsCmd := &cobra.Command{
+		Use:   "tools",
+		Short: "Interactively select which tools the agent uses by default",
+		RunE:  runTools,
+	}
+	toolsCmd.Flags().StringP("config", "c", "", "Path to config.toml")
+	rootCmd.AddCommand(toolsCmd)
 
 	// --- ageage mcp ---
 	mcpCmd := &cobra.Command{
@@ -227,6 +237,13 @@ func runInit(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// 6. Tool selection (optional).
+	var selectedTools []string
+	fmt.Print("\n🔧 Customize which tools are enabled by default? (y/N): ")
+	if strings.ToLower(readLine(reader, "n")) == "y" {
+		selectedTools = selectTools(reader, nil)
+	}
+
 	// Auto-fill remaining values.
 	model := "gpt-4o-mini"
 	// Detect provider from URL and adjust defaults.
@@ -235,6 +252,8 @@ func runInit(cmd *cobra.Command, args []string) error {
 	} else if strings.Contains(baseURL, "generativelanguage.googleapis.com") || strings.Contains(baseURL, "gemini") {
 		model = "gemini-2.0-flash"
 	}
+
+	toolsLine := toolsLineFromSlice(selectedTools)
 
 	// Create directories.
 	dirs := []string{
@@ -271,6 +290,7 @@ temperature = 0.7
 [agent]
 max_iterations = 20
 mode = "supervised"
+%s
 
 [subagent]
 max_iterations = 10
@@ -368,7 +388,7 @@ max_image_bytes = 10485760  # 10 MB
 # [[multimodal.converters]]
 # extensions = ["docx", "odt"]
 # command = "libreoffice --headless --convert-to txt:Text {input} --outdir {output}"
-`, absWsDir, apiKey, baseURL, model, model, model, getStrongModel(model), model,
+`, absWsDir, apiKey, baseURL, model, toolsLine, model, model, getStrongModel(model), model,
 			searchBackend, searxngURL, fetchBackend, jinaKey, pythonCmd)
 
 		if err := os.WriteFile(configPath, []byte(configContent), 0o644); err != nil {
@@ -496,13 +516,31 @@ func startChannels(factory *agent.AgentFactory) (*channel.Manager, int) {
 	var managerPtr *channel.Manager
 	channelsByType := make(map[string]channel.Channel)
 
+	// roomChatKey strips the ":t:<threadID>" suffix so we always have a
+	// plain "channelType:channelID" key for session-prefix and callback wiring.
+	roomChatKey := func(chatKey string) string {
+		if idx := strings.LastIndex(chatKey, ":t:"); idx >= 0 {
+			return chatKey[:idx]
+		}
+		return chatKey
+	}
+
 	// chatSessionID returns the active session ID for a chatKey, creating the
 	// default session on first access. Must be called with agentMu held.
+	// Thread chatKeys ("type:id:t:threadID") produce a session under the room's
+	// prefix so all thread sessions are visible in the room's session list.
 	chatSessionID := func(chatKey string) string {
 		if id, ok := activeSessions[chatKey]; ok {
 			return id
 		}
-		id := agent.SanitizeSessionID(chatKey)
+		var id string
+		if idx := strings.LastIndex(chatKey, ":t:"); idx >= 0 {
+			rKey := chatKey[:idx]
+			threadID := chatKey[idx+3:]
+			id = agent.SanitizeSessionID(rKey) + "-" + agent.SanitizeSessionID(threadID)
+		} else {
+			id = agent.SanitizeSessionID(chatKey)
+		}
 		_ = sm.EnsureSession(id)
 		activeSessions[chatKey] = id
 		chatKeyBySessionID[id] = chatKey
@@ -512,7 +550,7 @@ func startChannels(factory *agent.AgentFactory) (*channel.Manager, int) {
 	// makeChatAgent creates an agent for a session, wires IM callbacks, and
 	// optionally loads existing history. Must be called with agentMu held.
 	makeChatAgent := func(chatKey, sessionID string) *agent.Agent {
-		parts := strings.SplitN(chatKey, ":", 2)
+		parts := strings.SplitN(roomChatKey(chatKey), ":", 2)
 		channelType, channelID := "", ""
 		if len(parts) == 2 {
 			channelType, channelID = parts[0], parts[1]
@@ -612,10 +650,12 @@ func startChannels(factory *agent.AgentFactory) (*channel.Manager, int) {
 		return mu
 	}
 
-	// handleSessionCmd processes /session sub-commands for a given chatKey.
-	// The defaultPrefix is the sanitised chatKey (session ID prefix for this chat).
-	handleSessionCmd := func(chatKey, rawInput string) string {
-		defaultPrefix := agent.SanitizeSessionID(chatKey)
+	// handleSessionCmd processes /session sub-commands for a room.
+	// roomKey is always "channelType:channelID" (no :t: suffix) — all sessions
+	// in the room share this prefix. chatKey may include ":t:threadID" and is
+	// used only to resolve the currently active session.
+	handleSessionCmd := func(rKey, chatKey, rawInput string) string {
+		defaultPrefix := agent.SanitizeSessionID(rKey)
 
 		// /session display name ↔ full session ID mapping helpers.
 		toFullID := func(name string) string {
@@ -767,8 +807,10 @@ func startChannels(factory *agent.AgentFactory) (*channel.Manager, int) {
 		text := strings.TrimSpace(msg.Text)
 		textLow := strings.ToLower(text)
 
-		// Thread-aware chatKey: each Matrix thread is its own session.
-		chatKey := msg.ChannelType + ":" + msg.ChannelID
+		// rKey is always the room-level key ("type:channelID"), used for session prefix.
+		// chatKey additionally encodes the thread when msg.ThreadID is set.
+		rKey := msg.ChannelType + ":" + msg.ChannelID
+		chatKey := rKey
 		if msg.ThreadID != "" {
 			chatKey += ":t:" + msg.ThreadID
 		}
@@ -857,8 +899,7 @@ func startChannels(factory *agent.AgentFactory) (*channel.Manager, int) {
 				agentMu.Lock()
 				origChatKey := chatKeyBySessionID[fullID]
 				agentMu.Unlock()
-				if idx := strings.Index(origChatKey, ":t:"); idx >= 0 {
-					threadEventID := origChatKey[idx+3:]
+				if _, threadEventID, ok := strings.Cut(origChatKey, ":t:"); ok {
 					line += fmt.Sprintf(" → https://matrix.to/#/%s/%s", msg.ChannelID, threadEventID)
 				}
 				sb.WriteString(line + "\n")
@@ -873,14 +914,23 @@ func startChannels(factory *agent.AgentFactory) (*channel.Manager, int) {
 			if len(parts) >= 2 {
 				sub = strings.ToLower(parts[1])
 			}
+			// Normalize alias before any checks.
+			if sub == "n" {
+				sub = "new"
+			}
 
-			// /session new from a top-level Matrix message: start a thread-based session.
-			// The user's command event becomes the thread root; the bot replies inside it.
+			// No nesting: /session new from within a thread is not allowed.
+			if sub == "new" && msg.ThreadID != "" {
+				return respond(msg, "❌ Cannot create a session from within a thread. Use the main chat window.")
+			}
+
+			// Matrix: /session new in the main chat creates a thread-backed session.
+			// The user's command event becomes the thread root; replies go inside it.
+			// Session ID follows the room-prefix scheme: roomPrefix + "-" + sanitize(threadID).
 			if sub == "new" && msg.ChannelType == "matrix" && msg.ThreadID == "" {
-				// Session ID = SanitizeSessionID(threadChatKey) — no name suffix so that
-				// after a restart, incoming messages in the thread map to the same session.
-				threadChatKey := msg.ChannelType + ":" + msg.ChannelID + ":t:" + msg.ReplyTo
-				newFullID := agent.SanitizeSessionID(threadChatKey)
+				threadChatKey := rKey + ":t:" + msg.ReplyTo
+				roomPrefix := agent.SanitizeSessionID(rKey)
+				newFullID := roomPrefix + "-" + agent.SanitizeSessionID(msg.ReplyTo)
 
 				agentMu.Lock()
 				currentSessionID := chatSessionID(chatKey)
@@ -891,8 +941,7 @@ func startChannels(factory *agent.AgentFactory) (*channel.Manager, int) {
 					agentMu.Unlock()
 					return respond(msg, fmt.Sprintf("❌ Failed to create session: %s", err))
 				}
-				// Use room-level channelID for agent callbacks (not the :t:-encoded key).
-				newAg := makeChatAgent(msg.ChannelType+":"+msg.ChannelID, newFullID)
+				newAg := makeChatAgent(threadChatKey, newFullID)
 				agents[newFullID] = newAg
 				activeSessions[threadChatKey] = newFullID
 				chatKeyBySessionID[newFullID] = threadChatKey
@@ -904,7 +953,7 @@ func startChannels(factory *agent.AgentFactory) (*channel.Manager, int) {
 				return ""
 			}
 
-			return respond(msg, handleSessionCmd(chatKey, text))
+			return respond(msg, handleSessionCmd(rKey, chatKey, text))
 		}
 
 		switch textLow {
@@ -927,17 +976,47 @@ func startChannels(factory *agent.AgentFactory) (*channel.Manager, int) {
 			_ = sm.SaveHistory(sessionID, ag.Messages())
 			return respond(msg, fmt.Sprintf("📋 Summary:\n%s", summary))
 
+		case "/undo":
+			ag, sessionID := getAgent(chatKey)
+			n := ag.RollbackLastTurn()
+			if n == 0 {
+				return respond(msg, "Nothing to undo.")
+			}
+			_ = sm.SaveHistory(sessionID, ag.Messages())
+			return respond(msg, "↩️ Last turn undone.")
+
 		case "/help":
 			return respond(msg, "Available commands:\n"+
 				"/clear — Clear conversation history (keeps session)\n"+
 				"/stop — Stop the current task\n"+
 				"/summarize — Summarize conversation\n"+
+				"/undo — Remove the last turn from history\n"+
+				"/retry [text] — Re-run the last message (optionally modified)\n"+
 				"/sessions — List sessions for this room\n"+
 				"/session list|ls — List sessions\n"+
 				"/session new|n [name] — Start a new session\n"+
 				"/session switch|sw <name> — Switch to a session\n"+
 				"/session remove|rm <name> — Remove a session (moves to trash)\n"+
 				"/help — Show this help")
+		}
+
+		// /retry [modifier] — roll back the last turn and re-run with optional extra text.
+		// Must NOT return here; fall through to the agent execution block below.
+		var retryText string
+		var retryParts []llm.ContentPart
+		if textLow == "/retry" || strings.HasPrefix(textLow, "/retry ") {
+			ag, _ := getAgent(chatKey)
+			lastMsg, ok := ag.LastTurnUserMessage()
+			if !ok {
+				return respond(msg, "Nothing to retry.")
+			}
+			retryText = lastMsg.TextContent()
+			retryParts = lastMsg.Parts
+			modifier := strings.TrimSpace(text[len("/retry"):])
+			if modifier != "" {
+				retryText += "\n\n" + modifier
+			}
+			ag.RollbackLastTurn()
 		}
 
 		// Typing indicator: on while the agent runs.
@@ -955,7 +1034,17 @@ func startChannels(factory *agent.AgentFactory) (*channel.Manager, int) {
 		ag, sessionID := getAgent(chatKey)
 		ag.SetChannelID(msg.ChannelID)
 
-		result, err := ag.Run(context.Background(), msg.Text, nil)
+		runText := msg.Text
+		if retryText != "" {
+			runText = retryText
+		}
+		var result string
+		var err error
+		if len(retryParts) > 0 {
+			result, err = ag.RunWithParts(context.Background(), runText, retryParts, nil)
+		} else {
+			result, err = ag.Run(context.Background(), runText, nil)
+		}
 		// Save history after every run (best-effort; ignore errors).
 		_ = sm.SaveHistory(sessionID, ag.Messages())
 
@@ -1250,8 +1339,8 @@ func runCLI(cmd *cobra.Command, args []string) error {
 				fmt.Print(stGray.Render("... ▸ "))
 				continue
 			}
-			if strings.HasSuffix(raw, "\\") {
-				accum.WriteString(strings.TrimSuffix(raw, "\\") + "\n")
+			if trimmed, ok := strings.CutSuffix(raw, "\\"); ok {
+				accum.WriteString(trimmed + "\n")
 				fmt.Print(stGray.Render("... ▸ "))
 				continue
 			}
@@ -1480,6 +1569,39 @@ func runCLI(cmd *cobra.Command, args []string) error {
 				continue
 			}
 
+			// /undo — remove the last user→assistant exchange.
+			if lower == "/undo" {
+				n := ag.RollbackLastTurn()
+				if n == 0 {
+					ui.printWarn("Nothing to undo.")
+				} else {
+					_ = sm.SaveHistory(activeSessionID, ag.Messages())
+					ui.printOK("Last turn undone.")
+				}
+				ui.printPrompt()
+				continue
+			}
+
+			// /retry [modifier] — re-run last message, optionally with extra text.
+			// Modifies `input` and sets retryParts so the default case runs the agent.
+			var retryParts []llm.ContentPart
+			if lower == "/retry" || strings.HasPrefix(lower, "/retry ") {
+				lastMsg, ok := ag.LastTurnUserMessage()
+				if !ok {
+					ui.printWarn("Nothing to retry.")
+					ui.printPrompt()
+					continue
+				}
+				modifier := strings.TrimSpace(input[len("/retry"):])
+				input = lastMsg.TextContent()
+				retryParts = lastMsg.Parts
+				if modifier != "" {
+					input += "\n\n" + modifier
+				}
+				ag.RollbackLastTurn()
+				// Fall through to switch default → agent execution.
+			}
+
 			switch input {
 			case "exit", "quit":
 				_ = sm.SaveHistory(activeSessionID, ag.Messages())
@@ -1515,7 +1637,7 @@ func runCLI(cmd *cobra.Command, args []string) error {
 				} else {
 					fmt.Println()
 					fmt.Println(stGray.Render("┌── last thinking ") + stDim.Render(line(34)))
-					for _, l := range strings.Split(strings.TrimSpace(thinkFilter.LastThink), "\n") {
+					for l := range strings.SplitSeq(strings.TrimSpace(thinkFilter.LastThink), "\n") {
 						fmt.Println(stDim.Render("│ " + l))
 					}
 					fmt.Println(stGray.Render("└" + line(50)))
@@ -1555,6 +1677,8 @@ func runCLI(cmd *cobra.Command, args []string) error {
 						{"/clear", "Clear conversation history"},
 						{"/stop", "Interrupt a running task"},
 						{"/summarize", "Compress conversation history"},
+						{"/undo", "Remove the last turn from history"},
+						{"/retry [text]", "Re-run the last message (optionally modified)"},
 						{"/think", "Show the last reasoning think-block"},
 						{"/skills", "List available skills"},
 						{"exit / quit", "Exit AgeAge"},
@@ -1590,6 +1714,10 @@ func runCLI(cmd *cobra.Command, args []string) error {
 				cleanText, parts, warnings := agent.ParseCLIInput(input, factory.Config, ag.TmpManager())
 				for _, w := range warnings {
 					ui.printWarn(w)
+				}
+				// /retry: restore the original parts (attachments) from the rolled-back turn.
+				if retryParts != nil {
+					parts = retryParts
 				}
 				fmt.Println()
 				ui.printAgentHeader()
@@ -2003,5 +2131,201 @@ func runCredRemove(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	fmt.Printf("✓ Credential %q removed.\n", name)
+	return nil
+}
+
+// --- ageage tools ---
+
+// toolEntry describes a tool available for selection.
+type toolEntry struct {
+	name      string
+	desc      string
+	skillOnly bool // normally registered only when a skill requires it
+}
+
+var knownTools = []toolEntry{
+	{"bash", "Execute shell commands", false},
+	{"file_read", "Read files", false},
+	{"file_write", "Create/overwrite files", false},
+	{"file_edit", "Edit files (diff-based)", false},
+	{"web_fetch", "Fetch web pages", false},
+	{"web_search", "Search the web", false},
+	{"memory_store", "Store memories", false},
+	{"memory_recall", "Recall memories", false},
+	{"memory_forget", "Delete memories", false},
+	{"cron_add", "Schedule cron tasks", false},
+	{"cron_remove", "Remove cron tasks", false},
+	{"cron_list", "List cron tasks", false},
+	{"delegate", "Delegate to a sub-agent", false},
+	{"grep", "Search file content", true},
+	{"glob", "Find files by pattern", true},
+	{"tree", "Show directory tree", true},
+	{"ask_user", "Ask the user a question", true},
+	{"escalate", "Escalate task to user", true},
+	{"browser_navigate", "Browser automation", true},
+	{"update_todos", "Manage todo list", true},
+}
+
+// selectTools presents an interactive checklist and returns the selected tool names.
+// Pass nil for initialSelected to start with all tools enabled.
+// Returns nil when all tools are selected (empty config = all tools).
+func selectTools(reader *bufio.Reader, initialSelected []string) []string {
+	selected := make([]bool, len(knownTools))
+	if len(initialSelected) == 0 {
+		// nil or empty → all enabled
+		for i := range selected {
+			selected[i] = true
+		}
+	} else {
+		for i, t := range knownTools {
+			selected[i] = slices.Contains(initialSelected, t.name)
+		}
+	}
+
+	for {
+		fmt.Println()
+		fmt.Println("   Tools  ([x] = enabled   [ ] = disabled)")
+		fmt.Println("   " + strings.Repeat("─", 54))
+		for i, t := range knownTools {
+			mark := "[ ]"
+			if selected[i] {
+				mark = "[x]"
+			}
+			note := ""
+			if t.skillOnly {
+				note = "  (skill-only by default)"
+			}
+			fmt.Printf("   %2d. %s  %-22s %s%s\n", i+1, mark, t.name, t.desc, note)
+		}
+		fmt.Println()
+		fmt.Print("   Toggle (e.g. 1,3,5), 'a' = all, 'd' = none, Enter = confirm: ")
+		line := strings.TrimSpace(readLine(reader, ""))
+		if line == "" {
+			break
+		}
+		switch line {
+		case "a":
+			for i := range selected {
+				selected[i] = true
+			}
+		case "d":
+			for i := range selected {
+				selected[i] = false
+			}
+		default:
+			for part := range strings.SplitSeq(line, ",") {
+				var n int
+				if _, err := fmt.Sscanf(strings.TrimSpace(part), "%d", &n); err == nil && n >= 1 && n <= len(knownTools) {
+					selected[n-1] = !selected[n-1]
+				}
+			}
+		}
+	}
+
+	result := make([]string, 0, len(knownTools))
+	allOn := true
+	for i, t := range knownTools {
+		if selected[i] {
+			result = append(result, t.name)
+		} else {
+			allOn = false
+		}
+	}
+	if allOn {
+		return nil // empty config means all tools enabled
+	}
+	return result
+}
+
+// toolsLineFromSlice formats a tools slice as a TOML config line.
+func toolsLineFromSlice(tools []string) string {
+	if len(tools) == 0 {
+		return "# tools = []  # Positive allowlist; empty = all tools enabled"
+	}
+	quoted := make([]string, len(tools))
+	for i, t := range tools {
+		quoted[i] = fmt.Sprintf("%q", t)
+	}
+	return fmt.Sprintf("tools = [%s]", strings.Join(quoted, ", "))
+}
+
+// updateConfigTools replaces or inserts the tools line in the [agent] section of a TOML file.
+func updateConfigTools(configPath, toolsLine string) error {
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return err
+	}
+	lines := strings.Split(string(data), "\n")
+
+	agentIdx := -1
+	toolsIdx := -1
+	for i, line := range lines {
+		stripped := strings.TrimSpace(line)
+		if stripped == "[agent]" {
+			agentIdx = i
+			continue
+		}
+		if agentIdx >= 0 && toolsIdx < 0 {
+			// Stop at the next section header.
+			if strings.HasPrefix(stripped, "[") {
+				break
+			}
+			isTools := strings.HasPrefix(stripped, "# tools") ||
+				(strings.HasPrefix(stripped, "tools") && len(stripped) > 5 && (stripped[5] == ' ' || stripped[5] == '='))
+			if isTools {
+				toolsIdx = i
+			}
+		}
+	}
+
+	if toolsIdx >= 0 {
+		lines[toolsIdx] = toolsLine
+	} else if agentIdx >= 0 {
+		// Insert after the [agent] line.
+		newLines := make([]string, 0, len(lines)+1)
+		newLines = append(newLines, lines[:agentIdx+1]...)
+		newLines = append(newLines, toolsLine)
+		newLines = append(newLines, lines[agentIdx+1:]...)
+		lines = newLines
+	} else {
+		// No [agent] section — append one.
+		lines = append(lines, "", "[agent]", toolsLine)
+	}
+
+	return os.WriteFile(configPath, []byte(strings.Join(lines, "\n")), 0o644)
+}
+
+func runTools(cmd *cobra.Command, args []string) error {
+	configPath, _ := cmd.Flags().GetString("config")
+	configPath = findConfigFile(configPath)
+
+	cfg, err := config.LoadConfig(configPath)
+	if err != nil {
+		return fmt.Errorf("failed to load config: %w", err)
+	}
+
+	reader := bufio.NewReader(os.Stdin)
+
+	fmt.Println("\n🔧 Tool Selection")
+	fmt.Println(strings.Repeat("─", 40))
+	if len(cfg.Agent.Tools) == 0 {
+		fmt.Println("Current: all tools enabled (no allowlist set)")
+	} else {
+		fmt.Printf("Current allowlist: %s\n", strings.Join(cfg.Agent.Tools, ", "))
+	}
+
+	selected := selectTools(reader, cfg.Agent.Tools)
+	newLine := toolsLineFromSlice(selected)
+
+	fmt.Printf("\nNew setting: %s\n", newLine)
+	fmt.Print("Write to config? (Y/n): ")
+	if strings.ToLower(readLine(reader, "y")) == "n" {
+		fmt.Println("Aborted — config not changed.")
+		return nil
+	}
+	if err := updateConfigTools(configPath, newLine); err != nil {
+		return fmt.Errorf("failed to update config: %w", err)
+	}
+	fmt.Printf("Updated %s\n", configPath)
 	return nil
 }

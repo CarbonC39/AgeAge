@@ -80,6 +80,7 @@ type AgentConfig struct {
 	Mode             string   `toml:"mode"`               // "full" or "supervised"
 	NonIncludeTools  []string `toml:"non_include_tools"`  // Tools that should never be injected
 	MaxParallelTools int      `toml:"max_parallel_tools"` // 0 or 1 = sequential; >1 = parallel tool execution
+	Tools            []string `toml:"tools"`              // If non-empty, only these tools are registered by default (positive allowlist)
 }
 
 // ModelConfig holds specific settings for a model (possibly from a different provider).
@@ -132,7 +133,9 @@ type SecurityConfig struct {
 
 // BashConfig holds bash tool settings.
 type BashConfig struct {
-	AutoAllowCommands []string `toml:"auto_allow_commands"` // Commands that skip supervised confirmation
+	AutoAllowCommands    []string `toml:"auto_allow_commands"`     // Commands that skip supervised confirmation
+	MaxOutputBytes       int      `toml:"max_output_bytes"`        // Cap on stdout+stderr combined (default 4 MB); prevents OOM on large outputs
+	PassthroughEnvVars   []string `toml:"passthrough_env_vars"`    // Additional env var names/prefixes forwarded to subprocesses
 }
 
 // WebSearchConfig holds web search tool settings.

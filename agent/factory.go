@@ -13,6 +13,7 @@ import (
 
 	"ageage/config"
 	"ageage/creds"
+	"ageage/internal/agentdocs"
 	"ageage/llm"
 	"ageage/security"
 	"ageage/skills"
@@ -108,6 +109,13 @@ func NewFactory(configPath string, debug bool) (*AgentFactory, error) {
 	}
 	if err := cfg.EnsureDirs(); err != nil {
 		return nil, err
+	}
+
+	// Extract embedded framework docs to .ageage/docs/ so the agent can read them
+	// with the standard file_read tool. Always overwrite to reflect binary version.
+	docsDir := filepath.Join(cfg.AgeAgeDirPath(), "docs")
+	if err := agentdocs.ExtractTo(docsDir); err != nil {
+		fmt.Printf("⚠️  Warning: could not extract framework docs: %s\n", err)
 	}
 
 	if cfg.LLM.APIKey == "" {
@@ -332,28 +340,43 @@ func (f *AgentFactory) CreateAgentFiltered(confirmMgr *tools.ConfirmationManager
 	}
 
 
-	// Helper function to check if a tool should be registered
+	// shouldRegisterTool reports whether toolName should be registered for this agent.
+	// Priority order:
+	//   1. non_include_tools blocklist — always excluded.
+	//   2. allowedTools (sub-agent / skill filter) — explicit allowlist, overrides config.
+	//   3. agent.tools (user config) — positive allowlist; empty means all tools.
 	shouldRegisterTool := func(toolName string) bool {
 		if f.Config.ShouldExcludeTool(toolName) {
 			return false
 		}
-		if allowedTools == nil {
-			return true
-		}
-		for _, t := range allowedTools {
-			if t == toolName {
-				return true
+		if allowedTools != nil {
+			for _, t := range allowedTools {
+				if t == toolName {
+					return true
+				}
 			}
+			return false
 		}
-		return false
+		if len(f.Config.Agent.Tools) > 0 {
+			for _, t := range f.Config.Agent.Tools {
+				if t == toolName {
+					return true
+				}
+			}
+			return false
+		}
+		return true
 	}
 
 	bashTool := &tools.BashTool{
-		Security:          f.SecurityChecker,
-		Timeout:           30 * time.Second,
-		Supervised:        isSupervised,
-		AutoAllowCommands: f.Config.Bash.AutoAllowCommands,
-		ConfirmFunc:       confirmFunc,
+		Security:           f.SecurityChecker,
+		Timeout:            30 * time.Second,
+		Supervised:         isSupervised,
+		AutoAllowCommands:  f.Config.Bash.AutoAllowCommands,
+		MaxOutputBytes:     f.Config.Bash.MaxOutputBytes,
+		WorkDir:            f.Config.EffectiveWorkDir(),
+		PassthroughEnvVars: f.Config.Bash.PassthroughEnvVars,
+		ConfirmFunc:        confirmFunc,
 	}
 	if shouldRegisterTool("bash") {
 		registry.Register(bashTool)
@@ -492,6 +515,21 @@ func (f *AgentFactory) CreateAgentFiltered(confirmMgr *tools.ConfirmationManager
 		if mkTool, ok := skillOnlyToolFactories[name]; ok {
 			if _, exists := registry.Get(name); !exists {
 				registry.Register(mkTool(f, registry, ag))
+			}
+		}
+	}
+
+	// For the main agent: if agent.tools allowlist names skill-only tools, register
+	// them now so they are available globally (not only when a skill is active).
+	if allowedTools == nil && len(f.Config.Agent.Tools) > 0 {
+		for _, name := range f.Config.Agent.Tools {
+			if f.Config.ShouldExcludeTool(name) {
+				continue
+			}
+			if mkTool, ok := skillOnlyToolFactories[name]; ok {
+				if _, exists := registry.Get(name); !exists {
+					registry.Register(mkTool(f, registry, ag))
+				}
 			}
 		}
 	}

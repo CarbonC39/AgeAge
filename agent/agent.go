@@ -62,6 +62,7 @@ type Agent struct {
 	ToolEndCallback     func(name string)               // Optional: called just after each tool completes
 	ToolResultCallback  func(name, result string)       // Optional: called with the tool's output after execution
 	CredMgr             *creds.Manager                  // Optional: substitutes {{cred:x}} in tool args, scrubs results
+	hintOnNextCall      string                          // Ephemeral; consumed by buildCallMessages, not stored in history
 }
 
 // NewAgent creates a new agent instance.
@@ -243,6 +244,16 @@ func (a *Agent) buildSystemPrompt(matchedSkill *skills.Skill) string {
 		if hint := a.CredMgr.PromptHint(); hint != "" {
 			sb.WriteString(hint)
 		}
+	}
+
+	// Framework documentation pointer — main agents only, not sub-agents or pipeline nodes.
+	// Stays in the stable prefix so KV-cache hits on every turn after the first.
+	if !a.IsSubAgent {
+		sb.WriteString("## Framework Documentation\n\n")
+		sb.WriteString("Self-reference guides are in `.ageage/docs/` (use `file_read`): " +
+			"how-i-work, troubleshooting, skills, pipeline.\n")
+		sb.WriteString("Read them when a tool fails unexpectedly, when creating or modifying skills, " +
+			"or when you need to understand how the agent loop works.\n\n")
 	}
 
 	// Active skill instructions (at most one skill per conversation).
@@ -661,10 +672,9 @@ func (a *Agent) RunWithParts(ctx context.Context, userInput string, parts []llm.
 				// If the model is known to emit dependent tools (like file_write followed by bash),
 				// progressive execution is risky.
 				// For now, we allow progressive execution only for non-mutation tools.
-				n := call.Function.Name
-				isMutation := n == "file_write" || n == "file_edit" || n == "bash"
-
-				if isMutation {
+				// Conservatively treat any non-read-only tool (including unknown
+				// MCP/custom tools) as a mutation; defer it to post-stream serialisation.
+				if !isReadOnlyTool(call.Function.Name) {
 					// Don't start mutation tools progressively; let the main loop
 					// handle them after the stream ends (where they might be serialized).
 					return
@@ -729,13 +739,12 @@ func (a *Agent) RunWithParts(ctx context.Context, userInput string, parts []llm.
 			return "", fmt.Errorf("LLM call failed at iteration %d: %w", i+1, err)
 		}
 
-		// Bug Fix 2: Dependency Detection (Corrected placement).
-		// If this turn contains both a file mutation tool (write/edit) and an
-		// execution/read tool (bash, file_read, web_fetch), we must be careful.
-		// For simplicity, if ANY mutation tool is present, we serialize the batch.
+		// Dependency detection: if any tool in this turn may have side effects,
+		// serialize the entire batch to prevent race conditions.
+		// Unknown tools (MCP, custom) are conservatively treated as mutations.
 		hasMutation := false
 		for _, tc := range assistantMsg.ToolCalls {
-			if n := tc.Function.Name; n == "file_write" || n == "file_edit" || n == "bash" {
+			if !isReadOnlyTool(tc.Function.Name) {
 				hasMutation = true
 				break
 			}
@@ -787,11 +796,13 @@ func (a *Agent) RunWithParts(ctx context.Context, userInput string, parts []llm.
 
 		// Collect results in call order and append to message history.
 		var currentTurnResults []string
+		anyToolError := false
 		for idx, tc := range cleanedMsg.ToolCalls {
 			res := <-inflightResults[idx]
 
 			toolResult := res.result
 			if res.execErr != nil {
+				anyToolError = true
 				toolResult = fmt.Sprintf("Error: %s", res.execErr.Error())
 				if res.result != "" {
 					toolResult = fmt.Sprintf("Error: %s\nPartial output: %s", res.execErr.Error(), res.result)
@@ -805,6 +816,14 @@ func (a *Agent) RunWithParts(ctx context.Context, userInput string, parts []llm.
 				ToolCallID: tc.ID,
 			})
 			currentTurnResults = append(currentTurnResults, toolResult)
+		}
+
+		// When a tool fails, set an ephemeral hint for the next LLM call.
+		// The hint is consumed by buildCallMessages and never stored in history.
+		// Suppressed for sub-agents and pipeline nodes (they have narrower scopes).
+		if anyToolError && !a.IsSubAgent {
+			a.hintOnNextCall = `A tool call above returned an error. ` +
+				`Read .ageage/docs/troubleshooting.md to diagnose common failure causes before retrying.`
 		}
 
 		// Check finish after all tools have been collected.
@@ -874,6 +893,24 @@ func (a *Agent) gcTmp() {
 
 // thinkBlockRe matches <think>...</think> sections produced by reasoning models.
 var thinkBlockRe = regexp.MustCompile(`(?s)<think>.*?</think>`)
+
+// readOnlyTools is the set of tool names that are guaranteed to have no side
+// effects and are therefore safe to run in parallel with other tools.
+// Every tool NOT in this set — including all MCP tools and unknown custom tools
+// — is conservatively treated as a mutation and causes the entire batch to be
+// serialised, preventing concurrent-write races.
+var readOnlyTools = map[string]bool{
+	"file_read":     true,
+	"web_fetch":     true,
+	"web_search":    true,
+	"memory_recall": true,
+	"glob":          true,
+	"grep":          true,
+	"cron_list":     true,
+}
+
+// isReadOnlyTool reports whether name is a known side-effect-free tool.
+func isReadOnlyTool(name string) bool { return readOnlyTools[name] }
 
 // stripThinkBlocks removes <think>...</think> content from a string and trims whitespace.
 // These blocks contain internal chain-of-thought that should not be stored in history.
@@ -1152,6 +1189,14 @@ func (a *Agent) buildCallMessages() []llm.Message {
 		}
 	}
 
+	// Consume the ephemeral error hint (set when a tool failed last iteration).
+	// Appended after the context block so it gets the agent's attention without
+	// polluting persistent history or the stable system-prompt prefix.
+	if a.hintOnNextCall != "" {
+		fmt.Fprintf(&sb, "\n[Framework] %s", a.hintOnNextCall)
+		a.hintOnNextCall = ""
+	}
+
 	ctxStr := sb.String()
 	// Create a copy of the message history to avoid mutating a.messages directly.
 	out := make([]llm.Message, len(a.messages))
@@ -1209,6 +1254,50 @@ func (a *Agent) GetRegistry() *tools.Registry {
 
 // TmpManager returns the agent's tmp file manager (for CLI attachment processing).
 func (a *Agent) TmpManager() *TmpManager { return a.tmpMgr }
+
+// LastTurnUserMessage returns the last user message in the conversation history
+// and whether one was found. Tool-result messages are skipped.
+func (a *Agent) LastTurnUserMessage() (llm.Message, bool) {
+	for i := len(a.messages) - 1; i >= 0; i-- {
+		if a.messages[i].Role == "user" {
+			return a.messages[i], true
+		}
+	}
+	return llm.Message{}, false
+}
+
+// RollbackLastTurn removes the last complete user→assistant exchange from
+// history (one user message plus all subsequent assistant/tool messages that
+// followed it). It also trims pendingTurns accordingly.
+// Returns the number of messages removed, or 0 if there was nothing to roll back.
+func (a *Agent) RollbackLastTurn() int {
+	// Find the last user message index.
+	lastUserIdx := -1
+	for i := len(a.messages) - 1; i >= 0; i-- {
+		if a.messages[i].Role == "user" {
+			lastUserIdx = i
+			break
+		}
+	}
+	if lastUserIdx < 0 {
+		return 0
+	}
+
+	removed := len(a.messages) - lastUserIdx
+	// Use 3-index slice to break backing-array reference, preventing memory leak.
+	a.messages = a.messages[:lastUserIdx:lastUserIdx]
+
+	// Trim pendingTurns: drop any whose msgStart is at or after lastUserIdx.
+	kept := a.pendingTurns[:0:0] // empty, own backing array
+	for _, pt := range a.pendingTurns {
+		if pt.msgStart < lastUserIdx {
+			kept = append(kept, pt)
+		}
+	}
+	a.pendingTurns = kept
+
+	return removed
+}
 
 // ClearHistory resets the conversation history, pending turn queue, and todo list.
 func (a *Agent) ClearHistory() {

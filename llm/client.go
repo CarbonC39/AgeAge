@@ -444,13 +444,14 @@ func (c *Client) chatCompletion(ctx context.Context, messages []Message, tools [
 	return &chatResp, nil
 }
 
-// stripThinkBlocksBytes removes <think>...</think> blocks from raw JSON response data.
+// thinkBlockBytesRe matches thinking-block tags in raw response data.
+// Covers <think>…</think> (DeepSeek-R1, QwQ) and <thought>…</thought> (Gemma 4).
+var thinkBlockBytesRe = regexp.MustCompile(`(?s)<think>.*?</think>|<thought>.*?</thought>`)
+
+// stripThinkBlocksBytes removes thinking-block tags from raw JSON response data.
 func stripThinkBlocksBytes(data []byte) []byte {
-	s := string(data)
-	// Simple regex replacement for <think> blocks.
-	re := regexp.MustCompile(`(?s)<think>.*?</think>`)
-	cleaned := re.ReplaceAllString(s, "")
-	return []byte(strings.TrimSpace(cleaned))
+	cleaned := thinkBlockBytesRe.ReplaceAll(data, nil)
+	return []byte(strings.TrimSpace(string(cleaned)))
 }
 
 // StreamCallback is called for each content token during streaming.

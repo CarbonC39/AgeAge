@@ -8,13 +8,15 @@ import (
 
 // IncomingMessage represents a message received from any channel.
 type IncomingMessage struct {
-	ChannelType string // "matrix", "telegram", "discord"
-	ChannelID   string // Room/Chat/Channel ID
-	SenderID    string // User identifier
-	SenderName  string // Display name
-	Text        string // Message content
-	ReplyTo     string // Message ID to reply to (if applicable)
-	ThreadID    string // Thread/topic ID within the channel; empty if not in a thread
+	ChannelType  string // "matrix", "telegram", "discord"
+	ChannelID    string // Room/Chat/Channel ID
+	SenderID     string // User identifier
+	SenderName   string // Display name
+	Text         string // Message content (mention prefix already stripped)
+	ReplyTo      string // Message ID to reply to (if applicable)
+	ThreadID     string // Thread/topic ID within the channel; empty if not in a thread
+	IsGroupChat  bool   // True if the message came from a multi-user room (not a DM)
+	BotMentioned bool   // True if the bot was @mentioned or the message is a reply to the bot
 
 	// Respond, when set, is called by the handler to send a reply via the
 	// correct channel-specific path (e.g. inside a Matrix thread). When nil,

@@ -22,6 +22,7 @@ type TelegramChannel struct {
 	client         *http.Client
 	stopCh         chan struct{}
 	botID          int64
+	botUsername    string // "@botname" (without @), used for mention detection
 	mu             sync.Mutex
 	typingStop     map[string]context.CancelFunc // channelID → cancel func for keep-alive typing
 	typingMu       sync.Mutex
@@ -58,12 +59,17 @@ func (t *TelegramChannel) Name() string { return "telegram" }
 
 // Start begins long-polling for Telegram updates.
 func (t *TelegramChannel) Start(handler MessageHandler) error {
+	if len(t.AllowedUsers) == 0 {
+		fmt.Println("[Telegram] WARN: allowed_users is not configured — group chat messages will be denied. Set allowed_users in config to grant access.")
+	}
+
 	me, err := t.getMe()
 	if err != nil {
 		fmt.Printf("[Telegram] Warning: could not get bot info: %s\n", err)
 	} else {
 		t.botID = me.ID
-		fmt.Printf("[Telegram] Bot ID: %d\n", t.botID)
+		t.botUsername = me.Username
+		fmt.Printf("[Telegram] Bot ID: %d, username: @%s\n", t.botID, t.botUsername)
 	}
 
 	// Drain all pending updates so they are not processed after a restart.
@@ -117,9 +123,29 @@ func (t *TelegramChannel) Start(handler MessageHandler) error {
 				continue
 			}
 
+			isGroup := update.Message.Chat.Type != "private"
 			senderID := fmt.Sprintf("%d", update.Message.From.ID)
+
+			// Security: deny all group messages when no allowlist is configured.
+			if isGroup && len(t.AllowedUsers) == 0 {
+				continue
+			}
+
 			if !t.isAllowedUser(senderID) {
 				continue
+			}
+
+			// Detect @mention: text contains "@botUsername".
+			// Supergroup topic messages (threadID != 0) are only delivered to the bot
+			// when it is @mentioned (Telegram privacy mode), so treat them as mentioned.
+			mentionTag := "@" + t.botUsername
+			botMentioned := (t.botUsername != "" && strings.Contains(text, mentionTag)) ||
+				update.Message.MessageThreadID != 0
+
+			// Strip the @mention from the text.
+			if botMentioned && t.botUsername != "" {
+				text = strings.ReplaceAll(text, mentionTag, "")
+				text = strings.TrimSpace(text)
 			}
 
 			chatID := fmt.Sprintf("%d", update.Message.Chat.ID)
@@ -130,13 +156,15 @@ func (t *TelegramChannel) Start(handler MessageHandler) error {
 			}
 
 			incoming := IncomingMessage{
-				ChannelType: "telegram",
-				ChannelID:   chatID,
-				SenderID:    senderID,
-				SenderName:  update.Message.From.FirstName,
-				Text:        text,
-				ReplyTo:     msgID,
-				ThreadID:    threadID,
+				ChannelType:  "telegram",
+				ChannelID:    chatID,
+				SenderID:     senderID,
+				SenderName:   update.Message.From.FirstName,
+				Text:         text,
+				ReplyTo:      msgID,
+				ThreadID:     threadID,
+				IsGroupChat:  isGroup,
+				BotMentioned: botMentioned,
 			}
 
 			// Capture values for the Respond closure.
@@ -315,12 +343,14 @@ type tgMessage struct {
 }
 
 type tgChat struct {
-	ID int64 `json:"id"`
+	ID   int64  `json:"id"`
+	Type string `json:"type"` // "private", "group", "supergroup", "channel"
 }
 
 type tgUser struct {
 	ID        int64  `json:"id"`
 	FirstName string `json:"first_name"`
+	Username  string `json:"username"`
 }
 
 type tgResponse struct {

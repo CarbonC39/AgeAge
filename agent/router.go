@@ -80,7 +80,8 @@ func (r *Router) buildRouterPrompt(availableTools []string) string {
 	var sb strings.Builder
 
 	// ── 1. Fixed header ───────────────────────────────────────────────────────
-	sb.WriteString("[SYSTEM: TASK EVALUATION PROTOCOL]\nAnalyze the request and return ONLY JSON.\n\n")
+	sb.WriteString("[SYSTEM: TASK EVALUATION PROTOCOL]\nAnalyze the request and return ONLY JSON.\n")
+	sb.WriteString("Self-reference docs in .ageage/docs/ (file_read): how-i-work.md, skills.md, pipeline.md, troubleshooting.md.\n\n")
 
 	// ── 2. Skill catalog (stable prefix) ─────────────────────────────────────
 	// Always show ALL skills so the router can select one. Users can also

@@ -15,31 +15,34 @@ import (
 
 // DiscordChannel connects to Discord via Bot API (REST polling).
 type DiscordChannel struct {
-	Token        string   // Bot token (without "Bot " prefix)
-	ChannelIDs   []string // Channel IDs to monitor
-	AllowedUsers []string // Discord user IDs allowed to interact; empty = allow all
-	Options      ChannelOptions
-	baseURL      string
-	client       *http.Client
-	stopCh       chan struct{}
-	lastMsgIDs   map[string]string          // Track last seen message per channel
-	mu           sync.Mutex
-	typingStop   map[string]context.CancelFunc // channelID → cancel func for keep-alive typing
-	typingMu     sync.Mutex
+	Token         string   // Bot token (without "Bot " prefix)
+	ChannelIDs    []string // Channel IDs to monitor
+	AllowedUsers  []string // Discord user IDs allowed to interact; empty = allow all
+	Options       ChannelOptions
+	baseURL       string
+	client        *http.Client
+	stopCh        chan struct{}
+	lastMsgIDs    map[string]string            // Track last seen message per channel
+	botUserID     string                       // Bot's own user ID (set in Start)
+	groupChannels map[string]bool              // channelID → true if guild channel, false if DM
+	mu            sync.Mutex
+	typingStop    map[string]context.CancelFunc // channelID → cancel func for keep-alive typing
+	typingMu      sync.Mutex
 }
 
 // NewDiscord creates a new Discord channel.
 func NewDiscord(botToken string, channelIDs []string, allowedUsers []string, opts ChannelOptions) *DiscordChannel {
 	return &DiscordChannel{
-		Token:        botToken,
-		ChannelIDs:   channelIDs,
-		AllowedUsers: allowedUsers,
-		Options:      opts,
-		baseURL:      "https://discord.com/api/v10",
-		client:       &http.Client{Timeout: 30 * time.Second},
-		stopCh:       make(chan struct{}),
-		lastMsgIDs:   make(map[string]string),
-		typingStop:   make(map[string]context.CancelFunc),
+		Token:         botToken,
+		ChannelIDs:    channelIDs,
+		AllowedUsers:  allowedUsers,
+		Options:       opts,
+		baseURL:       "https://discord.com/api/v10",
+		client:        &http.Client{Timeout: 30 * time.Second},
+		stopCh:        make(chan struct{}),
+		lastMsgIDs:    make(map[string]string),
+		groupChannels: make(map[string]bool),
+		typingStop:    make(map[string]context.CancelFunc),
 	}
 }
 
@@ -59,20 +62,46 @@ func (d *DiscordChannel) isAllowedUser(userID string) bool {
 
 func (d *DiscordChannel) Name() string { return "discord" }
 
+// getChannelType returns the Discord channel type integer (0=guild text, 1=DM, etc.).
+func (d *DiscordChannel) getChannelType(channelID string) (int, error) {
+	body, err := d.doRequest("GET", fmt.Sprintf("/channels/%s", channelID), nil)
+	if err != nil {
+		return 0, err
+	}
+	var ch struct {
+		Type int `json:"type"`
+	}
+	if err := json.Unmarshal(body, &ch); err != nil {
+		return 0, err
+	}
+	return ch.Type, nil
+}
+
 // Start begins polling Discord channels for new messages.
 func (d *DiscordChannel) Start(handler MessageHandler) error {
 	if len(d.ChannelIDs) == 0 {
 		return fmt.Errorf("no Discord channel IDs configured")
 	}
 
+	if len(d.AllowedUsers) == 0 {
+		fmt.Println("[Discord] WARN: allowed_users is not configured — group channel messages will be denied. Set allowed_users in config to grant access.")
+	}
+
 	botID, err := d.getBotUserID()
 	if err != nil {
 		return fmt.Errorf("failed to get bot user info: %w", err)
 	}
+	d.botUserID = botID
 
 	// Initialise the cursor for every channel so the main loop only sees
-	// messages that arrive after startup.
+	// messages that arrive after startup. Also detect group vs DM channels.
 	for _, chID := range d.ChannelIDs {
+		// Detect channel type: type 1 = DM, anything else = guild/group.
+		if chType, err := d.getChannelType(chID); err == nil {
+			d.groupChannels[chID] = chType != 1
+		} else {
+			d.groupChannels[chID] = true // default to group for safety
+		}
 		for {
 			select {
 			case <-d.stopCh:
@@ -106,7 +135,7 @@ func (d *DiscordChannel) Start(handler MessageHandler) error {
 			return nil
 		case <-ticker.C:
 			for _, chID := range d.ChannelIDs {
-				d.pollChannel(chID, botID, handler)
+				d.pollChannel(chID, handler)
 			}
 		}
 	}
@@ -346,7 +375,8 @@ func (d *DiscordChannel) createMessageWithID(channelID, content, replyToID strin
 	return "", nil
 }
 
-func (d *DiscordChannel) pollChannel(channelID, botID string, handler MessageHandler) {
+func (d *DiscordChannel) pollChannel(channelID string, handler MessageHandler) {
+	botID := d.botUserID
 	msgs, err := d.getMessages(channelID, 10)
 	if err != nil {
 		return
@@ -372,20 +402,40 @@ func (d *DiscordChannel) pollChannel(channelID, botID string, handler MessageHan
 		d.lastMsgIDs[channelID] = msg.ID
 		d.mu.Unlock()
 
+		isGroup := d.groupChannels[channelID] // false (DM) when absent, true for guild channels
+
+		// Security: deny all group messages when no allowlist is configured.
+		if isGroup && len(d.AllowedUsers) == 0 {
+			continue
+		}
+
 		if !d.isAllowedUser(msg.Author.ID) {
 			continue
+		}
+
+		// Detect @mention: "<@botUserID>" appears in message content.
+		mentionTag := fmt.Sprintf("<@%s>", botID)
+		botMentioned := strings.Contains(msg.Content, mentionTag)
+
+		// Strip the mention from the content.
+		content := msg.Content
+		if botMentioned {
+			content = strings.ReplaceAll(content, mentionTag, "")
+			content = strings.TrimSpace(content)
 		}
 
 		capturedChannelID := msg.ChannelID
 		capturedMsgID := msg.ID
 
 		incoming := IncomingMessage{
-			ChannelType: "discord",
-			ChannelID:   msg.ChannelID,
-			SenderID:    msg.Author.ID,
-			SenderName:  msg.Author.Username,
-			Text:        msg.Content,
-			ReplyTo:     msg.ID,
+			ChannelType:  "discord",
+			ChannelID:    msg.ChannelID,
+			SenderID:     msg.Author.ID,
+			SenderName:   msg.Author.Username,
+			Text:         content,
+			ReplyTo:      msg.ID,
+			IsGroupChat:  isGroup,
+			BotMentioned: botMentioned,
 		}
 		incoming.Respond = func(text string) error {
 			return d.Reply(capturedChannelID, capturedMsgID, text)

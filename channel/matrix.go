@@ -21,7 +21,8 @@ type MatrixChannel struct {
 	Options      ChannelOptions
 	client       *http.Client
 	stopCh       chan struct{}
-	since        string // Sync token for /sync
+	since        string          // Sync token for /sync
+	groupRooms   map[string]bool // roomID → true if multi-user (group), false if DM
 	mu           sync.Mutex
 }
 
@@ -36,6 +37,7 @@ func NewMatrix(homeserver, userID, accessToken string, roomIDs []string, allowed
 		Options:      opts,
 		client:       &http.Client{Timeout: 60 * time.Second},
 		stopCh:       make(chan struct{}),
+		groupRooms:   make(map[string]bool),
 	}
 }
 
@@ -55,10 +57,44 @@ func (m *MatrixChannel) isAllowedUser(userID string) bool {
 
 func (m *MatrixChannel) Name() string { return "matrix" }
 
+// isGroupRoom reports whether roomID is a multi-user room (not a DM).
+// Defaults to true (group) for rooms whose member count is unknown.
+func (m *MatrixChannel) isGroupRoom(roomID string) bool {
+	isGroup, ok := m.groupRooms[roomID]
+	if !ok {
+		return true // unknown rooms are treated as group for safety
+	}
+	return isGroup
+}
+
+// getRoomMemberCount returns the number of joined members in a room.
+func (m *MatrixChannel) getRoomMemberCount(roomID string) (int, error) {
+	path := fmt.Sprintf("/_matrix/client/v3/rooms/%s/joined_members", roomID)
+	body, err := m.doRequest("GET", path, nil)
+	if err != nil {
+		return 0, err
+	}
+	var resp struct {
+		Joined map[string]any `json:"joined"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return 0, err
+	}
+	return len(resp.Joined), nil
+}
+
 // Start begins listening for Matrix events via long-polling /sync.
 func (m *MatrixChannel) Start(handler MessageHandler) error {
+	if len(m.AllowedUsers) == 0 {
+		fmt.Println("[Matrix] WARN: allowed_users is not configured — group chat messages will be denied. Set allowed_users in config to grant access.")
+	}
+
 	for _, roomID := range m.RoomIDs {
 		m.joinRoom(roomID)
+		// Classify as DM (2 members: bot + 1 user) or group.
+		if count, err := m.getRoomMemberCount(roomID); err == nil {
+			m.groupRooms[roomID] = count > 2
+		}
 	}
 
 	roomSet := make(map[string]bool, len(m.RoomIDs))
@@ -120,6 +156,13 @@ func (m *MatrixChannel) Start(handler MessageHandler) error {
 					continue
 				}
 
+				isGroup := m.isGroupRoom(roomID)
+
+				// Security: deny all messages from group rooms when no allowlist is set.
+				if isGroup && len(m.AllowedUsers) == 0 {
+					continue
+				}
+
 				if !m.isAllowedUser(event.Sender) {
 					continue
 				}
@@ -139,19 +182,31 @@ func (m *MatrixChannel) Start(handler MessageHandler) error {
 					threadID, _ = relatesTo["event_id"].(string)
 				}
 
+				// Detect @mention: bot's UserID appears in the message body.
+				// Thread messages are always directed at the bot (the thread is the session).
+				botMentioned := threadID != "" || strings.Contains(body, m.UserID)
+
+				// Strip the @mention prefix from the body so the agent sees clean text.
+				if botMentioned && strings.Contains(body, m.UserID) {
+					body = strings.ReplaceAll(body, m.UserID, "")
+					body = strings.TrimSpace(body)
+				}
+
 				// Capture loop-local values for closure safety.
 				capturedRoomID := roomID
 				capturedEventID := event.EventID
 				capturedThreadID := threadID
 
 				incoming := IncomingMessage{
-					ChannelType: "matrix",
-					ChannelID:   roomID,
-					SenderID:    event.Sender,
-					SenderName:  event.Sender,
-					Text:        body,
-					ReplyTo:     event.EventID,
-					ThreadID:    threadID,
+					ChannelType:  "matrix",
+					ChannelID:    roomID,
+					SenderID:     event.Sender,
+					SenderName:   event.Sender,
+					Text:         body,
+					ReplyTo:      event.EventID,
+					ThreadID:     threadID,
+					IsGroupChat:  isGroup,
+					BotMentioned: botMentioned,
 				}
 
 				incoming.Respond = func(text string) error {

@@ -14,11 +14,13 @@ import (
 
 // ── Think-block stream filter ──────────────────────────────────────────────────
 
-// ThinkStreamFilter wraps a StreamCallback and intercepts <think>…</think>
-// blocks produced by reasoning models (e.g. DeepSeek-R1, QwQ).
+// ThinkStreamFilter wraps a StreamCallback and intercepts thinking-block tags
+// produced by reasoning models:
+//   - <think>…</think>   DeepSeek-R1, QwQ
+//   - <thought>…</thought>  Gemma 4
 //
 // When showThink=false (default): think content is suppressed during streaming;
-// after </think> a single summary line is printed.
+// after the closing tag a single summary line is printed.
 // When showThink=true: think content is streamed in dim colour before the response.
 //
 // LastThink holds the raw text of the most recent think block so the /think
@@ -28,17 +30,23 @@ type ThinkStreamFilter struct {
 	showThink bool
 
 	// streaming state
-	buf         string // accumulates tokens until a safe flush point
+	buf         string          // accumulates tokens until a safe flush point
 	inThink     bool
+	closeTag    string          // closing tag matching the open tag we entered with
 	thinkBuf    strings.Builder // content inside the current think block
 	hasThink    bool            // at least one think block seen this turn
+	contentSeen bool            // real (non-whitespace) content already emitted; ignore subsequent think tags
 
 	// exported result
 	LastThink string
 }
 
-const thinkOpen = "<think>"
-const thinkClose = "</think>"
+// thinking open/close tag pairs, in match-priority order.
+var thinkOpenTags = []string{"<think>", "<thought>"}
+var thinkCloseTags = map[string]string{
+	"<think>":   "</think>",
+	"<thought>": "</thought>",
+}
 
 // Wrap returns a StreamCallback that routes tokens through the filter.
 // Call Reset() before each agent turn to clear state.
@@ -50,8 +58,10 @@ func (f *ThinkStreamFilter) Wrap() llm.StreamCallback {
 func (f *ThinkStreamFilter) Reset() {
 	f.buf = ""
 	f.inThink = false
+	f.closeTag = ""
 	f.thinkBuf.Reset()
 	f.hasThink = false
+	f.contentSeen = false
 }
 
 // feed is the actual StreamCallback implementation.
@@ -59,39 +69,57 @@ func (f *ThinkStreamFilter) feed(token string) {
 	f.buf += token
 	for {
 		if !f.inThink {
-			// Look for opening tag.
-			idx := strings.Index(f.buf, thinkOpen)
+			// Once real content has been emitted, pass everything through
+			// without entering think mode — subsequent tags are body text.
+			if f.contentSeen {
+				if f.inner != nil && f.buf != "" {
+					f.inner(f.buf)
+				}
+				f.buf = ""
+				return
+			}
+
+			// Look for whichever opening tag appears first.
+			idx, openTag := firstTagIndex(f.buf, thinkOpenTags)
 			if idx != -1 {
-				// Flush content before the tag to the real callback.
+				// Flush content before the tag.
 				if idx > 0 && f.inner != nil {
 					f.inner(f.buf[:idx])
+					if strings.TrimSpace(f.buf[:idx]) != "" {
+						f.contentSeen = true
+					}
 				}
-				f.buf = f.buf[idx+len(thinkOpen):]
+				f.buf = f.buf[idx+len(openTag):]
 				f.inThink = true
+				f.closeTag = thinkCloseTags[openTag]
 				f.thinkBuf.Reset()
-				// Loop to process whatever's left in buf.
 				continue
 			}
-			// No opening tag found; check if the tail could be a partial tag.
-			safe, held := splitAtPartialTag(f.buf, thinkOpen)
-			if safe != "" && f.inner != nil {
-				f.inner(safe)
+			// No opening tag; hold any tail that could be a partial match.
+			safe, held := splitAtPartialTagAny(f.buf, thinkOpenTags)
+			if safe != "" {
+				if f.inner != nil {
+					f.inner(safe)
+				}
+				if strings.TrimSpace(safe) != "" {
+					f.contentSeen = true
+				}
 			}
 			f.buf = held
 			return
 		}
 
-		// Inside think block: look for closing tag.
-		idx := strings.Index(f.buf, thinkClose)
+		// Inside think block: look for the matching closing tag.
+		idx := strings.Index(f.buf, f.closeTag)
 		if idx != -1 {
 			f.thinkBuf.WriteString(f.buf[:idx])
-			f.buf = f.buf[idx+len(thinkClose):]
+			f.buf = f.buf[idx+len(f.closeTag):]
 			f.inThink = false
 			f.onThinkEnd()
 			continue
 		}
-		// No closing tag; hold the tail that could be a partial tag.
-		safe, held := splitAtPartialTag(f.buf, thinkClose)
+		// No closing tag; hold the tail that could be a partial match.
+		safe, held := splitAtPartialTag(f.buf, f.closeTag)
 		f.thinkBuf.WriteString(safe)
 		f.buf = held
 		return
@@ -133,6 +161,31 @@ func (f *ThinkStreamFilter) onThinkEnd() {
 		chars := len([]rune(strings.TrimSpace(content)))
 		fmt.Println(stDim.Render(fmt.Sprintf("  ◆ thinking… (%d chars)", chars)))
 	}
+}
+
+// firstTagIndex returns the position and matched tag of the earliest occurrence
+// of any tag in tags within s. Returns (-1, "") if none found.
+func firstTagIndex(s string, tags []string) (int, string) {
+	best, bestTag := -1, ""
+	for _, tag := range tags {
+		if idx := strings.Index(s, tag); idx != -1 && (best == -1 || idx < best) {
+			best, bestTag = idx, tag
+		}
+	}
+	return best, bestTag
+}
+
+// splitAtPartialTagAny holds the longest tail of s that could be a partial
+// prefix of any tag in tags, returning the safe prefix and held suffix.
+func splitAtPartialTagAny(s string, tags []string) (safe, held string) {
+	bestHeld := 0
+	for _, tag := range tags {
+		_, h := splitAtPartialTag(s, tag)
+		if len(h) > bestHeld {
+			bestHeld = len(h)
+		}
+	}
+	return s[:len(s)-bestHeld], s[len(s)-bestHeld:]
 }
 
 // splitAtPartialTag splits s into a safe-to-emit prefix and a held suffix.

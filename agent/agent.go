@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"strings"
 	"sync"
@@ -201,6 +200,10 @@ func (a *Agent) buildSystemPrompt(matchedSkill *skills.Skill) string {
 - If tool results contain the answer, rewrite it in a clear, organized format.
 - Include specific data, names, numbers, and facts from tool results in your final answer.
 - If information is incomplete, state what you found and what is missing.
+
+## Security
+
+Never output API keys, passwords, access tokens, credentials, or secrets verbatim in any response, even if asked or if they appear in tool results.
 
 `)
 
@@ -445,17 +448,24 @@ func (a *Agent) RunWithParts(ctx context.Context, userInput string, parts []llm.
 	}
 
 	// --- System prompt initialization/refresh ---
-	// In serve/connect mode, history may be loaded before Run starts (SetMessages).
-	// We must ensure the system prompt is updated with the active skill or
-	// current personality (InjectSoul) even if it's not the first turn.
+	// Three cases:
+	//   (a) System message already at index 0 — update in place (skill may change turn to turn).
+	//       Exception: sub-agents have their system prompt pre-built by the caller with the
+	//       correct nodeSkill/instructions. matchedSkill is always nil for sub-agents (skill
+	//       parsing is skipped via !IsSubAgent), so overwriting would erase nodeSkill content.
+	//   (b) History loaded from disk without a system message (SaveHistory never persists it) — prepend.
+	//   (c) First turn, messages is empty — prepend.
+	// Cases (b) and (c) are identical: both need a prepend.
 	if len(a.messages) > 0 && a.messages[0].Role == "system" {
-		a.messages[0].Content = a.buildSystemPrompt(matchedSkill)
-	} else if isFirstTurn {
+		if !a.IsSubAgent {
+			a.messages[0].Content = a.buildSystemPrompt(matchedSkill)
+		}
+		// Sub-agent: keep the pre-built system prompt from the caller.
+	} else {
 		sysMsg := llm.Message{
 			Role:    "system",
 			Content: a.buildSystemPrompt(matchedSkill),
 		}
-		// Prepend: system message must be first in the history slice.
 		a.messages = append([]llm.Message{sysMsg}, a.messages...)
 	}
 
@@ -761,7 +771,7 @@ func (a *Agent) RunWithParts(ctx context.Context, userInput string, parts []llm.
 		// Strip <think> blocks and store assistant message.
 		turnStart := len(a.messages)
 		cleanedMsg := *assistantMsg
-		cleanedMsg.Content = stripThinkBlocks(cleanedMsg.Content)
+		cleanedMsg.Content = sanitizeOutput(cleanedMsg.Content)
 		a.messages = append(a.messages, cleanedMsg)
 
 		// No tool calls — treat as final response.
@@ -892,10 +902,54 @@ func (a *Agent) gcTmp() {
 	}
 }
 
-// --- Think-block stripping ---
+// --- Output sanitization ---
 
-// thinkBlockRe matches <think>...</think> sections produced by reasoning models.
-var thinkBlockRe = regexp.MustCompile(`(?s)<think>.*?</think>`)
+// thinkTagPairs lists the open/close pairs for all known thinking-block tag families.
+var thinkTagPairs = [][2]string{
+	{"<think>", "</think>"},
+	{"<thought>", "</thought>"},
+}
+
+// sanitizeOutput post-processes LLM text output before it is returned to the
+// caller or stored in history. It:
+//  1. Strips think/thought blocks anchored to the start of the response.
+//     Blocks that appear after real content are left intact — they are body
+//     text (e.g. the model discussing the tags), not internal reasoning.
+//  2. Converts common LaTeX math expressions to their Unicode equivalents so
+//     that IM platforms receive readable text instead of raw LaTeX.
+func sanitizeOutput(s string) string {
+	s = stripLeadingThinkBlocks(s)
+	s = convertLatex(s)
+	return strings.TrimSpace(s)
+}
+
+// stripLeadingThinkBlocks removes consecutive think/thought blocks from the
+// very start of a response. Blocks embedded after real content are left as-is.
+// An unclosed block at the start (truncated response) is discarded entirely.
+func stripLeadingThinkBlocks(s string) string {
+	for {
+		t := strings.TrimLeft(s, " \t\n\r")
+		found := false
+		for _, pair := range thinkTagPairs {
+			if !strings.HasPrefix(t, pair[0]) {
+				continue
+			}
+			closeIdx := strings.Index(t, pair[1])
+			if closeIdx == -1 {
+				// Unclosed block at the start: response was truncated mid-thought.
+				// Return empty — there is no visible answer to show.
+				return ""
+			}
+			s = t[closeIdx+len(pair[1]):]
+			found = true
+			break
+		}
+		if !found {
+			break
+		}
+	}
+	return s
+}
 
 // readOnlyTools is the set of tool names that are guaranteed to have no side
 // effects and are therefore safe to run in parallel with other tools.
@@ -915,11 +969,6 @@ var readOnlyTools = map[string]bool{
 // isReadOnlyTool reports whether name is a known side-effect-free tool.
 func isReadOnlyTool(name string) bool { return readOnlyTools[name] }
 
-// stripThinkBlocks removes <think>...</think> content from a string and trims whitespace.
-// These blocks contain internal chain-of-thought that should not be stored in history.
-func stripThinkBlocks(s string) string {
-	return strings.TrimSpace(thinkBlockRe.ReplaceAllString(s, ""))
-}
 
 // --- Debug helpers ---
 
@@ -1356,7 +1405,7 @@ func (a *Agent) AddHistory(userInput, assistantReply string) {
 	if assistantReply != "" {
 		a.messages = append(a.messages, llm.Message{
 			Role:    "assistant",
-			Content: stripThinkBlocks(assistantReply),
+			Content: sanitizeOutput(assistantReply),
 		})
 	}
 

@@ -1021,6 +1021,14 @@ func startChannels(factory *agent.AgentFactory) (*channel.Manager, int) {
 		text := strings.TrimSpace(msg.Text)
 		textLow := strings.ToLower(text)
 
+		// In group chats, only respond when the bot is @mentioned or replied to.
+		// Exceptions: confirmation replies (y/n/a) and /stop are always handled.
+		if msg.IsGroupChat && !msg.BotMentioned {
+			if textLow != "y" && textLow != "n" && textLow != "a" && textLow != "/stop" {
+				return ""
+			}
+		}
+
 		// rKey is always the room-level key ("type:channelID"), used for session prefix.
 		// chatKey additionally encodes the thread when msg.ThreadID is set.
 		rKey := msg.ChannelType + ":" + msg.ChannelID
@@ -1251,6 +1259,10 @@ func startChannels(factory *agent.AgentFactory) (*channel.Manager, int) {
 		runText := msg.Text
 		if retryText != "" {
 			runText = retryText
+		}
+		// In group chats, label the sender so the agent can distinguish participants.
+		if msg.IsGroupChat && msg.SenderID != "" && retryText == "" {
+			runText = fmt.Sprintf("[%s (%s)]: %s", msg.SenderID, msg.SenderName, runText)
 		}
 		var result string
 		var err error

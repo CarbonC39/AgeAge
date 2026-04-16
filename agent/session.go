@@ -240,17 +240,24 @@ func trashDir(dir string) error {
 // System messages are skipped: they are rebuilt fresh on next load.
 // This method is safe to call after summarisation — it overwrites the entire file
 // rather than appending, so the saved state always matches the in-memory state.
+//
+// The write is atomic: data is first written to a sibling .tmp file, then renamed
+// into place. This prevents history corruption if two callers race (e.g. parallel
+// channel handlers both trying to save the same session concurrently).
 func (sm *SessionManager) SaveHistory(id string, msgs []llm.Message) error {
 	if err := sm.EnsureSession(id); err != nil {
 		return err
 	}
 	path := sm.HistoryPath(id)
-	f, err := os.Create(path)
+	tmp := path + ".tmp"
+
+	f, err := os.Create(tmp)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+
 	enc := json.NewEncoder(f)
+	writeErr := error(nil)
 	for _, m := range msgs {
 		if m.Role == "system" {
 			continue // rebuilt on load via buildSystemPrompt
@@ -263,10 +270,17 @@ func (sm *SessionManager) SaveHistory(id string, msgs []llm.Message) error {
 			ToolCallID: m.ToolCallID,
 		}
 		if err := enc.Encode(rec); err != nil {
-			return err
+			writeErr = err
+			break
 		}
 	}
-	return nil
+	f.Close()
+
+	if writeErr != nil {
+		_ = os.Remove(tmp)
+		return writeErr
+	}
+	return os.Rename(tmp, path)
 }
 
 // LoadHistory reads history.jsonl for a session and returns the messages.

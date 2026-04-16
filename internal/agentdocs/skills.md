@@ -2,9 +2,9 @@
 
 ## What Skills Are
 
-Markdown files in `{workspace}/skills/`. Each defines a specialized agent mode.
-
-Triggered by `/skill-name` in a message, or auto-selected by the router based on intent.
+Markdown files in `{ageage-dir}/skills/` (same directory as config.toml).
+Each defines a specialized agent mode with its own prompt, tool restrictions, and
+model tier. Triggered by `/skill-name` prefix or auto-selected by the router.
 Hot-reloaded every 2 seconds — no restart needed after saving.
 
 ---
@@ -27,20 +27,21 @@ prompt: |
 
 | Field | Required | Values | Effect |
 |-------|----------|--------|--------|
-| name | yes | slug | command name, routing key |
-| description | yes | string | shown in /skills, used by router |
+| name | yes | slug | command name and routing key |
+| description | yes | string | shown in `/skills`, used by router |
 | complexity | no | simple / medium / complex | model selection when router enabled |
-| tools | no | list of tool names | allowlist; omit to allow all tools |
+| tools | no | list of tool names | restricts available tools for this skill |
 | prompt | no | string | prepended to system prompt when skill is active |
 | pipeline | no | true | marks this as a pipeline skill (see pipeline doc) |
 
+The skill's `tools` list restricts on top of `agent.tools` config — the intersection is used.
 Body content after the frontmatter closing `---` is ignored for regular skills.
 
 ---
 
 ## Creating or Modifying a Skill
 
-Use `file_write` to create `{skillsDir}/my-skill.md`:
+Use `file_write` to create `{ageage-dir}/skills/my-skill.md`:
 
 ```markdown
 ---
@@ -57,7 +58,7 @@ prompt: |
 ---
 ```
 
-Then trigger with `/code-review <context>`.
+Trigger with `/code-review <context>` — the skill activates immediately (hot-reload).
 
 ---
 
@@ -67,9 +68,9 @@ When the router is enabled (`router.enabled = true`):
 
 | complexity | model used |
 |-----------|------------|
-| simple | router.router model (lightweight) |
-| medium | main LLM model |
-| complex | router.strong model (if configured) |
+| simple | `router.classifier` model (lightweight) |
+| medium | main `[llm]` model |
+| complex | `router.strong` model |
 
 Omitting `complexity` defaults to medium routing.
 
@@ -78,13 +79,14 @@ Omitting `complexity` defaults to medium routing.
 ## Pipeline Skills
 
 Add `pipeline: true` to frontmatter, then define nodes in YAML after the second `---`.
-Call `framework_doc("pipeline")` for the full pipeline reference and examples.
+Read `.ageage/docs/pipeline.md` for the full pipeline reference and examples.
 
 ---
 
 ## Tips
 
 - Keep `prompt` focused — broad instructions produce unfocused behavior
-- Use `tools` allowlist to prevent the skill from using unneeded tools
+- Use `tools` to restrict the skill from accessing unneeded tools
 - The skill's `prompt` is appended **after** AGENT.md — it can override defaults
-- Skills cannot call other skills; use a pipeline for multi-stage workflows
+- Skills cannot invoke other skills; use a pipeline for multi-stage workflows
+- The `{ageage-dir}/skills/` directory path is shown by `agent_info` if available

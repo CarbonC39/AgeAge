@@ -11,8 +11,9 @@ import (
 
 // Config is the top-level configuration for AgeAge.
 type Config struct {
-	Workspace string          `toml:"workspace"`
-	WorkDir   string          `toml:"-"` // Effective working dir for file ops; defaults to Workspace, overridden in CLI mode
+	Workspace string          `toml:"workspace"` // Working content directory (where the agent reads/writes files)
+	WorkDir   string          `toml:"-"`          // Effective working dir for file ops; defaults to Workspace, overridden in CLI mode
+	configDir string          // Dir containing config.toml; AgeAge data (AGENT.md, memories, skills) lives here
 	LLM       LLMConfig       `toml:"llm"`
 	Agent     AgentConfig     `toml:"agent"`
 	SubAgent  SubAgentConfig  `toml:"subagent"`
@@ -92,11 +93,11 @@ type ModelConfig struct {
 
 // RouterConfig holds settings for the intent router.
 type RouterConfig struct {
-	Enabled     bool        `toml:"enabled"`
-	RouterModel ModelConfig `toml:"router"` // Lightweight model for routing
-	MediumModel ModelConfig `toml:"medium"` // Medium model for linear tasks
-	StrongModel ModelConfig `toml:"strong"` // Strong model for complex tasks
-	MaxHistory  int         `toml:"max_history"`
+	Enabled          bool        `toml:"enabled"`
+	ClassifierModel  ModelConfig `toml:"classifier"` // Lightweight model for intent classification
+	MediumModel      ModelConfig `toml:"medium"`      // Medium model for linear tasks
+	StrongModel      ModelConfig `toml:"strong"`      // Strong model for complex tasks
+	MaxHistory       int         `toml:"max_history"`
 }
 
 // Resolve returns the model, API key and BaseURL, falling back to defaults if empty.
@@ -273,11 +274,11 @@ func DefaultConfig() *Config {
 			},
 		},
 		Router: RouterConfig{
-			Enabled:     false,
-			RouterModel: ModelConfig{}, // inherits base LLM model
-			MediumModel: ModelConfig{}, // inherits base LLM model
-			StrongModel: ModelConfig{}, // inherits base LLM model
-			MaxHistory:  8,
+			Enabled:         false,
+			ClassifierModel: ModelConfig{}, // inherits base LLM model
+			MediumModel:     ModelConfig{}, // inherits base LLM model
+			StrongModel:     ModelConfig{}, // inherits base LLM model
+			MaxHistory:      8,
 		},
 		Summarize: SummarizeConfig{
 			Enabled:    false,
@@ -287,6 +288,7 @@ func DefaultConfig() *Config {
 		},
 		Bash: BashConfig{
 			AutoAllowCommands: []string{},
+			MaxOutputBytes:    4 * 1024 * 1024, // 4 MB
 		},
 		WebSearch: WebSearchConfig{
 			Backend:          "duckduckgo",
@@ -330,10 +332,14 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("failed to parse config file %s: %w", path, err)
 	}
 
-	// Resolve workspace to absolute path relative to the config file location.
+	// configDir = directory containing config.toml.
+	// All AgeAge data (AGENT.md, memories, skills) lives here.
+	absPath, _ := filepath.Abs(path)
+	cfg.configDir = filepath.Dir(absPath)
+
+	// Resolve workspace (file-ops working dir) relative to configDir.
 	if !filepath.IsAbs(cfg.Workspace) {
-		configDir := filepath.Dir(path)
-		cfg.Workspace = filepath.Join(configDir, cfg.Workspace)
+		cfg.Workspace = filepath.Join(cfg.configDir, cfg.Workspace)
 	}
 	cfg.Workspace, _ = filepath.Abs(cfg.Workspace)
 	cfg.WorkDir = cfg.Workspace // default; CLI mode overrides this to cwd
@@ -341,10 +347,16 @@ func LoadConfig(path string) (*Config, error) {
 	return cfg, nil
 }
 
-// EnsureDirs creates directories required at runtime (e.g. workspace/data).
-// Call this after LoadConfig, not inside it, to keep the loader side-effect-free.
+// ConfigDir returns the directory containing config.toml.
+// AgeAge data (AGENT.md, SOUL.md, memories, skills) all live here.
+func (c *Config) ConfigDir() string {
+	return c.configDir
+}
+
+// EnsureDirs creates runtime directories under configDir.
+// Call after LoadConfig, not inside it, to keep the loader side-effect-free.
 func (c *Config) EnsureDirs() error {
-	dataDir := filepath.Join(c.Workspace, "data")
+	dataDir := filepath.Join(c.configDir, "data")
 	if err := os.MkdirAll(dataDir, 0o755); err != nil {
 		return fmt.Errorf("failed to create data directory: %w", err)
 	}
@@ -353,16 +365,16 @@ func (c *Config) EnsureDirs() error {
 
 // SOULPath returns the path to the SOUL.md file.
 func (c *Config) SOULPath() string {
-	return filepath.Join(c.Workspace, "data", "SOUL.md")
+	return filepath.Join(c.configDir, "data", "SOUL.md")
 }
 
 // AgentPath returns the path to the AGENT.md file.
 func (c *Config) AgentPath() string {
-	return filepath.Join(c.Workspace, "data", "AGENT.md")
+	return filepath.Join(c.configDir, "data", "AGENT.md")
 }
 
 // EffectiveWorkDir returns the working directory for file operations.
-// In CLI mode this is overridden to the launch directory; otherwise equals Workspace.
+// In CLI mode this is the launch directory; in serve/connect it is Workspace.
 func (c *Config) EffectiveWorkDir() string {
 	if c.WorkDir != "" {
 		return c.WorkDir
@@ -372,12 +384,12 @@ func (c *Config) EffectiveWorkDir() string {
 
 // SkillsDir returns the path to the skills directory.
 func (c *Config) SkillsDir() string {
-	return filepath.Join(c.Workspace, "skills")
+	return filepath.Join(c.configDir, "skills")
 }
 
 // MemoryPath returns the path to the MEMORY.jsonl file.
 func (c *Config) MemoryPath() string {
-	return filepath.Join(c.Workspace, "data", "MEMORY.jsonl")
+	return filepath.Join(c.configDir, "data", "MEMORY.jsonl")
 }
 
 // AgeAgeDirPath returns the .ageage directory path within the effective work dir.
@@ -390,9 +402,9 @@ func (c *Config) ContextMDPath() string {
 	return filepath.Join(c.AgeAgeDirPath(), "CONTEXT.md")
 }
 
-// CredentialsPath returns the path to credentials.toml (encrypted, alongside config.toml).
+// CredentialsPath returns the path to credentials.toml, stored alongside config.toml.
 func (c *Config) CredentialsPath() string {
-	return filepath.Join(c.Workspace, "credentials.toml")
+	return filepath.Join(c.configDir, "credentials.toml")
 }
 
 // WorkspaceSettingsPath returns the path to .ageage/settings.json.

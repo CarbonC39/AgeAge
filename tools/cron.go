@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -96,6 +97,95 @@ func (cs *CronStore) List() []CronEntry {
 	return result
 }
 
+// ── Expression matching ───────────────────────────────────────────────────────
+
+// MatchesCronExpr reports whether t matches the 5-field cron expression expr.
+// Fields (space-separated): minute hour day-of-month month day-of-week.
+// Each field supports: * (any), */n (step from min), n (exact), n-m (range), comma lists.
+func MatchesCronExpr(expr string, t time.Time) bool {
+	fields := strings.Fields(expr)
+	if len(fields) != 5 {
+		return false
+	}
+	return cronFieldMatch(fields[0], t.Minute(), 0) &&
+		cronFieldMatch(fields[1], t.Hour(), 0) &&
+		cronFieldMatch(fields[2], t.Day(), 1) &&
+		cronFieldMatch(fields[3], int(t.Month()), 1) &&
+		cronFieldMatch(fields[4], int(t.Weekday()), 0)
+}
+
+// ValidateCronExpr returns an error if expr is not a valid 5-field cron expression.
+func ValidateCronExpr(expr string) error {
+	fields := strings.Fields(expr)
+	if len(fields) != 5 {
+		return fmt.Errorf("cron expression must have exactly 5 fields (got %d): %q", len(fields), expr)
+	}
+	limits := [5][2]int{{0, 59}, {0, 23}, {1, 31}, {1, 12}, {0, 6}}
+	names := [5]string{"minute", "hour", "day", "month", "weekday"}
+	for i, f := range fields {
+		if err := validateCronField(f, limits[i][0], limits[i][1], names[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func cronFieldMatch(token string, val, min int) bool {
+	for _, part := range strings.Split(token, ",") {
+		if cronPartMatch(strings.TrimSpace(part), val, min) {
+			return true
+		}
+	}
+	return false
+}
+
+func cronPartMatch(part string, val, min int) bool {
+	switch {
+	case part == "*":
+		return true
+	case strings.HasPrefix(part, "*/"):
+		step, err := strconv.Atoi(part[2:])
+		return err == nil && step > 0 && (val-min)%step == 0
+	default:
+		if dash := strings.IndexByte(part, '-'); dash != -1 {
+			lo, err1 := strconv.Atoi(part[:dash])
+			hi, err2 := strconv.Atoi(part[dash+1:])
+			return err1 == nil && err2 == nil && val >= lo && val <= hi
+		}
+		n, err := strconv.Atoi(part)
+		return err == nil && val == n
+	}
+}
+
+func validateCronField(token string, min, max int, name string) error {
+	for _, part := range strings.Split(token, ",") {
+		part = strings.TrimSpace(part)
+		if part == "*" {
+			continue
+		}
+		if strings.HasPrefix(part, "*/") {
+			step, err := strconv.Atoi(part[2:])
+			if err != nil || step <= 0 {
+				return fmt.Errorf("cron %s: invalid step %q", name, part)
+			}
+			continue
+		}
+		if dash := strings.IndexByte(part, '-'); dash != -1 {
+			lo, err1 := strconv.Atoi(part[:dash])
+			hi, err2 := strconv.Atoi(part[dash+1:])
+			if err1 != nil || err2 != nil || lo > hi || lo < min || hi > max {
+				return fmt.Errorf("cron %s: invalid range %q (allowed %d-%d)", name, part, min, max)
+			}
+			continue
+		}
+		n, err := strconv.Atoi(part)
+		if err != nil || n < min || n > max {
+			return fmt.Errorf("cron %s: value %q out of range %d-%d", name, part, min, max)
+		}
+	}
+	return nil
+}
+
 // --- Cron Tools ---
 
 // CronAddTool adds a scheduled task.
@@ -136,6 +226,10 @@ func (t *CronAddTool) Execute(_ context.Context, args json.RawMessage) (string, 
 	}
 	if err := json.Unmarshal(args, &params); err != nil {
 		return "", fmt.Errorf("invalid arguments: %w", err)
+	}
+
+	if err := ValidateCronExpr(params.Schedule); err != nil {
+		return "", err
 	}
 
 	operation := fmt.Sprintf("Add cron task: %s (every %s)", params.Command, params.Schedule)

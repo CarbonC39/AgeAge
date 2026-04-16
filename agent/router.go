@@ -148,7 +148,7 @@ func (r *Router) Route(ctx context.Context, userInput string, availableTools []s
 	messages = append(messages, r.filterHistoryForRouter(history)...)
 
 	// Use the router (lightweight) model, falling back to the base LLM on failure.
-	modelName, apiKey, baseURL := r.cfg.Router.RouterModel.Resolve(r.cfg.LLM.Model, r.client.APIKey(), r.client.BaseURL())
+	modelName, apiKey, baseURL := r.cfg.Router.ClassifierModel.Resolve(r.cfg.LLM.Model, r.client.APIKey(), r.client.BaseURL())
 	routerClient := llm.NewClient(apiKey, baseURL, modelName, r.debug, 0)
 
 	resp, err := routerClient.ChatCompletionJSON(ctx, messages, r.cfg.LLM.Temperature)

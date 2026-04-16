@@ -53,7 +53,7 @@ type Agent struct {
 	InjectContext       bool                           // If true, .ageage/CONTEXT.md is injected into the system prompt (default true for main agent and pipeline nodes)
 	SessionDir          string                         // Directory for the active session (e.g. .ageage/sessions/default); CONTEXT.md is read from here
 	MaxIterations       int                            // Maximum iterations for this agent run
-	factory             *AgentFactory                  // Back-reference used for skill-only tool injection; nil for manually created agents
+	factory             *AgentFactory                  // Back-reference used for per-turn skill tool injection; nil for manually created agents
 	todoStore           *tools.TodoStore               // Non-nil when update_todos is injected; cleared after finish_task
 	browserSess         *tools.BrowserSession          // Non-nil when browser_* tools are injected; closed after Run
 	runUsage            llm.Usage                      // Accumulated token usage for the current Run(); reset each call
@@ -76,7 +76,7 @@ func NewAgent(cfg *config.Config, client *llm.Client, registry *tools.Registry, 
 		debug:         debug,
 		MaxIterations: cfg.Agent.MaxIterations,
 		messages:      make([]llm.Message, 0, 64),
-		tmpMgr:        newTmpManager(cfg.Workspace),
+		tmpMgr:        newTmpManager(cfg.ConfigDir()),
 		InjectContext: true, // on by default; explicitly disabled for delegate sub-agents
 	}
 
@@ -251,7 +251,7 @@ func (a *Agent) buildSystemPrompt(matchedSkill *skills.Skill) string {
 	if !a.IsSubAgent {
 		sb.WriteString("## Framework Documentation\n\n")
 		sb.WriteString("Self-reference guides are in `.ageage/docs/` (use `file_read`): " +
-			"how-i-work, troubleshooting, skills, pipeline.\n")
+			"how-i-work.md, troubleshooting.md, skills.md, pipeline.md.\n")
 		sb.WriteString("Read them when a tool fails unexpectedly, when creating or modifying skills, " +
 			"or when you need to understand how the agent loop works.\n\n")
 	}
@@ -526,6 +526,9 @@ func (a *Agent) RunWithParts(ctx context.Context, userInput string, parts []llm.
 	var neededTools []string
 	if routerResult != nil && len(routerResult.RequiredTools) > 0 {
 		neededTools = append(neededTools, routerResult.RequiredTools...)
+	} else if routerResult != nil && matchedSkill == nil {
+		// Router ran but imposed no tool restriction — use all available tools.
+		neededTools = a.registry.List()
 	} else if routerResult == nil && matchedSkill == nil {
 		// No router, no skill: use all available tools.
 		neededTools = a.registry.List()
@@ -726,8 +729,8 @@ func (a *Agent) RunWithParts(ctx context.Context, userInput string, parts []llm.
 			}
 
 			// If upgraded model failed and we haven't fallen back yet, try router model.
-			if upgradeUsed && !fallbackUsed && a.cfg.Router.RouterModel.Model != "" {
-				modelName, apiKey, baseURL := a.cfg.Router.RouterModel.Resolve(a.cfg.LLM.Model, a.client.APIKey(), a.client.BaseURL())
+			if upgradeUsed && !fallbackUsed && a.cfg.Router.ClassifierModel.Model != "" {
+				modelName, apiKey, baseURL := a.cfg.Router.ClassifierModel.Resolve(a.cfg.LLM.Model, a.client.APIKey(), a.client.BaseURL())
 				a.debugLog("Router", "fallback → %s", modelName)
 				activeClient = llm.NewClient(apiKey, baseURL, modelName, a.debug, a.cfg.LLM.MaxTokens)
 				upgradeUsed = false

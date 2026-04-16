@@ -1,9 +1,10 @@
 package agent
 
-// skillOnlyToolFactories maps skill-only tool names to factory functions.
-// These tools are NOT registered globally — they are instantiated and injected
-// into the agent's registry only when a matched skill declares them in
-// required_tools, and removed again after the run completes.
+// skillOnlyToolFactories maps tool names to factory functions for tools that
+// require special initialization. These tools are registered in three cases:
+//  1. Per-turn injection when a matched skill declares them in required_tools.
+//  2. At factory time when listed in agent.tools config (global allowlist).
+//  3. At factory time when listed in the sub-agent allowedTools parameter.
 //
 // Factory signature: func(factory *AgentFactory, registry *tools.Registry) tools.Tool
 // Both parameters may be used by tools that need sub-agent creation or config access.

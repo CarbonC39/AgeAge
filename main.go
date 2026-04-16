@@ -5,11 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -174,288 +176,500 @@ func findConfigFile(explicit string) string {
 func runInit(cmd *cobra.Command, args []string) error {
 	reader := bufio.NewReader(os.Stdin)
 
-	fmt.Println("🚀 AgeAge Setup Wizard")
-	fmt.Println(strings.Repeat("─", 40))
+	fmt.Println("AgeAge Setup Wizard")
+	fmt.Println(strings.Repeat("═", 52))
 
-	// 1. Workspace directory.
-	fmt.Print("\n📁 Workspace directory (default: ./workspace): ")
-	wsDir := readLine(reader, "./workspace")
-	absWsDir, _ := filepath.Abs(wsDir)
+	// ─── 1/6  Storage ────────────────────────────────────────
+	printInitSection("1/6  Storage")
+	fmt.Println("AgeAge directory — one folder for config.toml, AGENT.md, SOUL.md,")
+	fmt.Println("memories, skills, and session data. Pass it with: ageage cli -c <dir>/config.toml")
+	fmt.Print("AgeAge directory (default: ./ageage): ")
+	ageageDir, _ := filepath.Abs(readLine(reader, "./ageage"))
+	cfgPath := filepath.Join(ageageDir, "config.toml")
 
-	// 2. API Base URL.
-	fmt.Print("\n🌐 LLM API Base URL (default: https://api.openai.com/v1): ")
+	fmt.Println()
+	fmt.Println("Workspace — the directory of files the agent reads and writes.")
+	fmt.Println("In CLI mode the launch directory is always used regardless of this setting.")
+	fmt.Println("In channel/serve mode the agent operates here by default.")
+	fmt.Print("Workspace (default: . — current directory at runtime): ")
+	workspace := readLine(reader, ".")
+	// Keep "." as-is so it resolves at runtime relative to the ageage dir.
+
+	// ─── 2/6  LLM Provider ───────────────────────────────────
+	printInitSection("2/6  LLM Provider")
+	fmt.Println("Base URL examples:")
+	fmt.Println("  OpenAI:    https://api.openai.com/v1")
+	fmt.Println("  Anthropic: https://api.anthropic.com/v1")
+	fmt.Println("  DeepSeek:  https://api.deepseek.com/v1")
+	fmt.Println("  Gemini:    https://generativelanguage.googleapis.com/v1beta/openai")
+	fmt.Println("  Ollama:    http://localhost:11434/v1  (no API key needed)")
+	fmt.Print("Base URL (default: https://api.openai.com/v1): ")
 	baseURL := readLine(reader, "https://api.openai.com/v1")
 
-	// 3. API Key.
-	fmt.Print("\n🔑 LLM API Key: ")
-	apiKey := readLine(reader, "")
-	if apiKey == "" {
-		apiKey = os.Getenv("OPENAI_API_KEY")
-		if apiKey != "" {
-			fmt.Println("   (using OPENAI_API_KEY from environment)")
-		}
+	envKey, envName := findEnvAPIKey()
+	if envKey != "" {
+		fmt.Printf("API Key (found %s — press Enter to use it): ", envName)
+	} else {
+		fmt.Print("API Key: ")
+	}
+	apiKey := readLine(reader, envKey)
+	if apiKey == envKey && envKey != "" {
+		fmt.Printf("  Using %s.\n", envName)
 	}
 
-	// 4. Web Search Backend.
-	fmt.Println("\n🔎 Web Search Backend:")
-	fmt.Println("   1) DuckDuckGo (Native, no dependencies)")
-	fmt.Println("   2) SearXNG (Requires a running instance)")
-	fmt.Print("   Select (1-2, default: 1): ")
-	searchChoice := readLine(reader, "1")
-	searchBackend := "duckduckgo"
-	searxngURL := ""
-	if searchChoice == "2" {
-		searchBackend = "searxng"
-		fmt.Print("   SearXNG Instance URL (default: http://localhost:8080): ")
-		searxngURL = readLine(reader, "http://localhost:8080")
+	model := pickModel(reader, baseURL, apiKey)
+
+	// ─── 3/6  Agent Behavior ─────────────────────────────────
+	printInitSection("3/6  Agent Behavior")
+	fmt.Println("Mode:")
+	fmt.Println("  1) supervised — prompt for confirmation on every tool call")
+	fmt.Println("                  Best for CLI: you review before each action")
+	fmt.Println("  2) full       — autonomous, no confirmation prompts")
+	fmt.Println("                  Required for channel mode (Telegram/Discord/Matrix)")
+	fmt.Print("Select mode (default: 1): ")
+	agentMode := "supervised"
+	if readLine(reader, "1") == "2" {
+		agentMode = "full"
 	}
 
-	// 5. Web Fetch Backend.
-	fmt.Println("\n📄 Web Fetch Backend:")
-	fmt.Println("   1) Native (Go-based, simple)")
-	fmt.Println("   2) Jina (Requires Jina API key)")
-	fmt.Println("   3) Crawl4AI (Requires Python & crawl4ai package)")
-	fmt.Print("   Select (1-3, default: 1): ")
-	fetchChoice := readLine(reader, "1")
-	fetchBackend := "native"
-	jinaKey := ""
-	pythonCmd := ""
-
-	switch fetchChoice {
-	case "2":
-		fetchBackend = "jina"
-		fmt.Print("   Jina API Key (optional): ")
-		jinaKey = readLine(reader, "")
-	case "3":
-		fetchBackend = "crawl4ai"
-		pythonCmd = detectPython()
-		if pythonCmd == "" {
-			fmt.Println("⚠️  Warning: Python not detected. Crawl4AI will require manual setup.")
-			pythonCmd = "python"
-		} else {
-			fmt.Printf("Detected Python: %s\n", pythonCmd)
-		}
+	// ─── 4/6  Intent Router ──────────────────────────────────
+	printInitSection("4/6  Intent Router  (optional)")
+	fmt.Println("Routes requests to different model tiers by task complexity.")
+	fmt.Println("Example: cheap model for Q&A, powerful model for code/reasoning.")
+	fmt.Println("Skip if you use a single model for everything.")
+	fmt.Print("Configure router? (y/N): ")
+	routerEnabled := strings.ToLower(readLine(reader, "n")) == "y"
+	var routerClassifier, routerMedium, routerStrong string
+	if routerEnabled {
+		classDefault := suggestModel(baseURL)
+		fmt.Printf("  Classifier model (routing decisions, pick something cheap; default: %s): ", classDefault)
+		routerClassifier = readLine(reader, classDefault)
+		fmt.Printf("  Medium model (moderate tasks; default: %s): ", model)
+		routerMedium = readLine(reader, model)
+		strongDefault := getStrongModel(model)
+		fmt.Printf("  Strong model (complex tasks; default: %s): ", strongDefault)
+		routerStrong = readLine(reader, strongDefault)
 	}
 
-	// 6. Tool selection (optional).
+	// ─── 5/6  Web Tools ──────────────────────────────────────
+	printInitSection("5/6  Web Tools")
+	fmt.Println("Search backend:")
+	fmt.Println("  1) DuckDuckGo  — no API key, works out of the box")
+	fmt.Println("  2) Brave       — higher quality results (needs Brave Search API key)")
+	fmt.Println("  3) Tavily      — optimized for LLM agents (needs Tavily API key)")
+	fmt.Println("  4) SearXNG     — self-hosted, privacy-friendly")
+	fmt.Print("Select (default: 1): ")
+	searchBackend, searxngURL, tavilyKey, braveKey := parseSearchChoice(reader, readLine(reader, "1"))
+
+	fmt.Println("\nFetch backend (used when the agent reads web pages):")
+	fmt.Println("  1) Native   — built-in Go HTTP client, no setup")
+	fmt.Println("  2) Jina     — cleaner extraction; optional API key for higher rate limits")
+	fmt.Println("  3) Crawl4AI — best content quality; requires Python + crawl4ai package")
+	fmt.Print("Select (default: 1): ")
+	fetchBackend, jinaKey, pythonCmd := parseFetchChoice(reader, readLine(reader, "1"))
+
+	// ─── 6/6  Default Tools ───────────────────────────────────
+	printInitSection("6/6  Default Tools")
+	fmt.Println("All tools are enabled by default. An allowlist restricts the agent to")
+	fmt.Println("only the tools you name (useful for leaner or constrained deployments).")
+	fmt.Print("Customize tool allowlist? (y/N): ")
 	var selectedTools []string
-	fmt.Print("\n🔧 Customize which tools are enabled by default? (y/N): ")
 	if strings.ToLower(readLine(reader, "n")) == "y" {
 		selectedTools = selectTools(reader, nil)
 	}
-
-	// Auto-fill remaining values.
-	model := "gpt-4o-mini"
-	// Detect provider from URL and adjust defaults.
-	if strings.Contains(baseURL, "deepseek") {
-		model = "deepseek-chat"
-	} else if strings.Contains(baseURL, "generativelanguage.googleapis.com") || strings.Contains(baseURL, "gemini") {
-		model = "gemini-2.0-flash"
-	}
-
 	toolsLine := toolsLineFromSlice(selectedTools)
 
-	// Create directories.
-	dirs := []string{
-		filepath.Join(absWsDir, "data"),
-		filepath.Join(absWsDir, "skills"),
-	}
-	for _, d := range dirs {
+	// ─── Generate files ───────────────────────────────────────
+	for _, d := range []string{
+		filepath.Join(ageageDir, "data"),
+		filepath.Join(ageageDir, "skills"),
+	} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			return fmt.Errorf("failed to create directory %s: %w", d, err)
 		}
 	}
 
-	// Generate config.toml.
-	configPath := filepath.Join(absWsDir, "config.toml")
 	writeConfig := true
-	if _, err := os.Stat(configPath); err == nil {
-		fmt.Printf("\n⚠️ %s already exists. Overwrite? (y/n): ", configPath)
-		if readLine(reader, "n") != "y" {
-			fmt.Println("   Skipped config.toml")
+	if _, err := os.Stat(cfgPath); err == nil {
+		fmt.Printf("\n%s already exists. Overwrite? (y/N): ", cfgPath)
+		if strings.ToLower(readLine(reader, "n")) != "y" {
+			fmt.Println("  Skipped.")
 			writeConfig = false
 		}
 	}
 	if writeConfig {
-		configContent := fmt.Sprintf(`# AgeAge Configuration — Generated by ageage init
-
-workspace = "%s"
-
-[llm]
-api_key = "%s"
-base_url = "%s"
-model = "%s"
-temperature = 0.7
-
-[agent]
-max_iterations = 20
-mode = "supervised"
-%s
-
-[subagent]
-max_iterations = 10
-timeout = 300
-
-[subagent.model]
-# model = ""
-# api_key = ""
-# base_url = ""
-
-[pipeline]
-# foreach_concurrency = 4  # max parallel foreach iterations; 0 or 1 = sequential
-
-[pipeline.models.simple]
-# model = ""
-# api_key = ""
-# base_url = ""
-
-[pipeline.models.medium]
-# model = ""
-# api_key = ""
-# base_url = ""
-
-[pipeline.models.complex]
-# model = ""
-# api_key = ""
-# base_url = ""
-
-[router]
-enabled = true
-max_history = 8
-
-[router.router]
-model = "%s"
-
-[router.medium]
-model = "%s"
-
-[router.strong]
-model = "%s"
-
-[summarize]
-enabled = false
-model = "%s"
-threshold = 10
-keep_recent = 4
-
-[bash]
-auto_allow_commands = []
-
-[web_search]
-backend = "%s"
-searxng_url = "%s"
-max_results = 10
-
-[web_fetch]
-backend = "%s"
-jina_api_key = "%s"
-crawl4ai_cmd = "%s"
-max_characters = 15000
-
-[mcp]
-enabled = false
-# Define external MCP servers here
-# [mcp.servers.weather]
-# command = "npx"
-# args = ["-y", "@modelcontextprotocol/server-weather"]
-# env = { API_KEY = "..." }
-
-[security]
-blocked_commands = [
-  "rm -rf /", "rm -rf /*", "mkfs", "dd if=",
-  ":(){ :|:& };:", "> /dev/sda", "chmod -R 777 /", "format c:",
-]
-allowed_roots = []
-forbidden_roots = []
-
-[server]
-host = "127.0.0.1"
-port = 8080
-
-[multimodal]
-# vision = true means the LLM accepts image attachments directly.
-# Set to false if your model is text-only — images will be rejected or converted.
-vision = true
-max_image_bytes = 10485760  # 10 MB
-
-# Converters turn non-image files into plain text before sending to the LLM.
-# {input} is replaced with the source file path; {output} with a managed .md tmp path.
-# Example:
-# [[multimodal.converters]]
-# extensions = ["pdf"]
-# command = "pdftotext {input} {output}"
-#
-# [[multimodal.converters]]
-# extensions = ["docx", "odt"]
-# command = "libreoffice --headless --convert-to txt:Text {input} --outdir {output}"
-`, absWsDir, apiKey, baseURL, model, toolsLine, model, model, getStrongModel(model), model,
-			searchBackend, searxngURL, fetchBackend, jinaKey, pythonCmd)
-
-		if err := os.WriteFile(configPath, []byte(configContent), 0o644); err != nil {
-			return fmt.Errorf("failed to write config.toml: %w", err)
+		content := buildInitConfig(workspace, apiKey, baseURL, model, agentMode, toolsLine,
+			routerEnabled, routerClassifier, routerMedium, routerStrong,
+			searchBackend, searxngURL, tavilyKey, braveKey,
+			fetchBackend, jinaKey, pythonCmd)
+		if err := os.WriteFile(cfgPath, []byte(content), 0o644); err != nil {
+			return fmt.Errorf("failed to write config: %w", err)
 		}
-		fmt.Printf("Created %s\n", configPath)
+		fmt.Printf("Created %s\n", cfgPath)
 	}
 
-	// Generate AGENT.md if not exists (behavioral rules — always injected).
-	agentPath := filepath.Join(absWsDir, "data", "AGENT.md")
-	if _, err := os.Stat(agentPath); os.IsNotExist(err) {
-		agentContent := `# AGENT
+	writeFileMD(filepath.Join(ageageDir, "data", "AGENT.md"), `# AGENT
 
 ## Execution Directives
 
 - Use tools to gather information and perform actions.
-- Call finish_task when the task is complete with a FINAL, complete answer.
+- Call finish_task when done with a final, complete answer.
 - Think step by step for complex tasks.
-- Always provide complete, detailed answers — never say "see above" or "refer to results".
-- Use the memory tool to store and recall important context across sessions.
-- Deploy tools efficiently; avoid unnecessary calls.
-- Stay honest about limitations.
+- Never say "see above" or "refer to results" — always include the full answer.
+- Use memory_store and memory_recall to persist context across sessions.
+- Minimize unnecessary tool calls; batch related reads when possible.
+- Stay honest about limitations and uncertainty.
 - Always respond in the same language the user uses.
-`
-		if err := os.WriteFile(agentPath, []byte(agentContent), 0o644); err != nil {
-			fmt.Printf("⚠️  Warning: could not create %s: %s\n", agentPath, err)
-		} else {
-			fmt.Printf("Created %s\n", agentPath)
-		}
-	}
+`)
 
-	// Generate SOUL.md if not exists (persona — injected in serve/connect, not CLI by default).
-	soulPath := filepath.Join(absWsDir, "data", "SOUL.md")
-	if _, err := os.Stat(soulPath); os.IsNotExist(err) {
-		soulContent := `# SOUL
+	writeFileMD(filepath.Join(ageageDir, "data", "SOUL.md"), `# SOUL
 
 You are a helpful, friendly, and knowledgeable AI assistant.
 
 ## Communication Style
 
 - Match the user's language and tone.
-- Use clear formatting (markdown) when helpful.
+- Use clear markdown formatting when it aids readability.
 - Keep responses focused and avoid unnecessary verbosity.
-`
-		if err := os.WriteFile(soulPath, []byte(soulContent), 0o644); err != nil {
-			fmt.Printf("⚠️  Warning: could not create %s: %s\n", soulPath, err)
-		} else {
-			fmt.Printf("Created %s\n", soulPath)
-		}
-	}
-
-	// Create empty MEMORY.jsonl if not exists.
-	memPath := filepath.Join(absWsDir, "data", "MEMORY.jsonl")
-	if _, err := os.Stat(memPath); os.IsNotExist(err) {
-		if err := os.WriteFile(memPath, []byte(""), 0o644); err != nil {
-			fmt.Printf("⚠️  Warning: could not create %s: %s\n", memPath, err)
-		}
-	}
+`)
 
 	fmt.Println()
-	fmt.Println("  " + strings.Repeat("─", 50))
-	fmt.Println("  ✨  Setup complete!")
+	fmt.Println(strings.Repeat("─", 52))
+	fmt.Println("Setup complete!")
 	fmt.Println()
-	fmt.Printf("  Run:  ageage cli -c %s\n", configPath)
+	fmt.Printf("  CLI mode:     ageage cli -c %s\n", cfgPath)
+	fmt.Printf("  Channel mode: ageage connect -c %s\n", cfgPath)
+	fmt.Printf("  Tool select:  ageage tools -c %s\n", cfgPath)
 	fmt.Println()
-
+	fmt.Println("Other features to configure in config.toml:")
+	fmt.Println("  [summarize]    — auto-compress long conversation history")
+	fmt.Println("  [channels.*]   — Telegram, Discord, Matrix connectors")
+	fmt.Println("  [mcp.servers]  — connect external MCP tool servers")
+	fmt.Println("  [multimodal]   — vision and document converter settings")
+	fmt.Println("  [bash]         — auto-allow commands, env var passthrough")
+	fmt.Println("  [security]     — restrict allowed paths and blocked commands")
+	fmt.Println()
 	return nil
+}
+
+// printInitSection prints a bold section header for the init wizard.
+func printInitSection(title string) {
+	fmt.Println()
+	fmt.Println("── " + title + " " + strings.Repeat("─", max(0, 48-len(title))))
+}
+
+// findEnvAPIKey returns the first API key found in known environment variables.
+func findEnvAPIKey() (key, name string) {
+	for _, n := range []string{"AGEAGE_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "DEEPSEEK_API_KEY", "GEMINI_API_KEY"} {
+		if v := os.Getenv(n); v != "" {
+			return v, n
+		}
+	}
+	return "", ""
+}
+
+// pickModel asks the user for a model, optionally fetching the list from the API.
+func pickModel(reader *bufio.Reader, baseURL, apiKey string) string {
+	suggested := suggestModel(baseURL)
+	fmt.Printf("Model (default: %s; press Enter to fetch list from API): ", suggested)
+	input := readLine(reader, "")
+	if input != "" {
+		return input
+	}
+	// Try fetching the model list.
+	fmt.Print("  Fetching models from API...")
+	models, err := fetchModels(baseURL, apiKey)
+	if err != nil || len(models) == 0 {
+		if err != nil {
+			fmt.Printf(" failed (%s)\n", err)
+		} else {
+			fmt.Println(" no models returned.")
+		}
+		fmt.Printf("  Enter model name (default: %s): ", suggested)
+		return readLine(reader, suggested)
+	}
+	fmt.Printf(" %d found.\n", len(models))
+	const maxShow = 40
+	for i, m := range models {
+		if i >= maxShow {
+			fmt.Printf("  ... and %d more (type name manually)\n", len(models)-maxShow)
+			break
+		}
+		fmt.Printf("  %3d. %s\n", i+1, m)
+	}
+	fmt.Printf("Select (number or name, default: %s): ", suggested)
+	choice := readLine(reader, "")
+	if choice == "" {
+		return suggested
+	}
+	var n int
+	if _, err := fmt.Sscanf(choice, "%d", &n); err == nil && n >= 1 && n <= len(models) {
+		return models[n-1]
+	}
+	return choice
+}
+
+// fetchModels calls the /models endpoint and returns sorted model IDs.
+func fetchModels(baseURL, apiKey string) ([]string, error) {
+	url := strings.TrimRight(baseURL, "/") + "/models"
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	if apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+		req.Header.Set("x-api-key", apiKey) // Anthropic
+	}
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	var result struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+	ids := make([]string, len(result.Data))
+	for i, d := range result.Data {
+		ids[i] = d.ID
+	}
+	sort.Strings(ids)
+	return ids, nil
+}
+
+// parseSearchChoice returns search config fields from the user's choice string.
+func parseSearchChoice(reader *bufio.Reader, choice string) (backend, searxngURL, tavilyKey, braveKey string) {
+	backend = "duckduckgo"
+	switch choice {
+	case "2":
+		backend = "brave"
+		fmt.Print("  Brave Search API Key: ")
+		braveKey = readLine(reader, "")
+	case "3":
+		backend = "tavily"
+		fmt.Print("  Tavily API Key: ")
+		tavilyKey = readLine(reader, "")
+	case "4":
+		backend = "searxng"
+		fmt.Print("  SearXNG instance URL (default: http://localhost:8888): ")
+		searxngURL = readLine(reader, "http://localhost:8888")
+	}
+	return
+}
+
+// parseFetchChoice returns fetch config fields from the user's choice string.
+func parseFetchChoice(reader *bufio.Reader, choice string) (backend, jinaKey, pythonCmd string) {
+	backend = "native"
+	switch choice {
+	case "2":
+		backend = "jina"
+		fmt.Print("  Jina API Key (optional — press Enter to skip): ")
+		jinaKey = readLine(reader, "")
+	case "3":
+		backend = "crawl4ai"
+		pythonCmd = detectPython()
+		if pythonCmd == "" {
+			fmt.Println("  Warning: Python not detected. Crawl4AI will need manual setup.")
+			pythonCmd = "python"
+		} else {
+			fmt.Printf("  Detected Python: %s\n", pythonCmd)
+		}
+	}
+	return
+}
+
+// buildInitConfig builds the config.toml content using a strings.Builder.
+func buildInitConfig(
+	workspace, apiKey, baseURL, model, agentMode, toolsLine string,
+	routerEnabled bool, routerClassifier, routerMedium, routerStrong string,
+	searchBackend, searxngURL, tavilyKey, braveKey string,
+	fetchBackend, jinaKey, pythonCmd string,
+) string {
+	if pythonCmd == "" {
+		pythonCmd = "python"
+	}
+	var b strings.Builder
+	p := func(format string, a ...any) { fmt.Fprintf(&b, format, a...) }
+
+	p("# AgeAge Configuration — generated by ageage init\n\n")
+	p("workspace = %q\n\n", workspace)
+
+	p("[llm]\n")
+	p("api_key     = %q\n", apiKey)
+	p("base_url    = %q\n", baseURL)
+	p("model       = %q\n", model)
+	p("temperature = 0.7\n")
+	p("# max_tokens = 8192\n\n")
+
+	p("[agent]\n")
+	p("max_iterations    = 20\n")
+	p("mode              = %q\n", agentMode)
+	p("%s\n", toolsLine)
+	p("# non_include_tools  = []  # tool names to always exclude\n")
+	p("# max_parallel_tools = 0   # >1 enables parallel tool dispatch within one response\n\n")
+
+	p("[subagent]\n")
+	p("max_iterations = 10\n")
+	p("timeout        = 300\n")
+	p("# [subagent.model]\n")
+	p("# model   = \"\"  # independent model for sub-agents; defaults to [llm].model\n")
+	p("# api_key = \"\"\n\n")
+
+	p("[pipeline]\n")
+	p("# foreach_concurrency = 4  # max parallel foreach iterations; 0 = sequential\n")
+	p("# [pipeline.models.simple]\n# model = \"\"\n")
+	p("# [pipeline.models.medium]\n# model = \"\"\n")
+	p("# [pipeline.models.complex]\n# model = \"\"\n\n")
+
+	if routerEnabled {
+		p("[router]\n")
+		p("# Routes requests to different model tiers by task complexity.\n")
+		p("enabled     = true\n")
+		p("max_history = 8\n\n")
+		p("[router.classifier]\n")
+		p("model = %q  # lightweight model for intent classification\n\n", routerClassifier)
+		p("[router.medium]\n")
+		p("model = %q\n\n", routerMedium)
+		p("[router.strong]\n")
+		p("model = %q\n\n", routerStrong)
+	} else {
+		p("[router]\n")
+		p("# Routes requests to model tiers by task complexity.\n")
+		p("# Set enabled = true and configure the sub-sections below to activate.\n")
+		p("enabled     = false\n")
+		p("# max_history = 8\n")
+		p("# [router.classifier]\n# model = \"gpt-4o-mini\"  # cheap intent classifier\n")
+		p("# [router.medium]\n# model = %q\n", model)
+		p("# [router.strong]\n# model = %q\n\n", getStrongModel(model))
+	}
+
+	p("[summarize]\n")
+	p("# Auto-compress long conversation history to stay within context limits.\n")
+	p("enabled     = false\n")
+	p("# model     = \"\"  # defaults to [llm].model; use a cheaper model to save cost\n")
+	p("threshold   = 10  # compress after this many message pairs\n")
+	p("keep_recent = 4   # keep N most recent messages intact after compression\n\n")
+
+	p("[bash]\n")
+	p("auto_allow_commands = []  # command prefixes that skip supervised confirmation\n")
+	p("# max_output_bytes   = 4194304  # 4 MB cap on combined stdout+stderr\n")
+	p("# passthrough_env_vars = []     # env var names/prefixes forwarded to subprocesses\n\n")
+
+	p("[web_search]\n")
+	p("backend        = %q\n", searchBackend)
+	p("searxng_url    = %q\n", searxngURL)
+	p("tavily_api_key = %q\n", tavilyKey)
+	p("brave_api_key  = %q\n", braveKey)
+	p("max_results    = 10\n")
+	p("# blocked_domains = []\n\n")
+
+	p("[web_fetch]\n")
+	p("backend        = %q\n", fetchBackend)
+	p("jina_api_key   = %q\n", jinaKey)
+	p("crawl4ai_cmd   = %q\n", pythonCmd)
+	p("max_characters = 15000\n\n")
+
+	p("[browser]\n")
+	p("# Browser automation tools (browser_navigate, browser_click, etc.).\n")
+	p("# backend = \"playwright\"  # \"playwright\" or \"agent-browser\"\n")
+	p("# headless    = true\n")
+	p("# browser_type = \"chromium\"  # \"chromium\", \"firefox\", or \"webkit\"\n")
+	p("# timeout     = 30           # seconds per browser action\n\n")
+
+	p("[mcp]\n")
+	p("# Connect external MCP tool servers (launched as subprocesses).\n")
+	p("enabled = false\n")
+	p("# [mcp.servers.example]\n")
+	p("# command = \"npx\"\n")
+	p("# args    = [\"-y\", \"@modelcontextprotocol/server-filesystem\", \"/tmp\"]\n")
+	p("# env     = { API_KEY = \"...\" }\n\n")
+
+	p("[security]\n")
+	p("blocked_commands = [\n")
+	p("  \"rm -rf /\", \"rm -rf /*\", \"mkfs\", \"dd if=\",\n")
+	p("  \":(){ :|:& };:\", \"> /dev/sda\", \"chmod -R 777 /\",\n")
+	p("  \"format c:\", \"del /f /s /q c:\\\\\",\n")
+	p("]\n")
+	p("allowed_roots   = []  # extra roots the agent may access; empty = workspace only\n")
+	p("forbidden_roots = []  # paths the agent can never access regardless of allowed_roots\n\n")
+
+	p("[multimodal]\n")
+	p("vision          = true        # false if your model does not support images\n")
+	p("max_image_bytes = 10485760    # 10 MB\n")
+	p("# [[multimodal.converters]]\n")
+	p("# extensions = [\"pdf\"]\n")
+	p("# command    = \"pdftotext {input} {output}\"\n\n")
+
+	p("[server]\n")
+	p("# HTTP API server (used by: ageage serve)\n")
+	p("host = \"127.0.0.1\"\n")
+	p("port = 8080\n\n")
+
+	p("# ── IM Channel Connectors (ageage connect) ──────────────────────────────────\n")
+	p("# Uncomment and fill in the relevant section to enable a channel.\n")
+	p("#\n")
+	p("# [channels]\n")
+	p("# parallel = false  # true = handle multiple incoming messages concurrently\n")
+	p("#\n")
+	p("# [channels.telegram]\n")
+	p("# enabled       = true\n")
+	p("# bot_token     = \"...\"\n")
+	p("# allowed_users = []  # Telegram user IDs (as strings); empty = allow all\n")
+	p("#\n")
+	p("# [channels.discord]\n")
+	p("# enabled       = true\n")
+	p("# bot_token     = \"...\"\n")
+	p("# channel_ids   = []  # Discord channel IDs to monitor\n")
+	p("# allowed_users = []\n")
+	p("#\n")
+	p("# [channels.matrix]\n")
+	p("# enabled      = true\n")
+	p("# homeserver   = \"https://matrix.org\"\n")
+	p("# user_id      = \"@bot:matrix.org\"\n")
+	p("# access_token = \"...\"\n")
+	p("# room_ids     = []  # rooms to monitor; empty = all joined rooms\n")
+	p("# allowed_users = []\n")
+	p("# auto_thread  = true  # reply in a new thread per conversation\n")
+
+	return b.String()
+}
+
+// writeFileMD writes content to path only if path does not exist yet.
+func writeFileMD(path, content string) {
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		return
+	}
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		fmt.Printf("Warning: could not create %s: %s\n", path, err)
+	} else {
+		fmt.Printf("Created %s\n", path)
+	}
+}
+
+// suggestModel returns a sensible default model for the given API base URL.
+func suggestModel(baseURL string) string {
+	switch {
+	case strings.Contains(baseURL, "anthropic"):
+		return "claude-haiku-4-5"
+	case strings.Contains(baseURL, "deepseek"):
+		return "deepseek-chat"
+	case strings.Contains(baseURL, "generativelanguage") || strings.Contains(baseURL, "gemini"):
+		return "gemini-2.0-flash"
+	case strings.Contains(baseURL, "mistral"):
+		return "mistral-small-latest"
+	case strings.Contains(baseURL, "11434"): // Ollama
+		return "llama3.2"
+	default:
+		return "gpt-4o-mini"
+	}
 }
 
 func readLine(reader *bufio.Reader, defaultVal string) string {
@@ -1142,6 +1356,7 @@ func runConnect(cmd *cobra.Command, args []string) error {
 	watchCtx, watchCancel := context.WithCancel(context.Background())
 	defer watchCancel()
 	go factory.WatchSkills(watchCtx)
+	go agent.NewCronScheduler(factory.CronStore, factory).Run(watchCtx)
 
 	manager, registered := startChannels(factory)
 	if registered == 0 {
@@ -1182,6 +1397,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	watchCtx, watchCancel := context.WithCancel(context.Background())
 	defer watchCancel()
 	go factory.WatchSkills(watchCtx)
+	go agent.NewCronScheduler(factory.CronStore, factory).Run(watchCtx)
 
 	// Start channel connectors in the background.
 	manager, chCount := startChannels(factory)
@@ -1252,6 +1468,7 @@ func runCLI(cmd *cobra.Command, args []string) error {
 	watchCtx, watchCancel := context.WithCancel(context.Background())
 	defer watchCancel()
 	go factory.WatchSkills(watchCtx)
+	go agent.NewCronScheduler(factory.CronStore, factory).Run(watchCtx)
 
 	// ── Session setup ─────────────────────────────────────────────────────────
 	sm := agent.NewSessionManager(factory.Config.AgeAgeDirPath())
@@ -2032,6 +2249,7 @@ func runMCP(cmd *cobra.Command, args []string) error {
 	watchCtx, watchCancel := context.WithCancel(context.Background())
 	defer watchCancel()
 	go factory.WatchSkills(watchCtx)
+	go agent.NewCronScheduler(factory.CronStore, factory).Run(watchCtx)
 
 	mcpSrv := server.NewMCPServer(factory)
 	return mcpSrv.Start()
@@ -2162,7 +2380,9 @@ var knownTools = []toolEntry{
 	{"tree", "Show directory tree", true},
 	{"ask_user", "Ask the user a question", true},
 	{"escalate", "Escalate task to user", true},
-	{"browser_navigate", "Browser automation", true},
+	{"browser_navigate", "Browser navigation", true},
+	{"browser_action", "Browser click/type/scroll actions", true},
+	{"browser_content", "Get browser page content", true},
 	{"update_todos", "Manage todo list", true},
 }
 

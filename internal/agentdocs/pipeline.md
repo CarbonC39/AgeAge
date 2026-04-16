@@ -7,7 +7,7 @@ sub-agents; data flows only through a shared `vars` map.
 
 ## File Format
 
-Pipeline skills are **standalone `.yaml` files** in `skills/` (not markdown).
+Pipeline skills are **standalone `.yaml` files** in `{ageage-dir}/skills/`.
 
 ```yaml
 name: my-pipeline
@@ -37,10 +37,10 @@ pipeline:
 | Syntax | Resolves to |
 |--------|-------------|
 | `$vars.name` or `{{$vars.name}}` | Pipeline variable `name` |
-| `$vars.input` | User's message (always set) |
+| `$vars.input` | User's original message (always set) |
 | `$foreach.current` | Current item in a foreach loop |
 | `$foreach.index` | Zero-based loop index |
-| `$config.workspace` | Workspace directory path |
+| `$config.workspace` | Effective working directory for file ops |
 
 ---
 
@@ -54,23 +54,24 @@ pipeline:
 | `type` | `agent` (default) or `auto` (direct tool call, no LLM) |
 | `foreach` | `$vars.array` — run node once per item |
 | `inputs` | Map of arguments; string values resolved as variable references |
-| `outputs` | Map: pipeline_var ← node output key |
+| `outputs` | Map: `pipeline_var ← node output key` |
 | `validate` | `not_empty` — fail pipeline if any resolved input is empty |
+| `depends_on` | List of node IDs that must complete first |
 
 ### Agent-only
 
 | Field | Description |
 |-------|-------------|
 | `prompt` | Task prompt; supports `{{$vars.x}}` template syntax |
-| `tools` | Tool allowlist; omit for all tools |
-| `complexity` | Model selection override for this node |
-| `no_context` | `true` to suppress CONTEXT.md injection |
+| `tools` | Tool allowlist for this node; omit for all available tools |
+| `complexity` | Model tier override for this node (`simple`/`medium`/`complex`) |
+| `no_context` | `true` to suppress CONTEXT.md injection for this node |
 
 ### Auto-only
 
 | Field | Description |
 |-------|-------------|
-| `tool` | Required. Tool name to call directly (no LLM overhead) |
+| `tool` | Required. Tool name to call directly (no LLM, no iteration overhead) |
 
 ---
 
@@ -86,7 +87,7 @@ Agent nodes use `node_complete` instead of `finish_task`:
 ```
 
 Set `"status": "failure"` with `"reason": "..."` to terminate the pipeline early.
-If an agent hits max_iterations without calling node_complete, its last message
+If an agent hits `max_iterations` without calling `node_complete`, its last message
 becomes `vars.result`.
 
 ---
@@ -135,7 +136,7 @@ pipeline:
     type: auto
     tool: web_fetch
     inputs: { url: $foreach.current }
-    outputs: { pages: result }   # collects into an array
+    outputs: { pages: result }   # foreach collects results into an array
 ```
 
 ---

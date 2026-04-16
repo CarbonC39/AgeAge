@@ -531,6 +531,7 @@ func (e *PipelineExecutor) runAgentNodeAttempt(
 	default:
 		// Agent returned without calling node_complete (direct answer or max
 		// iterations reached). Fall back: treat text as "result".
+		e.debugf("Warn", "%s  node_complete not called — falling back to last text output", node.ID)
 		fallback := runResult
 		if fallback == "" {
 			for i := len(subAgent.messages) - 1; i >= 0; i-- {

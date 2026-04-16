@@ -135,7 +135,7 @@ func NewFactory(configPath string, debug bool) (*AgentFactory, error) {
 	clientLLM := llm.NewClient(cfg.LLM.APIKey, cfg.LLM.BaseURL, cfg.LLM.Model, debug, cfg.LLM.MaxTokens)
 
 	sec := security.NewChecker(
-		cfg.Workspace,
+		cfg.EffectiveWorkDir(),
 		cfg.Security.BlockedCommands,
 		cfg.Security.AllowedRoots,
 		cfg.Security.ForbiddenRoots,
@@ -149,7 +149,7 @@ func NewFactory(configPath string, debug bool) (*AgentFactory, error) {
 	}
 
 	// Initialize cron store.
-	cronPath := filepath.Join(cfg.Workspace, "data", "cron.json")
+	cronPath := filepath.Join(cfg.ConfigDir(), "data", "cron.json")
 	cronStore := tools.NewCronStore(cronPath)
 
 	// Check if memories exist (once at startup).

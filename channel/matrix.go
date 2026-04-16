@@ -42,13 +42,15 @@ func NewMatrix(homeserver, userID, accessToken string, roomIDs []string, allowed
 }
 
 // isAllowedUser returns true when AllowedUsers is empty (allow all) or the
-// given userID is present in the whitelist.
+// given userID matches an AllowedUsers entry.
+// Matching trims surrounding whitespace from configured entries.
+// Matrix user IDs are always fully-qualified (@user:homeserver) and case-sensitive.
 func (m *MatrixChannel) isAllowedUser(userID string) bool {
 	if len(m.AllowedUsers) == 0 {
 		return true
 	}
 	for _, id := range m.AllowedUsers {
-		if id == userID {
+		if strings.TrimSpace(id) == userID {
 			return true
 		}
 	}

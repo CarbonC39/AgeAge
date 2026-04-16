@@ -46,15 +46,24 @@ func NewDiscord(botToken string, channelIDs []string, allowedUsers []string, opt
 	}
 }
 
-// isAllowedUser returns true when AllowedUsers is empty (allow all) or the
-// given userID is present in the whitelist.
-func (d *DiscordChannel) isAllowedUser(userID string) bool {
+// isAllowedUser returns true when AllowedUsers is empty (allow all) or any of
+// the given candidates matches an AllowedUsers entry.
+// Candidates are tried in order: typically (snowflakeID, username).
+// Matching trims surrounding whitespace; username comparison is case-insensitive.
+func (d *DiscordChannel) isAllowedUser(candidates ...string) bool {
 	if len(d.AllowedUsers) == 0 {
 		return true
 	}
-	for _, id := range d.AllowedUsers {
-		if id == userID {
-			return true
+	for _, entry := range d.AllowedUsers {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		for _, c := range candidates {
+			c = strings.TrimSpace(c)
+			if c != "" && strings.EqualFold(entry, c) {
+				return true
+			}
 		}
 	}
 	return false
@@ -259,10 +268,11 @@ func (d *DiscordChannel) Unreact(channelID, reactionKey string) error {
 // --- Discord API types ---
 
 type discordMessage struct {
-	ID        string      `json:"id"`
-	Content   string      `json:"content"`
-	Author    discordUser `json:"author"`
-	ChannelID string      `json:"channel_id"`
+	ID                string          `json:"id"`
+	Content           string          `json:"content"`
+	Author            discordUser     `json:"author"`
+	ChannelID         string          `json:"channel_id"`
+	ReferencedMessage *discordMessage `json:"referenced_message"` // Non-nil when this is a reply
 }
 
 type discordUser struct {
@@ -409,18 +419,28 @@ func (d *DiscordChannel) pollChannel(channelID string, handler MessageHandler) {
 			continue
 		}
 
-		if !d.isAllowedUser(msg.Author.ID) {
+		if !d.isAllowedUser(msg.Author.ID, msg.Author.Username) {
 			continue
 		}
 
-		// Detect @mention: "<@botUserID>" appears in message content.
+		// Detect whether this message is directed at the bot:
+		//   1. <@botID>  — standard Discord mention
+		//   2. <@!botID> — nickname mention (deprecated since 2022 but still seen in some clients)
+		//   3. Reply to bot — the referenced_message was authored by the bot
 		mentionTag := fmt.Sprintf("<@%s>", botID)
-		botMentioned := strings.Contains(msg.Content, mentionTag)
+		nickMentionTag := fmt.Sprintf("<@!%s>", botID)
+		hasMention := strings.Contains(msg.Content, mentionTag) ||
+			strings.Contains(msg.Content, nickMentionTag)
+		isReplyToBot := msg.ReferencedMessage != nil &&
+			botID != "" &&
+			msg.ReferencedMessage.Author.ID == botID
+		botMentioned := hasMention || isReplyToBot
 
-		// Strip the mention from the content.
+		// Strip explicit mention tags from the content (not applicable for reply-to-bot).
 		content := msg.Content
-		if botMentioned {
+		if hasMention {
 			content = strings.ReplaceAll(content, mentionTag, "")
+			content = strings.ReplaceAll(content, nickMentionTag, "")
 			content = strings.TrimSpace(content)
 		}
 

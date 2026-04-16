@@ -41,15 +41,27 @@ func NewTelegram(botToken string, allowedUsers []string, opts ChannelOptions) *T
 	}
 }
 
-// isAllowedUser returns true when AllowedUsers is empty (allow all) or the
-// given userID is present in the whitelist.
-func (t *TelegramChannel) isAllowedUser(userID string) bool {
+// isAllowedUser returns true when AllowedUsers is empty (allow all) or any of
+// the given candidates matches an AllowedUsers entry.
+// Candidates are tried in order: typically (numericID, username).
+// Matching is normalised: leading/trailing spaces and a leading "@" are stripped
+// before comparison so both "123456789" and "@johndoe" or "johndoe" work.
+func (t *TelegramChannel) isAllowedUser(candidates ...string) bool {
 	if len(t.AllowedUsers) == 0 {
 		return true
 	}
-	for _, id := range t.AllowedUsers {
-		if id == userID {
-			return true
+	normalize := func(s string) string {
+		return strings.TrimPrefix(strings.TrimSpace(s), "@")
+	}
+	for _, entry := range t.AllowedUsers {
+		entry = normalize(entry)
+		if entry == "" {
+			continue
+		}
+		for _, c := range candidates {
+			if normalize(c) == entry {
+				return true
+			}
 		}
 	}
 	return false
@@ -98,7 +110,7 @@ func (t *TelegramChannel) Start(handler MessageHandler) error {
 				t.answerCallbackQuery(cq.ID)
 				if t.AnswerCallback != nil && cq.Message != nil {
 					senderID := fmt.Sprintf("%d", cq.From.ID)
-					if t.isAllowedUser(senderID) {
+					if t.isAllowedUser(senderID, cq.From.Username) {
 						chatID := fmt.Sprintf("%d", cq.Message.Chat.ID)
 						t.AnswerCallback(chatID, cq.Data)
 					}
@@ -125,25 +137,31 @@ func (t *TelegramChannel) Start(handler MessageHandler) error {
 
 			isGroup := update.Message.Chat.Type != "private"
 			senderID := fmt.Sprintf("%d", update.Message.From.ID)
+			username := update.Message.From.Username
 
 			// Security: deny all group messages when no allowlist is configured.
 			if isGroup && len(t.AllowedUsers) == 0 {
 				continue
 			}
 
-			if !t.isAllowedUser(senderID) {
+			if !t.isAllowedUser(senderID, username) {
 				continue
 			}
 
-			// Detect @mention: text contains "@botUsername".
-			// Supergroup topic messages (threadID != 0) are only delivered to the bot
-			// when it is @mentioned (Telegram privacy mode), so treat them as mentioned.
+			// Detect whether this message is directed at the bot:
+			//   1. @mention — text contains "@botUsername"
+			//   2. Reply to bot — the replied-to message was sent by the bot
+			//   3. Supergroup topic thread — Telegram only delivers topic messages to bots
+			//      that are members of the topic (treated as implicitly directed)
 			mentionTag := "@" + t.botUsername
-			botMentioned := (t.botUsername != "" && strings.Contains(text, mentionTag)) ||
-				update.Message.MessageThreadID != 0
+			hasMention := t.botUsername != "" && strings.Contains(text, mentionTag)
+			isReplyToBot := update.Message.ReplyToMessage != nil &&
+				t.botID != 0 &&
+				update.Message.ReplyToMessage.From.ID == t.botID
+			botMentioned := hasMention || isReplyToBot || update.Message.MessageThreadID != 0
 
-			// Strip the @mention from the text.
-			if botMentioned && t.botUsername != "" {
+			// Strip the @mention text only when an explicit @mention is present.
+			if hasMention {
 				text = strings.ReplaceAll(text, mentionTag, "")
 				text = strings.TrimSpace(text)
 			}
@@ -334,12 +352,13 @@ type tgInlineButton struct {
 }
 
 type tgMessage struct {
-	MessageID       int    `json:"message_id"`
-	Text            string `json:"text"`
-	Caption         string `json:"caption"` // Text for photo/document/voice messages
-	Chat            tgChat `json:"chat"`
-	From            tgUser `json:"from"`
-	MessageThreadID int    `json:"message_thread_id"` // Supergroup topic ID; 0 if none
+	MessageID       int        `json:"message_id"`
+	Text            string     `json:"text"`
+	Caption         string     `json:"caption"`          // Text for photo/document/voice messages
+	Chat            tgChat     `json:"chat"`
+	From            tgUser     `json:"from"`
+	MessageThreadID int        `json:"message_thread_id"` // Supergroup topic ID; 0 if none
+	ReplyToMessage  *tgMessage `json:"reply_to_message"`  // Non-nil when this is a reply
 }
 
 type tgChat struct {

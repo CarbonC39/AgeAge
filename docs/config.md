@@ -499,6 +499,19 @@ parallel = false
 |------------|------|---------|-------------|
 | `parallel` | bool | `false` | Process messages from all users concurrently. When `false`, messages are queued per chat. |
 
+### Group chat behaviour
+
+AgeAge distinguishes **group chats** (multiple users in one room) from **direct messages** (private 1-on-1 chat with the bot). The rules differ to avoid spamming group rooms and to prevent unauthorised access:
+
+| Scenario | Bot responds when | Session scope |
+|----------|------------------|---------------|
+| **DM / private chat** | Always (for any whitelisted user) | Per room (each DM is already unique per user) |
+| **Group room** | Only when @mentioned or replied to | Per room (all users share one context) |
+
+In group chats the entire room shares a single session. If a user wants a private conversation with the bot, they should start a DM. Multiple users talking in the same room will see each other's messages in the shared history; the bot labels each message with the sender's ID so it can track who said what.
+
+> **`allowed_users` in group chats:** If `allowed_users` is left empty in a group room, all messages from that room are **denied** and a warning is printed at startup. This is a safety default — an unconfigured bot in a public room should not respond to strangers. In DMs, an empty `allowed_users` still means "allow everyone" (personal assistant pattern). **Always configure `allowed_users` before adding the bot to a group.**
+
 ### Channel UX features
 
 All IM channels share these UX behaviours when the platform supports them:
@@ -510,6 +523,7 @@ All IM channels share these UX behaviours when the platform supports them:
 | ❌ reaction on error | ✅ | ✅ | ✅ |
 | Read receipts | — | — | ✅ |
 | Thread sessions | Topics (supergroups) | — | ✅ |
+| @mention required in groups | ✅ | ✅ | ✅ |
 
 ### In-chat commands
 
@@ -520,6 +534,8 @@ These commands are handled directly in the channel handler and never routed thro
 | `/clear` | Clear conversation history for the current session (session stays). |
 | `/stop` | Abort the running agent task. |
 | `/summarize` | Compress conversation history into a summary. |
+| `/undo` | Remove the last turn from history. |
+| `/retry [text]` | Re-run the last message, optionally with additional text appended. |
 | `/sessions` | List all sessions for this room/chat, newest first. Matrix sessions include a `matrix.to` link to jump to the thread. |
 | `/session list\|ls` | List sessions scoped to this chat. |
 | `/session new\|n [name]` | Create a new session and switch to it. On Matrix top-level messages, the bot's reply starts a thread — continue in that thread to stay in the session. |
@@ -530,7 +546,7 @@ These commands are handled directly in the channel handler and never routed thro
 | `/cred reload` | Hot-reload credentials from disk (after CLI edits). |
 | `/help` | Show available commands. |
 
-> **Session scope:** In channel mode each chat (room/channel/DM) has its own session namespace. A session named `research` in one Telegram chat is independent from `research` in another. Matrix threads each get their own isolated session that resumes automatically after a restart.
+> **Session scope:** Each room/channel/DM has its own session namespace. A session named `research` in one Telegram chat is independent from `research` in another. Matrix threads each get their own isolated session that resumes automatically after a restart.
 
 ### `[channels.telegram]`
 
@@ -538,16 +554,18 @@ These commands are handled directly in the channel handler and never routed thro
 [channels.telegram]
 enabled       = true
 bot_token     = "123456:ABC-..."
-allowed_users = []   # Telegram user IDs; empty = allow all
+allowed_users = ["123456789", "987654321"]  # Telegram numeric user IDs
 ```
 
 | Key             | Type        | Default | Description |
 |-----------------|-------------|---------|-------------|
 | `enabled`       | bool        | `false` | Enable Telegram connector. |
 | `bot_token`     | string      | `""`    | Bot token from @BotFather. |
-| `allowed_users` | string list | `[]`    | Telegram user IDs that may interact. Empty = allow everyone. |
+| `allowed_users` | string list | `[]`    | Telegram numeric user IDs that may interact. Empty = allow all in DMs, deny all in groups (see note above). |
 
-Supergroup topics are supported: messages in a topic thread are treated as a separate session from the general chat.
+Supergroup topics are supported: messages in a topic thread are treated as a separate session. In groups, the bot only responds when @mentioned (e.g. `@YourBot do this`) or when Privacy Mode delivers a message (bot must be admin or Privacy Mode must be disabled for the bot to receive all messages).
+
+**Finding your Telegram user ID:** Forward any message from your account to [@userinfobot](https://t.me/userinfobot) and it will reply with your numeric ID.
 
 ### `[channels.discord]`
 
@@ -556,40 +574,46 @@ Supergroup topics are supported: messages in a topic thread are treated as a sep
 enabled       = true
 bot_token     = "your-discord-bot-token"
 channel_ids   = ["123456789012345678"]
-allowed_users = []
+allowed_users = ["111222333444555666"]  # Discord user IDs (snowflakes)
 ```
 
 | Key             | Type        | Default | Description |
 |-----------------|-------------|---------|-------------|
 | `enabled`       | bool        | `false` | Enable Discord connector. |
-| `bot_token`     | string      | `""`    | Bot token from the Discord developer portal. |
+| `bot_token`     | string      | `""`    | Bot token from the [Discord developer portal](https://discord.com/developers/applications). |
 | `channel_ids`   | string list | `[]`    | Channel IDs to monitor. Required — the bot ignores all other channels. |
-| `allowed_users` | string list | `[]`    | Discord user IDs that may interact. Empty = allow everyone. |
+| `allowed_users` | string list | `[]`    | Discord user IDs (snowflakes) that may interact. Empty = allow all in DMs, deny all in guild channels. |
 
-The bot polls each configured channel every 2 seconds for new messages (REST API, no WebSocket gateway required).
+The bot polls each configured channel every 2 seconds for new messages (REST API — no WebSocket gateway or privileged intents required). In guild channels the bot only responds when `<@BotID>` appears in the message content.
+
+**Finding Discord user IDs:** Enable Developer Mode in Discord (Settings → Advanced), then right-click any user and choose "Copy User ID".
 
 ### `[channels.matrix]`
 
 ```toml
 [channels.matrix]
-enabled      = true
-homeserver   = "https://matrix.org"
-user_id      = "@bot:matrix.org"
-access_token = "syt_..."
-room_ids     = ["!roomid:matrix.org"]
-allowed_users = []
+enabled       = true
+homeserver    = "https://matrix.org"
+user_id       = "@bot:matrix.org"
+access_token  = "syt_..."
+room_ids      = ["!roomid:matrix.org"]
+allowed_users = ["@alice:matrix.org", "@bob:matrix.org"]
 ```
 
 | Key             | Type        | Default | Description |
 |-----------------|-------------|---------|-------------|
 | `enabled`       | bool        | `false` | Enable Matrix connector. |
-| `homeserver`    | string      | `""`    | Full URL of the Matrix homeserver. |
-| `user_id`       | string      | `""`    | Full Matrix user ID of the bot account. |
-| `access_token`  | string      | `""`    | Access token for the bot account. |
-| `room_ids`      | string list | `[]`    | Room IDs to join and monitor. |
-| `allowed_users` | string list | `[]`    | Matrix user IDs that may interact. Empty = allow everyone. |
+| `homeserver`    | string      | `""`    | Full URL of the Matrix homeserver (e.g. `https://matrix.org`). |
+| `user_id`       | string      | `""`    | Full Matrix user ID of the bot account (e.g. `@bot:matrix.org`). |
+| `access_token`  | string      | `""`    | Access token for the bot account. Generate one in Element → Settings → Help & About → Access Token. |
+| `room_ids`      | string list | `[]`    | Room IDs to join and monitor. Leave empty to monitor all joined rooms. |
+| `allowed_users` | string list | `[]`    | Full Matrix user IDs that may interact. Empty = allow all in DMs (2-member rooms), deny all in group rooms. |
 
-**Thread sessions:** When a message arrives inside a Matrix thread (`m.thread`), it is automatically routed to a thread-specific session. The session ID is derived deterministically from the thread's root event ID, so history is correctly resumed after a bot restart. Use `/session new` from a top-level message to have the bot create a thread and start a fresh session inside it.
+**Getting an access token:** In Element Web, go to Settings → Help & About → scroll to the bottom → click "Access Token". Alternatively, use the Matrix login API.
+
+**Thread sessions:** When a message arrives inside a Matrix thread (`m.thread`), it is automatically routed to a thread-specific session — independent from other threads in the same room. The session ID is derived from the thread's root event ID so history resumes correctly after a restart. In group rooms the bot only responds when its user ID (`@bot:matrix.org`) appears in the message body.
+
+Use `/session new` from a top-level message to have the bot create a thread and start a fresh named session inside it.
 
 ---
 

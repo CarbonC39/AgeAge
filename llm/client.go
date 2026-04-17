@@ -381,6 +381,32 @@ func (c *Client) ChatCompletion(ctx context.Context, messages []Message, tools [
 	return c.chatCompletion(ctx, messages, tools, temperature, nil)
 }
 
+// prettyJSON attempts to indent JSON for debug readability.
+// Falls back to the raw string if the input is not valid JSON.
+func prettyJSON(data []byte) string {
+	var buf bytes.Buffer
+	if err := json.Indent(&buf, data, "", "  "); err != nil {
+		return string(data)
+	}
+	return buf.String()
+}
+
+// isRetryableError reports whether the HTTP status + body combination is a
+// transient error worth retrying (provider degraded, rate-limited, or 5xx).
+func isRetryableError(statusCode int, body []byte) bool {
+	if statusCode == http.StatusTooManyRequests {
+		return true
+	}
+	if statusCode >= 500 {
+		return true
+	}
+	// "DEGRADED function cannot be invoked" — transient provider endpoint failure.
+	if statusCode == http.StatusBadRequest && strings.Contains(string(body), "DEGRADED") {
+		return true
+	}
+	return false
+}
+
 func (c *Client) chatCompletion(ctx context.Context, messages []Message, tools []ToolDef, temperature float64, respFmt *ResponseFormat) (*ChatResponse, error) {
 	req := ChatRequest{
 		Model:          c.model,
@@ -392,39 +418,65 @@ func (c *Client) chatCompletion(ctx context.Context, messages []Message, tools [
 		ResponseFormat: respFmt,
 	}
 
-	body, err := json.Marshal(req)
+	bodyBytes, err := json.Marshal(req)
 	if err != nil {
 		return nil, fmt.Errorf("marshal request: %w", err)
 	}
 
 	if c.debug {
-		fmt.Printf("[DEBUG] LLM Request: %s\n", string(body))
+		fmt.Printf("[DEBUG] LLM Request:\n%s\n", prettyJSON(bodyBytes))
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+"/chat/completions", bytes.NewReader(body))
-	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
+	const maxAttempts = 3
+	var data []byte
+	var statusCode int
 
-	resp, err := c.http.Do(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("send request: %w", err)
-	}
-	defer resp.Body.Close()
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 {
+			delay := time.Duration(1<<uint(attempt-1)) * time.Second // 1 s, 2 s
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(delay):
+			}
+			if c.debug {
+				fmt.Printf("[DEBUG] LLM retry %d/%d after HTTP %d\n", attempt+1, maxAttempts, statusCode)
+			}
+		}
 
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("read response: %w", err)
+		httpReq, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+"/chat/completions", bytes.NewReader(bodyBytes))
+		if err != nil {
+			return nil, fmt.Errorf("create request: %w", err)
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+		httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
+
+		resp, err := c.http.Do(httpReq)
+		if err != nil {
+			return nil, fmt.Errorf("send request: %w", err)
+		}
+		data, err = io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			return nil, fmt.Errorf("read response: %w", err)
+		}
+		statusCode = resp.StatusCode
+
+		if c.debug {
+			fmt.Printf("[DEBUG] LLM Response (%d):\n%s\n", statusCode, prettyJSON(data))
+		}
+
+		if statusCode == http.StatusOK {
+			break
+		}
+		if isRetryableError(statusCode, data) && attempt < maxAttempts-1 {
+			continue
+		}
+		break
 	}
 
-	if c.debug {
-		fmt.Printf("[DEBUG] LLM Response (%d): %s\n", resp.StatusCode, string(data))
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("LLM API error (HTTP %d): %s", resp.StatusCode, string(data))
+	if statusCode != http.StatusOK {
+		return nil, fmt.Errorf("LLM API error (HTTP %d): %s", statusCode, string(data))
 	}
 
 	// Token optimization: some models output <thought> tags even in json_object mode.
@@ -522,32 +574,56 @@ func (c *Client) ChatCompletionStream(ctx context.Context, messages []Message, t
 		Stream:      true,
 	}
 
-	body, err := json.Marshal(req)
+	bodyBytes, err := json.Marshal(req)
 	if err != nil {
 		return nil, nil, fmt.Errorf("marshal request: %w", err)
 	}
 
 	if c.debug {
-		fmt.Printf("[DEBUG] LLM Stream Request: %s\n", string(body))
+		fmt.Printf("[DEBUG] LLM Stream Request:\n%s\n", prettyJSON(bodyBytes))
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+"/chat/completions", bytes.NewReader(body))
-	if err != nil {
-		return nil, nil, fmt.Errorf("create request: %w", err)
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
+	const maxAttempts = 3
+	var resp *http.Response
+	var statusCode int
 
-	resp, err := c.http.Do(httpReq)
-	if err != nil {
-		return nil, nil, fmt.Errorf("send request: %w", err)
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 {
+			delay := time.Duration(1<<uint(attempt-1)) * time.Second
+			select {
+			case <-ctx.Done():
+				return nil, nil, ctx.Err()
+			case <-time.After(delay):
+			}
+			if c.debug {
+				fmt.Printf("[DEBUG] LLM stream retry %d/%d after HTTP %d\n", attempt+1, maxAttempts, statusCode)
+			}
+		}
+
+		httpReq, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+"/chat/completions", bytes.NewReader(bodyBytes))
+		if err != nil {
+			return nil, nil, fmt.Errorf("create request: %w", err)
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+		httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
+
+		resp, err = c.http.Do(httpReq)
+		if err != nil {
+			return nil, nil, fmt.Errorf("send request: %w", err)
+		}
+		statusCode = resp.StatusCode
+
+		if statusCode == http.StatusOK {
+			break
+		}
+		errBody, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if isRetryableError(statusCode, errBody) && attempt < maxAttempts-1 {
+			continue
+		}
+		return nil, nil, fmt.Errorf("LLM API error (HTTP %d): %s", statusCode, string(errBody))
 	}
 	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		data, _ := io.ReadAll(resp.Body)
-		return nil, nil, fmt.Errorf("LLM API error (HTTP %d): %s", resp.StatusCode, string(data))
-	}
 
 	// Parse SSE stream.
 	result := &Message{Role: "assistant"}

@@ -1260,9 +1260,11 @@ func startChannels(factory *agent.AgentFactory) (*channel.Manager, int) {
 		if retryText != "" {
 			runText = retryText
 		}
-		// In group chats, label the sender so the agent can distinguish participants.
+		// In group chats, prefix with a clean sender name so the agent can
+		// distinguish participants. DMs are unlabelled (single user).
 		if msg.IsGroupChat && msg.SenderID != "" && retryText == "" {
-			runText = fmt.Sprintf("[%s (%s)]: %s", msg.SenderID, msg.SenderName, runText)
+			displayName := senderDisplayName(msg.ChannelType, msg.SenderID, msg.SenderName)
+			runText = fmt.Sprintf("[%s]: %s", displayName, runText)
 		}
 		var result string
 		var err error
@@ -2125,6 +2127,29 @@ func handleCredChanCmd(_ channel.IncomingMessage, mgr *creds.Manager, rawInput s
 
 // fmtAge returns a short human-readable description of how long ago t was.
 // Used in session listings (e.g. "2h ago", "3d ago", "just now").
+// senderDisplayName returns a clean, platform-neutral label for a group chat
+// sender. Platform-specific identifiers (Matrix homeservers, @ sigils, numeric
+// Discord snowflakes, etc.) are stripped so the agent sees a short human name.
+func senderDisplayName(channelType, senderID, senderName string) string {
+	switch channelType {
+	case "matrix":
+		// @localpart:homeserver.org → localpart
+		if strings.HasPrefix(senderID, "@") {
+			if i := strings.Index(senderID, ":"); i > 1 {
+				return senderID[1:i]
+			}
+			return senderID[1:]
+		}
+	}
+	// For all other platforms: prefer the human-readable display name,
+	// strip a leading @ that some platforms include in usernames.
+	name := strings.TrimPrefix(senderName, "@")
+	if name != "" {
+		return name
+	}
+	return senderID
+}
+
 func fmtAge(t time.Time) string {
 	if t.IsZero() {
 		return "—"

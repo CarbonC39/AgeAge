@@ -21,9 +21,11 @@ type MatrixChannel struct {
 	Options      ChannelOptions
 	client       *http.Client
 	stopCh       chan struct{}
-	since        string          // Sync token for /sync
-	groupRooms   map[string]bool // roomID → true if multi-user (group), false if DM
-	mu           sync.Mutex
+	since         string              // Sync token for /sync
+	groupRooms    map[string]bool     // roomID → true if multi-user (group), false if DM
+	directMap     map[string][]string // peerID → []roomID
+	directFetched time.Time
+	mu            sync.RWMutex
 }
 
 // NewMatrix creates a new Matrix channel.
@@ -60,11 +62,17 @@ func (m *MatrixChannel) isAllowedUser(userID string) bool {
 func (m *MatrixChannel) Name() string { return "matrix" }
 
 // isGroupRoom reports whether roomID is a multi-user room (not a DM).
-// Defaults to true (group) for rooms whose member count is unknown.
 func (m *MatrixChannel) isGroupRoom(roomID string) bool {
+	m.mu.RLock()
 	isGroup, ok := m.groupRooms[roomID]
+	m.mu.RUnlock()
+
 	if !ok {
-		return true // unknown rooms are treated as group for safety
+		// Lazily determine if it's a DM.
+		isGroup = !m.isRoomDM(roomID)
+		m.mu.Lock()
+		m.groupRooms[roomID] = isGroup
+		m.mu.Unlock()
 	}
 	return isGroup
 }
@@ -86,29 +94,100 @@ func (m *MatrixChannel) getRoomMemberCount(roomID string) (int, error) {
 }
 
 // isRoomDM returns true when roomID is a 1-on-1 direct message room.
-//
-// Detection strategy (in order):
-//  1. Authoritative: check the is_direct flag on the bot's own m.room.member
-//     state event. Matrix clients set this when the room was created as a DM,
-//     so it is unaffected by bridge bots or other service accounts.
-//  2. Fallback: count joined members; ≤ 2 (bot + one user) means DM.
 func (m *MatrixChannel) isRoomDM(roomID string) bool {
-	// Primary: bot's member state carries is_direct=true for DM rooms.
-	path := fmt.Sprintf("/_matrix/client/v3/rooms/%s/state/m.room.member/%s", roomID, m.UserID)
-	if body, err := m.doRequest("GET", path, nil); err == nil {
-		var content struct {
-			IsDirect bool `json:"is_direct"`
-		}
-		if json.Unmarshal(body, &content) == nil && content.IsDirect {
-			return true
+	// Primary: check cached m.direct account data.
+	directMap := m.getDirectMap()
+	for _, rooms := range directMap {
+		for _, r := range rooms {
+			if r == roomID {
+				return true
+			}
 		}
 	}
+
 	// Fallback: exactly 2 joined members → DM (bot + 1 user).
 	count, err := m.getRoomMemberCount(roomID)
 	if err != nil {
 		return false // indeterminate → treat as group for safety
 	}
 	return count <= 2
+}
+
+func (m *MatrixChannel) getDirectMap() map[string][]string {
+	m.mu.RLock()
+	if m.directMap != nil && time.Since(m.directFetched) < 1*time.Minute {
+		defer m.mu.RUnlock()
+		return m.directMap
+	}
+	m.mu.RUnlock()
+
+	path := fmt.Sprintf("/_matrix/client/v3/user/%s/account_data/m.direct", m.UserID)
+	body, err := m.doRequest("GET", path, nil)
+	if err != nil {
+		return nil
+	}
+
+	var directMap map[string][]string
+	if err := json.Unmarshal(body, &directMap); err != nil {
+		return nil
+	}
+
+	m.mu.Lock()
+	m.directMap = directMap
+	m.directFetched = time.Now()
+	m.mu.Unlock()
+
+	return directMap
+}
+
+// parseInviteIsDirect extracts is_direct and the inviter's user ID from an
+// invited room's sync data. Returns (true, senderID) when the room is a DM.
+func (m *MatrixChannel) parseInviteIsDirect(inviteData json.RawMessage) (bool, string) {
+	var invite struct {
+		InviteState struct {
+			Events []struct {
+				Type     string `json:"type"`
+				StateKey string `json:"state_key"`
+				Sender   string `json:"sender"`
+				Content  struct {
+					IsDirect bool `json:"is_direct"`
+				} `json:"content"`
+			} `json:"events"`
+		} `json:"invite_state"`
+	}
+	if err := json.Unmarshal(inviteData, &invite); err != nil {
+		return false, ""
+	}
+	for _, ev := range invite.InviteState.Events {
+		if ev.Type == "m.room.member" && ev.StateKey == m.UserID && ev.Content.IsDirect {
+			return true, ev.Sender
+		}
+	}
+	return false, ""
+}
+
+// updateDirectRooms records roomID in the bot's m.direct account data under
+// peerID so that isRoomDM can find it on subsequent starts.
+func (m *MatrixChannel) updateDirectRooms(peerID, roomID string) {
+	path := fmt.Sprintf("/_matrix/client/v3/user/%s/account_data/m.direct", m.UserID)
+
+	// Fetch current map (ignore error — may not exist yet).
+	var directMap map[string][]string
+	if body, err := m.doRequest("GET", path, nil); err == nil {
+		json.Unmarshal(body, &directMap) //nolint:errcheck
+	}
+	if directMap == nil {
+		directMap = make(map[string][]string)
+	}
+
+	// Append roomID if not already tracked under peerID.
+	for _, r := range directMap[peerID] {
+		if r == roomID {
+			return
+		}
+	}
+	directMap[peerID] = append(directMap[peerID], roomID)
+	m.doRequest("PUT", path, directMap) //nolint:errcheck
 }
 
 // Start begins listening for Matrix events via long-polling /sync.
@@ -119,7 +198,10 @@ func (m *MatrixChannel) Start(handler MessageHandler) error {
 
 	for _, roomID := range m.RoomIDs {
 		m.joinRoom(roomID)
-		m.groupRooms[roomID] = !m.isRoomDM(roomID)
+		isDM := m.isRoomDM(roomID)
+		m.mu.Lock()
+		m.groupRooms[roomID] = !isDM
+		m.mu.Unlock()
 	}
 
 	roomSet := make(map[string]bool, len(m.RoomIDs))
@@ -135,11 +217,26 @@ func (m *MatrixChannel) Start(handler MessageHandler) error {
 			return nil
 		default:
 		}
-		if _, err := m.doSync(); err != nil {
+		syncResp, err := m.doSync()
+		if err != nil {
 			fmt.Printf("[Matrix] Initial sync error: %s — retrying\n", err)
 			time.Sleep(5 * time.Second)
 			continue
 		}
+
+		// Discovery: Identify DMs from the initial sync state.
+		for roomID := range syncResp.Rooms.Join {
+			m.mu.RLock()
+			_, ok := m.groupRooms[roomID]
+			m.mu.RUnlock()
+			if !ok {
+				isDM := m.isRoomDM(roomID)
+				m.mu.Lock()
+				m.groupRooms[roomID] = !isDM
+				m.mu.Unlock()
+			}
+		}
+
 		fmt.Println("[Matrix] Skipped historical messages")
 		break
 	}
@@ -255,10 +352,22 @@ func (m *MatrixChannel) Start(handler MessageHandler) error {
 			}
 		}
 
-		for roomID := range syncResp.Rooms.Invite {
-			fmt.Printf("[Matrix] Auto-joining invited room: %s\n", roomID)
+		for roomID, inviteData := range syncResp.Rooms.Invite {
+			isDirect, peerID := m.parseInviteIsDirect(inviteData)
+			fmt.Printf("[Matrix] Auto-joining invited room: %s (DM: %v)\n", roomID, isDirect)
 			m.joinRoom(roomID)
-			m.groupRooms[roomID] = !m.isRoomDM(roomID)
+			m.mu.Lock()
+			if isDirect {
+				m.groupRooms[roomID] = false
+				m.mu.Unlock()
+				if peerID != "" {
+					go m.updateDirectRooms(peerID, roomID)
+				}
+			} else {
+				isDM := m.isRoomDM(roomID)
+				m.groupRooms[roomID] = !isDM
+				m.mu.Unlock()
+			}
 		}
 	}
 }

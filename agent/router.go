@@ -80,7 +80,9 @@ func (r *Router) buildRouterPrompt(availableTools []string) string {
 	var sb strings.Builder
 
 	// ── 1. Fixed header ───────────────────────────────────────────────────────
-	sb.WriteString("[SYSTEM: TASK EVALUATION PROTOCOL]\nAnalyze the request and return ONLY JSON.\n")
+	sb.WriteString("[SYSTEM: TASK EVALUATION PROTOCOL]\n")
+	sb.WriteString("Analyze the request and return ONLY the JSON object specified below.\n")
+	sb.WriteString("Rules: no markdown fences, no tool calls, no preamble, no text before or after the JSON.\n")
 	sb.WriteString("Self-reference docs in .ageage/docs/ (file_read): how-i-work.md, skills.md, pipeline.md, troubleshooting.md.\n\n")
 
 	// ── 2. Skill catalog (stable prefix) ─────────────────────────────────────
@@ -113,7 +115,7 @@ func (r *Router) buildRouterPrompt(availableTools []string) string {
 - "medium": Linear task, needs tools. List in "required_tools".
 - "complex": Multi-step, coding, deep reasoning. List all in "required_tools".
 
-JSON Output:
+Output exactly this JSON and nothing else:
 {
   "complexity": "simple|medium|complex",
   "skill": "exact skill name or empty string",
@@ -121,6 +123,7 @@ JSON Output:
   "reasoning": "brief",
   "direct_answer": "..."
 }
+DO NOT wrap the JSON in code fences. DO NOT call any tools or functions. DO NOT add any text outside the JSON object.
 `)
 
 	return sb.String()

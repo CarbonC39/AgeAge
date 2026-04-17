@@ -85,6 +85,32 @@ func (m *MatrixChannel) getRoomMemberCount(roomID string) (int, error) {
 	return len(resp.Joined), nil
 }
 
+// isRoomDM returns true when roomID is a 1-on-1 direct message room.
+//
+// Detection strategy (in order):
+//  1. Authoritative: check the is_direct flag on the bot's own m.room.member
+//     state event. Matrix clients set this when the room was created as a DM,
+//     so it is unaffected by bridge bots or other service accounts.
+//  2. Fallback: count joined members; ≤ 2 (bot + one user) means DM.
+func (m *MatrixChannel) isRoomDM(roomID string) bool {
+	// Primary: bot's member state carries is_direct=true for DM rooms.
+	path := fmt.Sprintf("/_matrix/client/v3/rooms/%s/state/m.room.member/%s", roomID, m.UserID)
+	if body, err := m.doRequest("GET", path, nil); err == nil {
+		var content struct {
+			IsDirect bool `json:"is_direct"`
+		}
+		if json.Unmarshal(body, &content) == nil && content.IsDirect {
+			return true
+		}
+	}
+	// Fallback: exactly 2 joined members → DM (bot + 1 user).
+	count, err := m.getRoomMemberCount(roomID)
+	if err != nil {
+		return false // indeterminate → treat as group for safety
+	}
+	return count <= 2
+}
+
 // Start begins listening for Matrix events via long-polling /sync.
 func (m *MatrixChannel) Start(handler MessageHandler) error {
 	if len(m.AllowedUsers) == 0 {
@@ -93,10 +119,7 @@ func (m *MatrixChannel) Start(handler MessageHandler) error {
 
 	for _, roomID := range m.RoomIDs {
 		m.joinRoom(roomID)
-		// Classify as DM (2 members: bot + 1 user) or group.
-		if count, err := m.getRoomMemberCount(roomID); err == nil {
-			m.groupRooms[roomID] = count > 2
-		}
+		m.groupRooms[roomID] = !m.isRoomDM(roomID)
 	}
 
 	roomSet := make(map[string]bool, len(m.RoomIDs))
@@ -185,8 +208,8 @@ func (m *MatrixChannel) Start(handler MessageHandler) error {
 				}
 
 				// Detect @mention: bot's UserID appears in the message body.
-				// Thread messages are always directed at the bot (the thread is the session).
-				botMentioned := threadID != "" || strings.Contains(body, m.UserID)
+				// DM rooms and thread messages are always directed at the bot.
+				botMentioned := !isGroup || threadID != "" || strings.Contains(body, m.UserID)
 
 				// Strip the @mention prefix from the body so the agent sees clean text.
 				if botMentioned && strings.Contains(body, m.UserID) {
@@ -235,6 +258,7 @@ func (m *MatrixChannel) Start(handler MessageHandler) error {
 		for roomID := range syncResp.Rooms.Invite {
 			fmt.Printf("[Matrix] Auto-joining invited room: %s\n", roomID)
 			m.joinRoom(roomID)
+			m.groupRooms[roomID] = !m.isRoomDM(roomID)
 		}
 	}
 }

@@ -25,6 +25,7 @@ type DiscordChannel struct {
 	lastMsgIDs    map[string]string            // Track last seen message per channel
 	botUserID     string                       // Bot's own user ID (set in Start)
 	groupChannels map[string]bool              // channelID → true if guild channel, false if DM
+	threadParent  map[string]string            // thread channel ID → parent channel ID
 	mu            sync.Mutex
 	typingStop    map[string]context.CancelFunc // channelID → cancel func for keep-alive typing
 	typingMu      sync.Mutex
@@ -42,6 +43,7 @@ func NewDiscord(botToken string, channelIDs []string, allowedUsers []string, opt
 		stopCh:        make(chan struct{}),
 		lastMsgIDs:    make(map[string]string),
 		groupChannels: make(map[string]bool),
+		threadParent:  make(map[string]string),
 		typingStop:    make(map[string]context.CancelFunc),
 	}
 }
@@ -143,7 +145,15 @@ func (d *DiscordChannel) Start(handler MessageHandler) error {
 		case <-d.stopCh:
 			return nil
 		case <-ticker.C:
-			for _, chID := range d.ChannelIDs {
+			// Poll configured channels plus any threads that were created at runtime.
+			d.mu.Lock()
+			channels := make([]string, len(d.ChannelIDs))
+			copy(channels, d.ChannelIDs)
+			for tid := range d.threadParent {
+				channels = append(channels, tid)
+			}
+			d.mu.Unlock()
+			for _, chID := range channels {
 				d.pollChannel(chID, handler)
 			}
 		}
@@ -385,8 +395,40 @@ func (d *DiscordChannel) createMessageWithID(channelID, content, replyToID strin
 	return "", nil
 }
 
+// createThread creates a public thread from a message and returns the thread channel ID.
+func (d *DiscordChannel) createThread(channelID, messageID, name string) (string, error) {
+	if len([]rune(name)) > 100 {
+		name = string([]rune(name)[:100])
+	}
+	if name == "" {
+		name = "Conversation"
+	}
+	payload := map[string]any{
+		"name":                  name,
+		"auto_archive_duration": 1440, // archive after 24 h of inactivity
+	}
+	body, err := d.doRequest("POST",
+		fmt.Sprintf("/channels/%s/messages/%s/threads", channelID, messageID), payload)
+	if err != nil {
+		return "", err
+	}
+	var thread struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(body, &thread); err != nil || thread.ID == "" {
+		return "", fmt.Errorf("thread creation returned no ID")
+	}
+	return thread.ID, nil
+}
+
 func (d *DiscordChannel) pollChannel(channelID string, handler MessageHandler) {
 	botID := d.botUserID
+
+	// Determine whether this channel is a thread we created.
+	d.mu.Lock()
+	parentID, isThread := d.threadParent[channelID]
+	d.mu.Unlock()
+
 	msgs, err := d.getMessages(channelID, 10)
 	if err != nil {
 		return
@@ -412,7 +454,17 @@ func (d *DiscordChannel) pollChannel(channelID string, handler MessageHandler) {
 		d.lastMsgIDs[channelID] = msg.ID
 		d.mu.Unlock()
 
-		isGroup := d.groupChannels[channelID] // false (DM) when absent, true for guild channels
+		// For thread channels, report the parent channel as ChannelID so the
+		// session key (discord:parentChannelID:t:threadChannelID) matches the
+		// one set when the thread was created.
+		effectiveChannelID := channelID
+		threadID := ""
+		if isThread {
+			effectiveChannelID = parentID
+			threadID = channelID
+		}
+
+		isGroup := d.groupChannels[effectiveChannelID] // false (DM) when absent
 
 		// Security: deny all group messages when no allowlist is configured.
 		if isGroup && len(d.AllowedUsers) == 0 {
@@ -427,6 +479,7 @@ func (d *DiscordChannel) pollChannel(channelID string, handler MessageHandler) {
 		//   1. <@botID>  — standard Discord mention
 		//   2. <@!botID> — nickname mention (deprecated since 2022 but still seen in some clients)
 		//   3. Reply to bot — the referenced_message was authored by the bot
+		//   4. Message in a thread the bot is managing — always directed at the bot
 		mentionTag := fmt.Sprintf("<@%s>", botID)
 		nickMentionTag := fmt.Sprintf("<@!%s>", botID)
 		hasMention := strings.Contains(msg.Content, mentionTag) ||
@@ -434,9 +487,9 @@ func (d *DiscordChannel) pollChannel(channelID string, handler MessageHandler) {
 		isReplyToBot := msg.ReferencedMessage != nil &&
 			botID != "" &&
 			msg.ReferencedMessage.Author.ID == botID
-		botMentioned := hasMention || isReplyToBot
+		botMentioned := hasMention || isReplyToBot || isThread
 
-		// Strip explicit mention tags from the content (not applicable for reply-to-bot).
+		// Strip explicit mention tags from the content.
 		content := msg.Content
 		if hasMention {
 			content = strings.ReplaceAll(content, mentionTag, "")
@@ -444,29 +497,49 @@ func (d *DiscordChannel) pollChannel(channelID string, handler MessageHandler) {
 			content = strings.TrimSpace(content)
 		}
 
-		capturedChannelID := msg.ChannelID
-		capturedMsgID := msg.ID
+		// For guild channel messages (not already a thread) where the bot is
+		// mentioned: create a thread so the conversation stays contained.
+		// The thread is added to the poll list for subsequent messages.
+		sendChannelID := channelID // where responses go
+		if isGroup && !isThread && botMentioned {
+			name := content
+			if len([]rune(name)) > 100 {
+				name = string([]rune(name)[:100])
+			}
+			if tid, err := d.createThread(channelID, msg.ID, name); err == nil {
+				sendChannelID = tid
+				threadID = tid
+				d.mu.Lock()
+				d.lastMsgIDs[tid] = "0"
+				d.threadParent[tid] = channelID
+				d.groupChannels[tid] = true
+				d.mu.Unlock()
+			}
+			// Thread creation failure falls back to sending in the original channel.
+		}
+
+		capturedSendChannelID := sendChannelID
 
 		incoming := IncomingMessage{
 			ChannelType:  "discord",
-			ChannelID:    msg.ChannelID,
+			ChannelID:    effectiveChannelID,
 			SenderID:     msg.Author.ID,
 			SenderName:   msg.Author.Username,
 			Text:         content,
 			ReplyTo:      msg.ID,
+			ThreadID:     threadID,
 			IsGroupChat:  isGroup,
 			BotMentioned: botMentioned,
 		}
 		incoming.Respond = func(text string) error {
-			return d.Reply(capturedChannelID, capturedMsgID, text)
+			return d.Send(capturedSendChannelID, text)
 		}
 
-		go func(m IncomingMessage) {
+		go func(m IncomingMessage, sendCh string) {
 			reply := handler(m)
 			if reply != "" {
-				// Fallback when handler returns a string instead of calling Respond.
-				d.Reply(m.ChannelID, m.ReplyTo, reply)
+				d.Send(sendCh, reply)
 			}
-		}(incoming)
+		}(incoming, capturedSendChannelID)
 	}
 }

@@ -219,12 +219,24 @@ func NewFactory(configPath string, debug bool) (*AgentFactory, error) {
 	}, nil
 }
 
+// GetConfig implements AgentDeps.
+func (f *AgentFactory) GetConfig() *config.Config { return f.Config }
+
+// GetSecurity implements AgentDeps.
+func (f *AgentFactory) GetSecurity() *security.Checker { return f.SecurityChecker }
+
+// GetUserInputMgr implements AgentDeps.
+func (f *AgentFactory) GetUserInputMgr() *tools.UserInputManager { return f.UserInputMgr }
+
 // ensureMCPSessions checks existing MCP sessions and attempts to reconnect
 // to any servers that are missing or unresponsive.
 func (f *AgentFactory) ensureMCPSessions() {
 	if !f.Config.MCP.Enabled {
 		return
 	}
+
+	f.mcpMu.Lock()
+	defer f.mcpMu.Unlock()
 
 	if f.MCPSessions == nil {
 		f.MCPSessions = make(map[string]*mcp.ClientSession)
@@ -303,8 +315,8 @@ func (f *AgentFactory) CreateAgentFiltered(confirmMgr *tools.ConfirmationManager
 			cid := ag.GetChannelID()
 
 			prompt := fmt.Sprintf("*Agent Confirmation Required*\nOperation: `%s`\nReply with `y`, `n`, or `a` (always allow).", operation)
-			if ag.NotifyFunc != nil {
-				ag.NotifyFunc(prompt)
+			if ag.Callbacks.Notify != nil {
+				ag.Callbacks.Notify(prompt)
 			} else {
 				fmt.Printf("\n[IM Confirmation] %s\n", prompt)
 			}
@@ -473,7 +485,13 @@ func (f *AgentFactory) CreateAgentFiltered(confirmMgr *tools.ConfirmationManager
 	}
 
 	// MCP Tools (external).
-	for _, mcpSession := range f.MCPSessions {
+	f.mcpMu.RLock()
+	mcpSessions := make([]*mcp.ClientSession, 0, len(f.MCPSessions))
+	for _, s := range f.MCPSessions {
+		mcpSessions = append(mcpSessions, s)
+	}
+	f.mcpMu.RUnlock()
+	for _, mcpSession := range mcpSessions {
 		resp, err := mcpSession.ListTools(context.Background(), &mcp.ListToolsParams{})
 		if err != nil {
 			if f.Debug {
@@ -493,8 +511,8 @@ func (f *AgentFactory) CreateAgentFiltered(confirmMgr *tools.ConfirmationManager
 	}
 
 	ag := NewAgent(f.Config, f.LLMClient, registry, finishTool, f.Skills, f.Debug)
-	ag.factory = f
-	ag.InjectSoul = f.InjectSoul
+	ag.deps = f
+	ag.Mode.InjectSoul = f.InjectSoul
 	ag.ConfirmationMgr = confirmMgr
 	ag.CredMgr = f.CredMgr
 	if channelID != "" {
@@ -506,7 +524,7 @@ func (f *AgentFactory) CreateAgentFiltered(confirmMgr *tools.ConfirmationManager
 	// creating it would waste the AGENT.md read and allocate memory for nothing.
 	if allowedTools == nil && f.Config.Router.Enabled {
 		ag.router = NewRouter(f.Config, f.LLMClient, f.GetSkills(), f.Debug)
-		ag.router.InjectSoul = ag.InjectSoul
+		ag.router.InjectSoul = ag.Mode.InjectSoul
 	}
 
 	// If allowedTools is provided, also register any skill-only tools requested.

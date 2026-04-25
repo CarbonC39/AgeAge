@@ -72,8 +72,14 @@ func (s *Summarizer) Summarize(ctx context.Context, messages []llm.Message) ([]l
 		startIdx = 1
 	}
 
-	oldMessages := messages[startIdx : len(messages)-keepRecent]
-	recentMessages := messages[len(messages)-keepRecent:]
+	cutPoint := len(messages) - keepRecent
+	// Don't cut inside a tool-call exchange: walk back to a user-message boundary
+	// so recentMessages never starts with orphaned role:"tool" messages.
+	for cutPoint > startIdx && messages[cutPoint].Role != "user" {
+		cutPoint--
+	}
+	oldMessages := messages[startIdx:cutPoint]
+	recentMessages := messages[cutPoint:]
 
 	if len(oldMessages) == 0 {
 		return messages, nil

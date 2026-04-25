@@ -19,49 +19,64 @@ import (
 	"ageage/tools"
 )
 
+// triggerEvaluator starts a background quality check on an auto-generated skill run.
+func (a *Agent) triggerEvaluator(skill *skills.Skill, userInput, agentOutput string, toolHistory []ToolRecord) {
+	factory, ok := a.deps.(*AgentFactory)
+	if !ok {
+		return
+	}
+	docsDir := filepath.Join(factory.Config.AgeAgeDirPath(), "docs")
+	ev := NewEvaluator(factory, docsDir, a.Callbacks.Notify)
+	snap := EvalSnapshot{
+		Skill:       skill,
+		UserInput:   userInput,
+		ToolHistory: toolHistory,
+		AgentOutput: agentOutput,
+	}
+	go ev.Run(context.Background(), snap)
+}
+
 // turnRecord tracks an uncompressed tool-call turn so it can be compressed later.
 type turnRecord struct {
 	assistantMsg llm.Message
 	toolResults  []string
-	msgStart     int // index in a.messages where the assistant message lives
+	msgStart     int // index in conv where the assistant message lives
 	msgCount     int // 1 (assistant) + N (tool results)
 }
 
 // Agent is the core agent that drives the conversation and tool execution loop.
 type Agent struct {
-	cfg              *config.Config
-	client           *llm.Client
-	registry         *tools.Registry
-	finishTool       *tools.FinishTool
-	router           *Router
-	summarizer       *Summarizer
-	skills           []skills.Skill
-	messages         []llm.Message
-	pendingTurns     []turnRecord // Recent uncompressed tool-call turns
-	debug            bool
-	cancel           context.CancelFunc
-	cancelMu         sync.Mutex
-	currentChannelID string                         // For async confirmations in channel mode
-	ConfirmationMgr  *tools.ConfirmationManager     // Optional: for async confirmations
-	NotifyFunc       func(message string)                    // Optional: for sending notifications to the channel
-	AskUserNotify    func(question string, options []string) // Optional: send ask_user question to the user
-	TodoSendFunc     func(text string) string                // Optional: send a todo notification, returns message ID
-	TodoEditFunc     func(msgID, text string) error          // Optional: edit a previously sent todo notification
-	InjectSoul          bool                           // If true, SOUL.md personality is injected (serve/connect default true; CLI default false)
-	IsSubAgent          bool                           // If true, this is a sub-agent (disables pre-execution and skill-only tool injection)
-	InjectContext       bool                           // If true, .ageage/CONTEXT.md is injected into the system prompt (default true for main agent and pipeline nodes)
-	SessionDir          string                         // Directory for the active session (e.g. .ageage/sessions/default); CONTEXT.md is read from here
-	MaxIterations       int                            // Maximum iterations for this agent run
-	factory             *AgentFactory                  // Back-reference used for per-turn skill tool injection; nil for manually created agents
-	todoStore           *tools.TodoStore               // Non-nil when update_todos is injected; cleared after finish_task
-	browserSess         *tools.BrowserSession          // Non-nil when browser_* tools are injected; closed after Run
-	runUsage            llm.Usage                      // Accumulated token usage for the current Run(); reset each call
-	tmpMgr              *TmpManager                    // Manages tmp files created by attachment converters
-	ToolStartCallback   func(name, args string)         // Optional: called just before each tool executes (CLI spinner/diff display)
-	ToolEndCallback     func(name string)               // Optional: called just after each tool completes
-	ToolResultCallback  func(name, result string)       // Optional: called with the tool's output after execution
-	CredMgr             *creds.Manager                  // Optional: substitutes {{cred:x}} in tool args, scrubs results
-	hintOnNextCall      string                          // Ephemeral; consumed by buildCallMessages, not stored in history
+	cfg          *config.Config
+	client       *llm.Client
+	registry     *tools.Registry
+	finishTool   *tools.FinishTool
+	router       *Router
+	summarizer   *Summarizer
+	skills       []skills.Skill
+	conv         Conversation
+	pendingTurns []turnRecord
+	debug        bool
+	cancel       context.CancelFunc
+	cancelMu     sync.Mutex
+
+	// Mode and Callbacks are set after construction by the factory or caller.
+	Mode      AgentMode
+	Callbacks AgentCallbacks
+
+	// deps provides factory-level services (skill hot-reload, sub-agent creation).
+	// Nil for manually constructed agents that do not need those services.
+	deps AgentDeps
+
+	currentChannelID string                     // For async confirmations in channel mode
+	ConfirmationMgr  *tools.ConfirmationManager // Optional: for async confirmations
+	SessionDir       string                     // Directory for the active session
+	MaxIterations    int                        // Maximum iterations for this agent run
+	todoStore        *tools.TodoStore           // Non-nil when update_todos is injected
+	browserSess      *tools.BrowserSession      // Non-nil when browser_* tools are injected
+	runUsage         llm.Usage                  // Accumulated token usage for the current Run()
+	tmpMgr           *TmpManager                // Manages tmp files created by attachment converters
+	CredMgr          *creds.Manager             // Optional: substitutes {{cred:x}} in tool args
+	hintOnNextCall   string                     // Ephemeral; consumed by buildCallMessages
 }
 
 // NewAgent creates a new agent instance.
@@ -74,9 +89,8 @@ func NewAgent(cfg *config.Config, client *llm.Client, registry *tools.Registry, 
 		skills:        loadedSkills,
 		debug:         debug,
 		MaxIterations: cfg.Agent.MaxIterations,
-		messages:      make([]llm.Message, 0, 64),
 		tmpMgr:        newTmpManager(cfg.ConfigDir()),
-		InjectContext: true, // on by default; explicitly disabled for delegate sub-agents
+		Mode:          AgentMode{InjectContext: true}, // default: inject context for main agents
 	}
 
 	if cfg.Summarize.Enabled {
@@ -87,8 +101,6 @@ func NewAgent(cfg *config.Config, client *llm.Client, registry *tools.Registry, 
 }
 
 // contextMDPath returns the CONTEXT.md path for the agent's active session.
-// When SessionDir is set (session-aware usage) it points to the session's own
-// CONTEXT.md; otherwise it falls back to the workspace-level path.
 func (a *Agent) contextMDPath() string {
 	if a.SessionDir != "" {
 		return filepath.Join(a.SessionDir, "CONTEXT.md")
@@ -97,41 +109,32 @@ func (a *Agent) contextMDPath() string {
 }
 
 // BuildSystemPrompt returns the system prompt string for the current agent
-// state without a specific skill active. Used when restoring history so the
-// fresh context (CONTEXT.md) is embedded in a new system message.
+// state without a specific skill active.
 func (a *Agent) BuildSystemPrompt() string {
 	return a.buildSystemPrompt(nil)
 }
 
 // Messages returns a snapshot of the agent's current message history.
 func (a *Agent) Messages() []llm.Message {
-	return a.messages
+	return a.conv.All()
 }
 
 // SetMessages replaces the agent's message history with the supplied slice.
 // If msgs is non-empty and the first entry is not a system message, a fresh
-// system prompt is prepended automatically. This is the correct way to restore
-// conversation history when resuming a session.
+// system prompt is prepended automatically.
 func (a *Agent) SetMessages(msgs []llm.Message) {
 	if len(msgs) == 0 {
-		a.messages = msgs
+		a.conv.Reset(msgs)
 		return
 	}
 	if msgs[0].Role != "system" {
 		sysMsg := llm.Message{Role: "system", Content: a.buildSystemPrompt(nil)}
 		msgs = append([]llm.Message{sysMsg}, msgs...)
 	}
-	a.messages = msgs
+	a.conv.Reset(msgs)
 }
 
 // parseSkillCommand checks whether input begins with a /skill-name command.
-// If a matching skill is found, it returns a pointer to it and the remaining
-// text after the command token (which becomes the actual user message).
-// Returns (nil, input) unchanged if the input is not a skill command or the
-// name does not match any loaded skill.
-//
-// Matching is normalised: lowercase, spaces/underscores → hyphens.
-// e.g.  "/code-review fix the auth module" → skill "code_review", "fix the auth module"
 func (a *Agent) parseSkillCommand(input string) (*skills.Skill, string) {
 	if !strings.HasPrefix(input, "/") || len(a.skills) == 0 {
 		return nil, input
@@ -176,12 +179,9 @@ func NormalizeSkillName(s string) string {
 func (a *Agent) buildSystemPrompt(matchedSkill *skills.Skill) string {
 	var sb strings.Builder
 
-	// Core system instructions (English as per spec).
 	sb.WriteString("## Core Rules\n\n")
 	sb.WriteString("1. You have access to tools. Use them to gather information and perform actions.\n")
 
-	// The finish tool name is usually finish_task, but pipeline nodes replace it
-	// with node_complete to report structured results.
 	finishToolName := "finish_task"
 	isPipelineAgent := false
 	if _, ok := a.registry.Get("node_complete"); ok {
@@ -207,15 +207,13 @@ Never output API keys, passwords, access tokens, credentials, or secrets verbati
 
 `)
 
-	// Always inject AGENT.md (behavioral directives).
 	if agentData, err := os.ReadFile(a.cfg.AgentPath()); err == nil && len(agentData) > 0 {
 		sb.WriteString("## Agent Directives\n\n")
 		sb.WriteString(strings.TrimSpace(string(agentData)))
 		sb.WriteString("\n\n")
 	}
 
-	// Inject SOUL.md only when InjectSoul is set (serve/connect mode; off by default in CLI).
-	if a.InjectSoul {
+	if a.Mode.InjectSoul {
 		if soulData, err := os.ReadFile(a.cfg.SOULPath()); err == nil && len(soulData) > 0 {
 			sb.WriteString("## Personality & Behavior\n\n")
 			sb.WriteString(strings.TrimSpace(string(soulData)))
@@ -223,10 +221,7 @@ Never output API keys, passwords, access tokens, credentials, or secrets verbati
 		}
 	}
 
-	// Workspace context notes — injected for main agent and pipeline nodes (InjectContext=true),
-	// suppressed for delegate sub-agents (InjectContext=false).
-	// Placed before skill instructions so the prefix stays stable for KV-cache reuse.
-	if a.InjectContext {
+	if a.Mode.InjectContext {
 		sb.WriteString("## Context Notes File\n\n")
 		sb.WriteString("You have access to `.ageage/CONTEXT.md` in the working directory. " +
 			"Use `file_write` or `file_edit` to update it (no confirmation required). " +
@@ -242,16 +237,13 @@ Never output API keys, passwords, access tokens, credentials, or secrets verbati
 		}
 	}
 
-	// Credential placeholder hint (only when credentials are configured).
 	if a.CredMgr != nil {
 		if hint := a.CredMgr.PromptHint(); hint != "" {
 			sb.WriteString(hint)
 		}
 	}
 
-	// Framework documentation pointer — main agents only, not sub-agents or pipeline nodes.
-	// Stays in the stable prefix so KV-cache hits on every turn after the first.
-	if !a.IsSubAgent {
+	if !a.Mode.IsSubAgent {
 		sb.WriteString("## Framework Documentation\n\n")
 		sb.WriteString("Self-reference guides are in `.ageage/docs/` (use `file_read`): " +
 			"how-i-work.md, troubleshooting.md, skills.md, pipeline.md.\n")
@@ -259,7 +251,6 @@ Never output API keys, passwords, access tokens, credentials, or secrets verbati
 			"or when you need to understand how the agent loop works.\n\n")
 	}
 
-	// Active skill instructions (at most one skill per conversation).
 	if matchedSkill != nil {
 		sb.WriteString("## Active Skill Instructions\n\n")
 		fmt.Fprintf(&sb, "### %s\n", matchedSkill.Name)
@@ -285,22 +276,20 @@ func (a *Agent) Stop() {
 }
 
 // ForceSummarize manually triggers conversation summarization.
-// Returns the summary text or an error.
 func (a *Agent) ForceSummarize() (string, error) {
 	if a.summarizer == nil {
 		return "", fmt.Errorf("summarization is not enabled in config")
 	}
-	if len(a.messages) <= 2 {
+	if a.conv.Len() <= 2 {
 		return "", fmt.Errorf("not enough conversation history to summarize")
 	}
 
-	oldCount := len(a.messages)
-	newMessages, err := a.summarizer.Summarize(context.Background(), a.messages)
+	oldCount := a.conv.Len()
+	newMessages, err := a.summarizer.Summarize(context.Background(), a.conv.All())
 	if err != nil {
 		return "", err
 	}
 
-	// Extract the summary text from the new messages.
 	var summaryText string
 	for _, m := range newMessages {
 		if m.Role == "system" && strings.HasPrefix(m.Content, "[Previous conversation summary]") {
@@ -309,7 +298,7 @@ func (a *Agent) ForceSummarize() (string, error) {
 		}
 	}
 
-	a.messages = newMessages
+	a.conv.Reset(newMessages)
 	a.debugLog("Summarize", "compressed %d → %d messages", oldCount, len(newMessages))
 	return summaryText, nil
 }
@@ -328,10 +317,10 @@ func (a *Agent) RunWithParts(ctx context.Context, userInput string, parts []llm.
 	a.finishTool.Reset()
 	a.runUsage = llm.Usage{}
 
-	// Hot-reload: refresh skill list from factory on every run.
-	// This is a cheap pointer swap; the factory's WatchSkills goroutine does the actual I/O.
-	if a.factory != nil {
-		current := a.factory.GetSkills()
+	// Hot-reload: refresh skill list from deps on every run.
+	// This is a cheap pointer swap; WatchSkills goroutine does the actual I/O.
+	if a.deps != nil {
+		current := a.deps.GetSkills()
 		a.skills = current
 		if a.router != nil {
 			a.router.skills = current
@@ -346,50 +335,41 @@ func (a *Agent) RunWithParts(ctx context.Context, userInput string, parts []llm.
 	defer cancel()
 
 	// --- Skill selection ---
-	// Skills are triggered in one of two ways:
-	//   1. Explicit /skill-name command in user input (highest priority).
-	//   2. Router LLM selects a skill from the full catalog (fallback).
-	// Skill selection happens BEFORE the system prompt is built so that the
-	// active skill's instructions can be included on the first turn.
-	isFirstTurn := len(a.messages) == 0
+	isFirstTurn := a.conv.Len() == 0
 
 	var matchedSkill *skills.Skill
 	actualInput := userInput
 
-	if !a.IsSubAgent {
+	if !a.Mode.IsSubAgent {
 		matchedSkill, actualInput = a.parseSkillCommand(userInput)
 		if matchedSkill != nil {
 			a.debugLog("Skill", "explicit command: %s (remaining: %q)", matchedSkill.Name, actualInput)
+			if actualInput == "" {
+				actualInput = "Please proceed based on the skill instructions."
+			}
 		}
 	}
 
-	// Add user message (plain text or multimodal). Use actualInput so the
-	// /skill-name prefix is stripped from the stored message.
+	// Add user message. Use actualInput so the /skill-name prefix is stripped.
 	userMsg := llm.Message{Role: "user", Content: actualInput}
 	if len(parts) > 0 {
 		userMsg.Parts = parts
 	}
-
-	// On the first turn we cannot build the system prompt yet (we may still
-	// need the router to select a skill). Temporarily store only the user
-	// message; filterHistoryForRouter ignores system messages anyway.
 	if isFirstTurn {
-		a.messages = []llm.Message{userMsg}
+		a.conv.Reset([]llm.Message{userMsg})
 	} else {
-		a.messages = append(a.messages, userMsg)
+		a.conv.Append(userMsg)
 	}
 
 	// Proactively summarize if history is getting long (before LLM call).
 	a.trySummarize(ctx)
 
 	// --- Router phase ---
-	// Runs before system-prompt finalisation so the router's skill selection
-	// can influence the first-turn system prompt.
+	// Runs before system-prompt finalisation so skill selection can influence
+	// the first-turn system prompt.
 	var routerResult *RouterResult
 
-	if a.router != nil && !a.IsSubAgent {
-		// If an explicit skill is active, skip the router entirely.
-		// The skill overrides both skill selection and complexity.
+	if a.router != nil && !a.Mode.IsSubAgent {
 		if matchedSkill != nil {
 			tc := TaskComplexity(strings.ToLower(matchedSkill.Complexity))
 			if tc == "" {
@@ -399,10 +379,8 @@ func (a *Agent) RunWithParts(ctx context.Context, userInput string, parts []llm.
 					tc = TaskMedium
 				}
 			}
-
 			switch tc {
 			case TaskSimple, TaskMedium, TaskComplex:
-				// valid
 			default:
 				a.debugLog("Skill", "unknown complexity %q in skill %q, falling back to medium", matchedSkill.Complexity, matchedSkill.Name)
 				tc = TaskMedium
@@ -414,23 +392,18 @@ func (a *Agent) RunWithParts(ctx context.Context, userInput string, parts []llm.
 			}
 			a.debugLog("Router", "skipped (explicit skill %q) complexity=%s", matchedSkill.Name, tc)
 		} else {
-			// Call the router. If no explicit skill was given, the router may
-			// select one from its full skill catalog.
 			toolsForRouter := a.registry.ListExcept("finish_task", "memory_store")
 			var err error
-			routerResult, err = a.router.Route(ctx, actualInput, toolsForRouter, a.messages)
+			routerResult, err = a.router.Route(ctx, actualInput, toolsForRouter, a.conv.All())
 			if err != nil {
 				a.debugLog("Router", "failed, using all tools: %s", err)
 			} else {
 				a.debugLog("Router", "complexity=%s skill=%q tools=%v",
 					routerResult.Complexity, routerResult.Skill, routerResult.RequiredTools)
-				// Router-selected skill (only when the user did not already give one).
 				if routerResult.Skill != "" {
 					matchedSkill = a.findSkillByName(routerResult.Skill)
 					if matchedSkill != nil {
 						a.debugLog("Skill", "router selected: %s", matchedSkill.Name)
-						// If the router-selected skill declares a complexity, honour it
-						// as an override over the router's own complexity assessment.
 						if matchedSkill.Complexity != "" {
 							tc := TaskComplexity(strings.ToLower(matchedSkill.Complexity))
 							switch tc {
@@ -447,125 +420,152 @@ func (a *Agent) RunWithParts(ctx context.Context, userInput string, parts []llm.
 		}
 	}
 
-	// --- System prompt initialization/refresh ---
-	// Three cases:
-	//   (a) System message already at index 0 — update in place (skill may change turn to turn).
-	//       Exception: sub-agents have their system prompt pre-built by the caller with the
-	//       correct nodeSkill/instructions. matchedSkill is always nil for sub-agents (skill
-	//       parsing is skipped via !IsSubAgent), so overwriting would erase nodeSkill content.
-	//   (b) History loaded from disk without a system message (SaveHistory never persists it) — prepend.
-	//   (c) First turn, messages is empty — prepend.
-	// Cases (b) and (c) are identical: both need a prepend.
-	if len(a.messages) > 0 && a.messages[0].Role == "system" {
-		if !a.IsSubAgent {
-			a.messages[0].Content = a.buildSystemPrompt(matchedSkill)
+	// --- Planner: create a skill for complex tasks with no match ---
+	if a.router != nil && !a.Mode.IsSubAgent &&
+		routerResult != nil && routerResult.Complexity == TaskComplex &&
+		routerResult.Skill == "" && matchedSkill == nil {
+		if factory, ok := a.deps.(*AgentFactory); ok {
+			docsDir := filepath.Join(factory.Config.AgeAgeDirPath(), "docs")
+			planner := NewPlanner(factory, docsDir)
+			if skill, err := planner.CreateSkill(ctx, actualInput); err == nil && skill != nil {
+				matchedSkill = skill
+				routerResult.Skill = skill.Name
+				if skill.Complexity != "" {
+					tc := TaskComplexity(strings.ToLower(skill.Complexity))
+					switch tc {
+					case TaskSimple, TaskMedium, TaskComplex:
+					default:
+						tc = TaskMedium
+					}
+					routerResult.Complexity = tc
+				}
+				a.debugLog("Planner", "created skill %q", skill.Name)
+			} else if err != nil {
+				a.debugLog("Planner", "skill creation failed (%s) — proceeding without skill", err)
+			}
 		}
-		// Sub-agent: keep the pre-built system prompt from the caller.
+	}
+
+	// --- System prompt initialization/refresh ---
+	// Sub-agents have their system prompt pre-built by the caller and must not be overwritten.
+	if a.conv.HasSystem() {
+		if !a.Mode.IsSubAgent {
+			a.conv.SetSystemContent(a.buildSystemPrompt(matchedSkill))
+		}
 	} else {
-		sysMsg := llm.Message{
+		a.conv.PrependSystem(llm.Message{
 			Role:    "system",
 			Content: a.buildSystemPrompt(matchedSkill),
-		}
-		a.messages = append([]llm.Message{sysMsg}, a.messages...)
+		})
 	}
 
 	// --- Pipeline skill handling ---
-	// Pipeline skills run entirely outside the normal agent loop: each node
-	// spawns an isolated sub-agent. Return early after the pipeline completes.
 	if matchedSkill != nil && matchedSkill.IsPipeline() {
-		if a.factory == nil {
-			return "", fmt.Errorf("pipeline skills require an AgentFactory")
-		}
 		result, err := a.runPipelineSkill(ctx, matchedSkill, actualInput)
 		if err != nil {
 			return "", err
 		}
-		a.messages = append(a.messages, llm.Message{
-			Role:    "assistant",
-			Content: result,
-		})
+		a.conv.Append(llm.Message{Role: "assistant", Content: result})
 		a.trySummarize(ctx)
 		a.gcTmp()
 		if streamCb != nil {
 			streamCb(result)
+		}
+		if matchedSkill.AutoGenerated {
+			a.triggerEvaluator(matchedSkill, actualInput, result, nil)
 		}
 		return result, nil
 	}
 
 	// Handle simple tasks (direct answer from router, no tool loop needed).
 	if routerResult != nil && routerResult.Complexity == TaskSimple && routerResult.DirectAnswer != "" {
-		a.messages = append(a.messages, llm.Message{
-			Role:    "assistant",
-			Content: routerResult.DirectAnswer,
-		})
+		a.conv.Append(llm.Message{Role: "assistant", Content: routerResult.DirectAnswer})
 		if streamCb != nil {
 			streamCb(routerResult.DirectAnswer)
 		}
 		return routerResult.DirectAnswer, nil
 	}
 
-	// --- Skill-only tool injection ---
-	// Instantiate and register tools that live outside the global registry.
-	// These are removed again via defer at the end of this Run call.
-	var injectedTools []string
-	if !a.IsSubAgent && a.factory != nil && matchedSkill != nil {
-		for _, toolName := range matchedSkill.RequiredTools {
+	// Phase 1: inject skill-only tools for the duration of this run.
+	cleanup := a.injectSkillTools(matchedSkill)
+	defer cleanup()
+
+	// Phase 2: select tool set and LLM client.
+	toolDefs, activeClient, upgradeUsed := a.buildExecPlan(routerResult, matchedSkill)
+
+	// Phase 3: execute the main loop.
+	defer a.gcTmp()
+	result, err := a.runLoop(ctx, streamCb, toolDefs, activeClient, upgradeUsed)
+	if err == nil && matchedSkill != nil && matchedSkill.AutoGenerated {
+		a.triggerEvaluator(matchedSkill, actualInput, result, a.conv.ToolHistory())
+	}
+	return result, err
+}
+
+// injectSkillTools registers skill-only tools for the duration of one Run call.
+// Returns a cleanup function that removes those tools and closes any browser session.
+func (a *Agent) injectSkillTools(skill *skills.Skill) func() {
+	var injected []string
+	if !a.Mode.IsSubAgent && a.deps != nil && skill != nil {
+		for _, toolName := range skill.RequiredTools {
 			if mkTool, ok := skillOnlyToolFactories[toolName]; ok {
 				if _, exists := a.registry.Get(toolName); !exists {
-					a.registry.Register(mkTool(a.factory, a.registry, a))
-					injectedTools = append(injectedTools, toolName)
-					a.debugLog("Skill", "injected %s", toolName)
+					if t := mkTool(a.deps, a.registry, a); t != nil {
+						a.registry.Register(t)
+						injected = append(injected, toolName)
+					}
+						a.debugLog("Skill", "injected %s", toolName)
 				}
 			}
 		}
 	}
-	defer func() {
-		for _, name := range injectedTools {
+	return func() {
+		for _, name := range injected {
 			a.registry.Unregister(name)
 		}
 		if a.browserSess != nil {
 			a.browserSess.Close()
 			a.browserSess = nil
 		}
-	}()
+	}
+}
 
-	// Select the model and tools based on router result and active skill.
-	activeClient := a.client
+// buildExecPlan selects the tool set and LLM client for a run based on the
+// router result and active skill.
+// Returns toolDefs, the initial LLM client, and whether an upgraded model was used.
+func (a *Agent) buildExecPlan(rr *RouterResult, skill *skills.Skill) (toolDefs []llm.ToolDef, activeClient *llm.Client, upgradeUsed bool) {
+	activeClient = a.client
 
-	// Collect the tool list for this turn.
+	// Collect the tool list for this run.
 	var neededTools []string
-	if routerResult != nil && len(routerResult.RequiredTools) > 0 {
-		neededTools = append(neededTools, routerResult.RequiredTools...)
-	} else if routerResult != nil && matchedSkill == nil {
+	if rr != nil && len(rr.RequiredTools) > 0 {
+		neededTools = append(neededTools, rr.RequiredTools...)
+	} else if rr != nil && skill == nil {
 		// Router ran but imposed no tool restriction — use all available tools.
 		neededTools = a.registry.List()
-	} else if routerResult == nil && matchedSkill == nil {
+	} else if rr == nil && skill == nil {
 		// No router, no skill: use all available tools.
 		neededTools = a.registry.List()
 	}
 
-	// Always include tools declared by the active skill.
-	if matchedSkill != nil {
-		neededTools = append(neededTools, matchedSkill.RequiredTools...)
+	if skill != nil {
+		neededTools = append(neededTools, skill.RequiredTools...)
 	}
 
-	// ALWAYS include finish_task.
 	neededTools = ensureFinishTask(neededTools)
 
 	// Delegation tool injection (main agent only; sub-agents must not recurse).
-	if !a.IsSubAgent {
+	if !a.Mode.IsSubAgent {
 		if a.router != nil {
-			// With a router: only inject for medium/complex tasks.
-			if routerResult != nil && (routerResult.Complexity == TaskMedium || routerResult.Complexity == TaskComplex) {
+			if rr != nil && (rr.Complexity == TaskMedium || rr.Complexity == TaskComplex) {
 				neededTools = append(neededTools, "delegate")
 			}
 		} else {
-			// No router: always available.
 			neededTools = append(neededTools, "delegate")
 		}
 	}
 
-	// web_search implies web_fetch: the agent needs to be able to open pages it finds.
+	// web_search implies web_fetch: the agent needs to open pages it finds.
 	for _, t := range neededTools {
 		if t == "web_search" {
 			neededTools = append(neededTools, "web_fetch")
@@ -573,20 +573,17 @@ func (a *Agent) RunWithParts(ctx context.Context, userInput string, parts []llm.
 		}
 	}
 
-	// De-duplicate and filter.
 	neededTools = UniqueStrings(neededTools)
-	toolDefs := a.registry.ToOpenAIToolsFiltered(neededTools)
+	toolDefs = a.registry.ToOpenAIToolsFiltered(neededTools)
 
-	upgradeUsed := false
-	if routerResult != nil {
-		// Use medium/strong model if configured.
+	// Model upgrade based on router complexity.
+	if rr != nil {
 		var targetModel config.ModelConfig
-		if routerResult.Complexity == TaskComplex && a.cfg.Router.StrongModel.Model != "" {
+		if rr.Complexity == TaskComplex && a.cfg.Router.StrongModel.Model != "" {
 			targetModel = a.cfg.Router.StrongModel
-		} else if routerResult.Complexity == TaskMedium && a.cfg.Router.MediumModel.Model != "" {
+		} else if rr.Complexity == TaskMedium && a.cfg.Router.MediumModel.Model != "" {
 			targetModel = a.cfg.Router.MediumModel
 		}
-
 		if targetModel.Model != "" {
 			modelName, apiKey, baseURL := targetModel.Resolve(a.cfg.LLM.Model, a.client.APIKey(), a.client.BaseURL())
 			activeClient = llm.NewClient(apiKey, baseURL, modelName, a.debug, a.cfg.LLM.MaxTokens)
@@ -595,12 +592,14 @@ func (a *Agent) RunWithParts(ctx context.Context, userInput string, parts []llm.
 		}
 	}
 
-	// --- Execution loop ---
+	return
+}
+
+// runLoop executes the main LLM ↔ tool iteration loop.
+func (a *Agent) runLoop(ctx context.Context, streamCb llm.StreamCallback, toolDefs []llm.ToolDef, activeClient *llm.Client, upgradeUsed bool) (string, error) {
 	fallbackUsed := false
-	defer a.gcTmp() // Ensure cleanup on any exit path.
 
 	for i := 0; i < a.MaxIterations; i++ {
-		// Check for cancellation.
 		if ctx.Err() != nil {
 			return "(Task stopped by user)", nil
 		}
@@ -610,19 +609,14 @@ func (a *Agent) RunWithParts(ctx context.Context, userInput string, parts []llm.
 		var assistantMsg *llm.Message
 		var err error
 
-		// Inject context (time, workspace, OS, arch) and current todos into the
-		// last user message. This keeps the system prompt byte-identical across
-		// calls, enabling KV cache hits on the entire prior conversation.
 		callMessages := a.buildCallMessages()
 
-		// inflightResults[idx] receives the tool result for tool call at position idx.
 		type toolExecResult struct {
 			result  string
 			execErr error
 		}
 		inflightResults := make(map[int]chan toolExecResult)
 
-		// Determine effective parallelism.
 		maxPar := a.cfg.Agent.MaxParallelTools
 		if maxPar <= 0 {
 			maxPar = 1
@@ -636,63 +630,44 @@ func (a *Agent) RunWithParts(ctx context.Context, userInput string, parts []llm.
 				rawArgs = json.RawMessage(tc.Function.Arguments)
 			}
 
-			// Credential security: block direct file access and substitute placeholders.
 			if a.CredMgr != nil {
 				argsStr := string(rawArgs)
-				// Block access to credentials file (defense-in-depth: security checker
-				// already blocks file tools; this catches bash and other tools).
 				if a.CredMgr.ContainsCredPath(argsStr) {
 					return "error: direct access to the credentials file is system-protected and not permitted", nil
 				}
-				// Replace {{cred:name}} placeholders with actual values.
 				if substituted := a.CredMgr.Substitute(argsStr); substituted != argsStr {
 					rawArgs = json.RawMessage(substituted)
 				}
 			}
 
 			a.debugLog("Tool▷", "%s  %s", tc.Function.Name, briefActionSummary(tc.Function.Name, tc.Function.Arguments))
-			if a.ToolStartCallback != nil {
-				a.ToolStartCallback(tc.Function.Name, string(rawArgs))
+			if a.Callbacks.ToolStart != nil {
+				a.Callbacks.ToolStart(tc.Function.Name, string(rawArgs))
 			}
 			res, execErr := a.registry.Execute(ctx, tc.Function.Name, rawArgs)
 
-			// Scrub any credential values that leaked into the tool result before
-			// they are stored in conversation history.
 			if a.CredMgr != nil {
 				res = a.CredMgr.Scrub(res)
 			}
 
-			if a.ToolEndCallback != nil {
-				a.ToolEndCallback(tc.Function.Name)
+			if a.Callbacks.ToolEnd != nil {
+				a.Callbacks.ToolEnd(tc.Function.Name)
 			}
-			if a.ToolResultCallback != nil {
-				a.ToolResultCallback(tc.Function.Name, res)
+			if a.Callbacks.ToolResult != nil {
+				a.Callbacks.ToolResult(tc.Function.Name, res)
 			}
 			a.debugLog("Tool◁", "%s  %s", tc.Function.Name, truncateStr(res, 600))
 			a.debugBlankLine()
 			return res, execErr
 		}
 
-		// For streaming calls, wire a progressive callback.
-		// Bug Fix 1: Sequential dependency in streaming.
-		// If we are in parallel mode (maxPar > 1), we check for mutations.
-		// To be safe, if we detect multiple tool calls in a stream, and we suspect
-		// dependencies, we can either serialize them or defer them.
+		// For streaming calls, start read-only tools progressively.
 		var toolCallStreamCb llm.ToolCallStreamCb
 		if streamCb != nil && maxPar > 1 {
 			toolCallStreamCb = func(idx int, call llm.ToolCall) {
-				// We don't know the FULL list of tools yet in a stream.
-				// If the model is known to emit dependent tools (like file_write followed by bash),
-				// progressive execution is risky.
-				// For now, we allow progressive execution only for non-mutation tools.
-				// Conservatively treat any non-read-only tool (including unknown
-				// MCP/custom tools) as a mutation; defer it to post-stream serialisation.
 				if !isReadOnlyTool(call.Function.Name) {
-					// Don't start mutation tools progressively; let the main loop
-					// handle them after the stream ends (where they might be serialized).
 					return
 				}
-
 				ch := make(chan toolExecResult, 1)
 				inflightResults[idx] = ch
 				go func() {
@@ -733,28 +708,22 @@ func (a *Agent) RunWithParts(ctx context.Context, userInput string, parts []llm.
 		}
 
 		if err != nil {
-			// If context was cancelled (user stop), return cleanly.
 			if ctx.Err() != nil {
 				return "(Task stopped by user)", nil
 			}
-
-			// If upgraded model failed and we haven't fallen back yet, try router model.
 			if upgradeUsed && !fallbackUsed && a.cfg.Router.ClassifierModel.Model != "" {
 				modelName, apiKey, baseURL := a.cfg.Router.ClassifierModel.Resolve(a.cfg.LLM.Model, a.client.APIKey(), a.client.BaseURL())
 				a.debugLog("Router", "fallback → %s", modelName)
 				activeClient = llm.NewClient(apiKey, baseURL, modelName, a.debug, a.cfg.LLM.MaxTokens)
 				upgradeUsed = false
 				fallbackUsed = true
-				i-- // Retry this iteration with the fallback model
+				i--
 				continue
 			}
-
 			return "", fmt.Errorf("LLM call failed at iteration %d: %w", i+1, err)
 		}
 
-		// Dependency detection: if any tool in this turn may have side effects,
-		// serialize the entire batch to prevent race conditions.
-		// Unknown tools (MCP, custom) are conservatively treated as mutations.
+		// Serialize the entire batch if any tool has side effects.
 		hasMutation := false
 		for _, tc := range assistantMsg.ToolCalls {
 			if !isReadOnlyTool(tc.Function.Name) {
@@ -763,34 +732,29 @@ func (a *Agent) RunWithParts(ctx context.Context, userInput string, parts []llm.
 			}
 		}
 		if hasMutation {
-			maxPar = 1 // Serialize this specific turn.
-			// Re-create sem with new capacity.
+			maxPar = 1
 			sem = make(chan struct{}, maxPar)
 		}
 
-		// Strip <think> blocks and store assistant message.
-		turnStart := len(a.messages)
+		turnStart := a.conv.Len()
 		cleanedMsg := *assistantMsg
 		cleanedMsg.Content = sanitizeOutput(cleanedMsg.Content)
-		a.messages = append(a.messages, cleanedMsg)
+		a.conv.Append(cleanedMsg)
 
-		// No tool calls — treat as final response.
 		if len(cleanedMsg.ToolCalls) == 0 {
 			a.trySummarize(ctx)
-			a.gcTmp()
 			if cleanedMsg.Content != "" {
 				return cleanedMsg.Content, nil
 			}
 			return "(Agent returned empty response)", nil
 		}
 
-		// Dispatch any tool calls not yet started progressively (sequential path
-		// or parallel path for tool calls whose JSON was only complete after stream end).
+		// Dispatch tool calls not yet started progressively.
 		for idx, tc := range cleanedMsg.ToolCalls {
 			if _, alreadyStarted := inflightResults[idx]; alreadyStarted {
 				continue
 			}
-			tc := tc // capture
+			tc := tc
 			ch := make(chan toolExecResult, 1)
 			inflightResults[idx] = ch
 			if maxPar > 1 {
@@ -801,13 +765,11 @@ func (a *Agent) RunWithParts(ctx context.Context, userInput string, parts []llm.
 					ch <- toolExecResult{res, execErr}
 				}()
 			} else {
-				// Sequential: run inline (block until done, then write to channel).
 				res, execErr := dispatchTool(tc)
 				ch <- toolExecResult{res, execErr}
 			}
 		}
 
-		// Collect results in call order and append to message history.
 		var currentTurnResults []string
 		anyToolError := false
 		for idx, tc := range cleanedMsg.ToolCalls {
@@ -823,25 +785,25 @@ func (a *Agent) RunWithParts(ctx context.Context, userInput string, parts []llm.
 			}
 
 			historyResult := compactToolResult(toolResult)
-			a.messages = append(a.messages, llm.Message{
+			toolCallID := tc.ID
+			if toolCallID == "" {
+				toolCallID = fmt.Sprintf("%s_%d", tc.Function.Name, idx)
+			}
+			a.conv.Append(llm.Message{
 				Role:       "tool",
 				Content:    historyResult,
-				ToolCallID: tc.ID,
+				ToolCallID: toolCallID,
 			})
 			currentTurnResults = append(currentTurnResults, toolResult)
 		}
 
-		// When a tool fails, set an ephemeral hint for the next LLM call.
-		// The hint is consumed by buildCallMessages and never stored in history.
-		// Suppressed for sub-agents and pipeline nodes (they have narrower scopes).
-		if anyToolError && !a.IsSubAgent {
+		if anyToolError && !a.Mode.IsSubAgent {
 			a.hintOnNextCall = `A tool call above returned an error. ` +
 				`Read .ageage/docs/troubleshooting.md to diagnose common failure causes before retrying.`
 		}
 
-		// Check finish after all tools have been collected.
 		if a.finishTool.Finished {
-			a.messages = append(a.messages, llm.Message{
+			a.conv.Append(llm.Message{
 				Role:    "assistant",
 				Content: a.finishTool.Summary,
 			})
@@ -849,17 +811,13 @@ func (a *Agent) RunWithParts(ctx context.Context, userInput string, parts []llm.
 			if a.todoStore != nil && a.todoStore.IsComplete() {
 				a.todoStore.Clear()
 			}
-			a.gcTmp()
 			return a.finishTool.Summary, nil
 		}
 
-		// Check for cancellation after tool batch.
 		if ctx.Err() != nil {
 			return "(Task stopped by user)", nil
 		}
 
-		// Record this turn. Compress any turns older than the 2 most recent ones,
-		// preserving the last 2 full rounds intact for LLM context continuity.
 		a.pendingTurns = append(a.pendingTurns, turnRecord{
 			assistantMsg: cleanedMsg,
 			toolResults:  currentTurnResults,
@@ -876,18 +834,24 @@ func (a *Agent) RunWithParts(ctx context.Context, userInput string, parts []llm.
 }
 
 // runPipelineSkill executes a YAML-based pipeline skill.
+// Requires deps to be an *AgentFactory because pipeline nodes need LLM client
+// and debug flag access that are not part of the AgentDeps interface.
 func (a *Agent) runPipelineSkill(ctx context.Context, skill *skills.Skill, input string) (string, error) {
+	factory, ok := a.deps.(*AgentFactory)
+	if !ok {
+		return "", fmt.Errorf("pipeline skills require an AgentFactory")
+	}
 	exec := NewPipelineExecutor(
 		skill.Pipeline,
 		skill,
-		a.factory,
+		factory,
 		input,
-		a.SessionDir, // Pass session dir (Bug Fix 1)
+		a.SessionDir,
 		0,
-		a.TodoSendFunc,
-		a.TodoEditFunc,
-		a.NotifyFunc,
-		a.AskUserNotify,
+		a.Callbacks.TodoSend,
+		a.Callbacks.TodoEdit,
+		a.Callbacks.Notify,
+		a.Callbacks.AskUser,
 		a.ConfirmationMgr,
 		a.currentChannelID,
 		a.registry,
@@ -898,34 +862,23 @@ func (a *Agent) runPipelineSkill(ctx context.Context, skill *skills.Skill, input
 // gcTmp removes managed tmp files no longer referenced in the message history.
 func (a *Agent) gcTmp() {
 	if a.tmpMgr != nil {
-		a.tmpMgr.GC(a.messages)
+		a.tmpMgr.GC(a.conv.All())
 	}
 }
 
 // --- Output sanitization ---
 
-// thinkTagPairs lists the open/close pairs for all known thinking-block tag families.
 var thinkTagPairs = [][2]string{
 	{"<think>", "</think>"},
 	{"<thought>", "</thought>"},
 }
 
-// sanitizeOutput post-processes LLM text output before it is returned to the
-// caller or stored in history. It:
-//  1. Strips think/thought blocks anchored to the start of the response.
-//     Blocks that appear after real content are left intact — they are body
-//     text (e.g. the model discussing the tags), not internal reasoning.
-//  2. Converts common LaTeX math expressions to their Unicode equivalents so
-//     that IM platforms receive readable text instead of raw LaTeX.
 func sanitizeOutput(s string) string {
 	s = stripLeadingThinkBlocks(s)
 	s = convertLatex(s)
 	return strings.TrimSpace(s)
 }
 
-// stripLeadingThinkBlocks removes consecutive think/thought blocks from the
-// very start of a response. Blocks embedded after real content are left as-is.
-// An unclosed block at the start (truncated response) is discarded entirely.
 func stripLeadingThinkBlocks(s string) string {
 	for {
 		t := strings.TrimLeft(s, " \t\n\r")
@@ -936,8 +889,6 @@ func stripLeadingThinkBlocks(s string) string {
 			}
 			closeIdx := strings.Index(t, pair[1])
 			if closeIdx == -1 {
-				// Unclosed block at the start: response was truncated mid-thought.
-				// Return empty — there is no visible answer to show.
 				return ""
 			}
 			s = t[closeIdx+len(pair[1]):]
@@ -951,11 +902,7 @@ func stripLeadingThinkBlocks(s string) string {
 	return s
 }
 
-// readOnlyTools is the set of tool names that are guaranteed to have no side
-// effects and are therefore safe to run in parallel with other tools.
-// Every tool NOT in this set — including all MCP tools and unknown custom tools
-// — is conservatively treated as a mutation and causes the entire batch to be
-// serialised, preventing concurrent-write races.
+// readOnlyTools is the set of tool names guaranteed to have no side effects.
 var readOnlyTools = map[string]bool{
 	"file_read":     true,
 	"web_fetch":     true,
@@ -966,13 +913,10 @@ var readOnlyTools = map[string]bool{
 	"cron_list":     true,
 }
 
-// isReadOnlyTool reports whether name is a known side-effect-free tool.
 func isReadOnlyTool(name string) bool { return readOnlyTools[name] }
-
 
 // --- Debug helpers ---
 
-// debugIcons maps log categories to visual symbols.
 var debugIcons = map[string]string{
 	"Router":    "◆",
 	"Tool▷":     "▷",
@@ -995,8 +939,6 @@ func (a *Agent) debugSeparator(iteration int) {
 	fmt.Printf("\n── %s%s\n", label, strings.Repeat("─", pad))
 }
 
-// debugIndent is the column offset of message content in debugLog output.
-// Format: "  X  CATEGORY   " = 2 + 1(icon) + 2 + 10(category) + 1 = 16 visual cols.
 const debugIndent = "                "
 
 func (a *Agent) debugLog(category, format string, args ...interface{}) {
@@ -1008,7 +950,6 @@ func (a *Agent) debugLog(category, format string, args ...interface{}) {
 	if !ok {
 		icon = "·"
 	}
-	// Indent continuation lines so they align with the column.
 	msg = strings.ReplaceAll(msg, "\n", "\n"+debugIndent)
 	fmt.Printf("  %s  %-10s %s\n", icon, category, msg)
 }
@@ -1021,9 +962,6 @@ func (a *Agent) debugBlankLine() {
 
 // --- Token optimization ---
 
-// compactToolResult truncates tool output stored in message history to save tokens.
-// The full result is already used by the current iteration; the history only needs
-// enough context for subsequent iterations.
 const maxToolResultInHistory = 4000
 
 func compactToolResult(result string) string {
@@ -1031,11 +969,9 @@ func compactToolResult(result string) string {
 	if len(runes) <= maxToolResultInHistory {
 		return result
 	}
-	// Keep the first portion and a note about truncation.
 	return string(runes[:maxToolResultInHistory]) + "\n\n[... output truncated for token efficiency. Key information is above.]"
 }
 
-// ensureFinishTask makes sure finish_task is always in the tool list.
 func ensureFinishTask(toolNames []string) []string {
 	for _, n := range toolNames {
 		if n == "finish_task" {
@@ -1045,9 +981,8 @@ func ensureFinishTask(toolNames []string) []string {
 	return append(toolNames, "finish_task")
 }
 
-// compressOldestTurn compresses the oldest pending turn in-place, replacing its
-// assistant + tool-result messages with a single narrative assistant message.
-// Indices of remaining pending turns are updated to reflect the splice.
+// compressOldestTurn replaces the oldest pending turn's messages with a single
+// narrative assistant message, updating pending-turn indices accordingly.
 func (a *Agent) compressOldestTurn() {
 	if len(a.pendingTurns) == 0 {
 		return
@@ -1057,22 +992,14 @@ func (a *Agent) compressOldestTurn() {
 
 	start := oldest.msgStart
 	end := start + oldest.msgCount
-	if end > len(a.messages) {
-		return // sanity guard
+	if end > a.conv.Len() {
+		return
 	}
 
 	narrative := buildTurnNarrative(oldest.assistantMsg, oldest.toolResults)
 	compressed := llm.Message{Role: "assistant", Content: narrative}
 
-	// Splice [start, end) → [compressed].
-	removed := oldest.msgCount - 1
-	newMsgs := make([]llm.Message, 0, len(a.messages)-removed)
-	newMsgs = append(newMsgs, a.messages[:start]...)
-	newMsgs = append(newMsgs, compressed)
-	newMsgs = append(newMsgs, a.messages[end:]...)
-	a.messages = newMsgs
-
-	// Shift indices of remaining (newer) pending turns.
+	removed := a.conv.Splice(start, end, compressed)
 	for i := range a.pendingTurns {
 		a.pendingTurns[i].msgStart -= removed
 	}
@@ -1080,9 +1007,6 @@ func (a *Agent) compressOldestTurn() {
 	a.debugLog("History", "%d messages → 1 narrative", oldest.msgCount)
 }
 
-// buildTurnNarrative creates a factual work-log string for a completed tool-call turn.
-// It avoids "called tool / arguments" framing so the LLM reads it as memory,
-// not as a prompt to repeat tool invocations.
 func buildTurnNarrative(assistantMsg llm.Message, toolResults []string) string {
 	var sb strings.Builder
 	if assistantMsg.Content != "" {
@@ -1101,10 +1025,7 @@ func buildTurnNarrative(assistantMsg llm.Message, toolResults []string) string {
 	return sb.String()
 }
 
-// briefActionSummary converts a tool name + raw JSON args into a short human-readable
-// action description, without exposing "tool call" framing to the LLM.
 func briefActionSummary(toolName, rawArgs string) string {
-	// Try to extract the single most meaningful field from JSON args.
 	param := extractPrimaryArg(rawArgs)
 
 	switch toolName {
@@ -1134,45 +1055,39 @@ func briefActionSummary(toolName, rawArgs string) string {
 		}
 	case "memory_store":
 		if param != "" {
-			return "Stored memory: " + param
+			return "Stored: " + param
 		}
 	case "memory_recall":
 		if param != "" {
-			return "Recalled memory: " + param
+			return "Recalled: " + param
 		}
-	case "memory_forget":
+	case "file_list":
 		if param != "" {
-			return "Removed memory: " + param
+			return "Listed: " + param
 		}
-	case "cron_add":
+	case "glob":
 		if param != "" {
-			return "Scheduled: " + param
+			return "Globbed: " + param
 		}
-	case "cron_remove":
-		return "Removed scheduled task"
-	case "cron_list":
-		return "Listed scheduled tasks"
-	case "finish_task":
-		return "Completed task"
-	case "delegate", "escalate":
+	case "grep":
 		if param != "" {
-			return "Delegated: " + param
+			return "Grepped: " + param
 		}
+	case "finish_task", "node_complete":
+		if param != "" {
+			return "Finished: " + param
+		}
+		return "Finished task"
 	}
-
-	// Generic fallback: toolName + abbreviated param.
 	if param != "" {
 		return toolName + ": " + param
 	}
 	return toolName
 }
 
-// extractPrimaryArg parses JSON args and returns the value of the most meaningful field.
-// Priority order covers the most common tool parameter names.
 func extractPrimaryArg(rawArgs string) string {
 	var m map[string]interface{}
 	if err := json.Unmarshal([]byte(rawArgs), &m); err != nil {
-		// Not JSON — truncate and return raw.
 		if len(rawArgs) > 120 {
 			return rawArgs[:120] + "…"
 		}
@@ -1190,7 +1105,6 @@ func extractPrimaryArg(rawArgs string) string {
 		}
 	}
 
-	// Fall back to the first string-valued field found.
 	for _, v := range m {
 		if s, ok := v.(string); ok {
 			if len(s) > 120 {
@@ -1215,7 +1129,6 @@ func UniqueStrings(input []string) []string {
 	return out
 }
 
-// truncateStr truncates a string for debug display.
 func truncateStr(s string, max int) string {
 	if len(s) <= max {
 		return s
@@ -1224,9 +1137,9 @@ func truncateStr(s string, max int) string {
 }
 
 // buildCallMessages returns the message slice to send to the LLM this turn.
-// It appends a temporary "user" message containing the current time, workspace,
-// and any active todos at the very end — never touching the stored a.messages.
-// Keeping all prior messages byte-identical maximises KV cache reuse.
+// Appends a temporary context message (time, workspace, todos) at the end
+// without touching the stored conversation — this keeps prior messages
+// byte-identical across turns, maximising KV cache reuse.
 func (a *Agent) buildCallMessages() []llm.Message {
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "<context>Time: %s | Workspace: %s | OS: %s | Arch: %s</context>",
@@ -1241,22 +1154,14 @@ func (a *Agent) buildCallMessages() []llm.Message {
 		}
 	}
 
-	// Consume the ephemeral error hint (set when a tool failed last iteration).
-	// Appended after the context block so it gets the agent's attention without
-	// polluting persistent history or the stable system-prompt prefix.
 	if a.hintOnNextCall != "" {
 		fmt.Fprintf(&sb, "\n[Framework] %s", a.hintOnNextCall)
 		a.hintOnNextCall = ""
 	}
 
 	ctxStr := sb.String()
-	// Create a copy of the message history to avoid mutating a.messages directly.
-	out := make([]llm.Message, len(a.messages))
-	copy(out, a.messages)
+	out := a.conv.Snapshot()
 
-	// To keep the API happy (alternating roles) and the context effective:
-	// 1. If the last message is from User, append the context to it.
-	// 2. Otherwise, append a new User message with the context.
 	if len(out) > 0 && out[len(out)-1].Role == "user" {
 		lastIdx := len(out) - 1
 		if len(out[lastIdx].Parts) > 0 {
@@ -1279,21 +1184,19 @@ func (a *Agent) trySummarize(ctx context.Context) {
 	if a.summarizer == nil {
 		return
 	}
-
-	if !a.summarizer.ShouldSummarize(a.messages) {
+	if !a.summarizer.ShouldSummarize(a.conv.All()) {
 		return
 	}
 
-	oldCount := len(a.messages)
-	newMessages, err := a.summarizer.Summarize(ctx, a.messages)
+	oldCount := a.conv.Len()
+	newMessages, err := a.summarizer.Summarize(ctx, a.conv.All())
 	if err != nil {
 		a.debugLog("Summarize", "failed: %s", err)
 		return
 	}
 
-	a.messages = newMessages
-	// pendingTurns hold indices into the old message slice; they become stale
-	// after summarization replaces the entire history. Drop them so
+	a.conv.Reset(newMessages)
+	// pendingTurns hold indices into the old message slice; clear them so
 	// compressOldestTurn doesn't iterate over invalid records.
 	a.pendingTurns = nil
 	a.debugLog("Summarize", "compressed %d → %d messages", oldCount, len(newMessages))
@@ -1307,26 +1210,23 @@ func (a *Agent) GetRegistry() *tools.Registry {
 // TmpManager returns the agent's tmp file manager (for CLI attachment processing).
 func (a *Agent) TmpManager() *TmpManager { return a.tmpMgr }
 
-// LastTurnUserMessage returns the last user message in the conversation history
-// and whether one was found. Tool-result messages are skipped.
+// LastTurnUserMessage returns the last user message in the conversation history.
 func (a *Agent) LastTurnUserMessage() (llm.Message, bool) {
-	for i := len(a.messages) - 1; i >= 0; i-- {
-		if a.messages[i].Role == "user" {
-			return a.messages[i], true
+	msgs := a.conv.All()
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role == "user" {
+			return msgs[i], true
 		}
 	}
 	return llm.Message{}, false
 }
 
-// RollbackLastTurn removes the last complete user→assistant exchange from
-// history (one user message plus all subsequent assistant/tool messages that
-// followed it). It also trims pendingTurns accordingly.
-// Returns the number of messages removed, or 0 if there was nothing to roll back.
+// RollbackLastTurn removes the last complete user→assistant exchange from history.
 func (a *Agent) RollbackLastTurn() int {
-	// Find the last user message index.
+	msgs := a.conv.All()
 	lastUserIdx := -1
-	for i := len(a.messages) - 1; i >= 0; i-- {
-		if a.messages[i].Role == "user" {
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role == "user" {
 			lastUserIdx = i
 			break
 		}
@@ -1335,12 +1235,10 @@ func (a *Agent) RollbackLastTurn() int {
 		return 0
 	}
 
-	removed := len(a.messages) - lastUserIdx
-	// Use 3-index slice to break backing-array reference, preventing memory leak.
-	a.messages = a.messages[:lastUserIdx:lastUserIdx]
+	removed := len(msgs) - lastUserIdx
+	a.conv.TruncateTo(lastUserIdx)
 
-	// Trim pendingTurns: drop any whose msgStart is at or after lastUserIdx.
-	kept := a.pendingTurns[:0:0] // empty, own backing array
+	kept := a.pendingTurns[:0:0]
 	for _, pt := range a.pendingTurns {
 		if pt.msgStart < lastUserIdx {
 			kept = append(kept, pt)
@@ -1353,7 +1251,7 @@ func (a *Agent) RollbackLastTurn() int {
 
 // ClearHistory resets the conversation history, pending turn queue, and todo list.
 func (a *Agent) ClearHistory() {
-	a.messages = nil
+	a.conv.Reset(nil)
 	a.pendingTurns = nil
 	if a.todoStore != nil {
 		a.todoStore.Clear()
@@ -1363,15 +1261,12 @@ func (a *Agent) ClearHistory() {
 	}
 }
 
-
 // SetChannelID sets the current channel ID for async confirmations.
 func (a *Agent) SetChannelID(channelID string) {
 	a.currentChannelID = channelID
 }
 
 // SetLLMClient overrides the LLM client for this agent.
-// Also updates the summarizer's client so it uses matching credentials
-// if the new client connects to a different API provider.
 func (a *Agent) SetLLMClient(client *llm.Client) {
 	a.client = client
 	if a.summarizer != nil {
@@ -1384,29 +1279,22 @@ func (a *Agent) GetChannelID() string {
 	return a.currentChannelID
 }
 
-// AddHistory adds historical messages to the conversation context without triggering agent execution.
-// This is used when process_history is enabled to load pre-existing messages into context.
+// AddHistory adds historical messages to the conversation context without
+// triggering agent execution.
 func (a *Agent) AddHistory(userInput, assistantReply string) {
-	if len(a.messages) == 0 {
-		// AddHistory is used to pre-load prior conversation; no skill is active.
-		a.messages = append(a.messages, llm.Message{
+	if a.conv.Len() == 0 {
+		a.conv.Append(llm.Message{
 			Role:    "system",
 			Content: a.buildSystemPrompt(nil),
 		})
 	}
 
 	if userInput != "" {
-		a.messages = append(a.messages, llm.Message{
-			Role:    "user",
-			Content: userInput,
-		})
+		a.conv.Append(llm.Message{Role: "user", Content: userInput})
 	}
 
 	if assistantReply != "" {
-		a.messages = append(a.messages, llm.Message{
-			Role:    "assistant",
-			Content: sanitizeOutput(assistantReply),
-		})
+		a.conv.Append(llm.Message{Role: "assistant", Content: sanitizeOutput(assistantReply)})
 	}
 
 	a.trySummarize(context.Background())

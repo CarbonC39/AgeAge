@@ -83,9 +83,9 @@ func (t *DelegateTool) Execute(ctx context.Context, args json.RawMessage) (strin
 
 	// Create the sub-agent with dynamically filtered tools.
 	subAgent := t.factory.CreateAgentFiltered(nil, "", UniqueStrings(safeTools))
-	subAgent.InjectSoul = false   // sub-agents never get personality injection
-	subAgent.InjectContext = false // delegate sub-agents don't need workspace context
-	subAgent.IsSubAgent = true
+	subAgent.Mode.InjectSoul = false
+	subAgent.Mode.InjectContext = false
+	subAgent.Mode.IsSubAgent = true
 	subAgent.MaxIterations = t.factory.Config.SubAgent.MaxIterations
 
 	// Set sub-agent specific model if configured.

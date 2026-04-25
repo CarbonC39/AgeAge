@@ -29,6 +29,7 @@ type Config struct {
 	MCP         MCPConfig         `toml:"mcp"`
 	Channels  ChannelConfig   `toml:"channels"`
 	Server    ServerConfig    `toml:"server"`
+	Eval      EvalConfig      `toml:"eval"`
 }
 
 // PipelineModels maps pipeline node complexity levels to specific model configs.
@@ -50,6 +51,16 @@ type SubAgentConfig struct {
 	MaxIterations int         `toml:"max_iterations"` // Maximum iterations for sub-agent
 	Timeout       int         `toml:"timeout"`        // Timeout in seconds for sub-agent
 	Model         ModelConfig `toml:"model"`          // Optional independent model for sub-agent
+}
+
+// EvalConfig holds settings for the Evaluator quality-check system.
+type EvalConfig struct {
+	// SuccessThreshold is the number of consecutive evaluator passes before an
+	// auto-generated skill graduates and evaluation stops. 0 means always evaluate.
+	SuccessThreshold int         `toml:"success_threshold"`
+	// Model is used for evaluation when success_count >= 1 (cheaper tier).
+	// Defaults to [router.medium] when empty.
+	Model            ModelConfig `toml:"model"`
 }
 
 
@@ -315,6 +326,9 @@ func DefaultConfig() *Config {
 		Server: ServerConfig{
 			Host: "127.0.0.1",
 			Port: 8080,
+		},
+		Eval: EvalConfig{
+			SuccessThreshold: 3,
 		},
 	}
 }

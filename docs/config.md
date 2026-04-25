@@ -105,6 +105,29 @@ If the sub-agent model fails, the `delegate` tool automatically retries with the
 
 ---
 
+## `[pipeline]`
+
+Controls the execution behavior of pipeline skills.
+
+```toml
+[pipeline]
+foreach_concurrency = 1   # Max parallel iterations for foreach nodes
+
+[pipeline.models]
+# Model overrides for specific node complexities
+simple = { model = "gpt-4o-mini" }
+medium = { model = "claude-3-haiku" }
+complex = { model = "gpt-4o" }
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `foreach_concurrency` | int | `1` | Max parallel iterations for foreach loops. `0` or `1` = sequential. `>1` runs iterations concurrently. |
+
+**`[pipeline.models]`** — overrides the `[router]` models for specific pipeline node complexities. If left empty, pipeline execution falls back to `[router.medium]` or `[router.strong]`.
+
+---
+
 ## `[router]`
 
 The router is a lightweight LLM call that runs before each user turn. It classifies task complexity, selects the required tools, and optionally provides a direct answer for simple queries — all without loading the full agent.
@@ -148,6 +171,26 @@ model = ""
 | `[router.strong]`| Agent execution on complex tasks; also used by the `escalate` skill-only tool. |
 
 > **Note:** The router always sends requests with `response_format: {type: "json_object"}` to prevent markdown-wrapped output from causing parse failures.
+
+---
+
+## `[eval]`
+
+Controls the background quality checker (Evaluator) that verifies auto-generated skills.
+
+```toml
+[eval]
+success_threshold = 3
+
+[eval.model]
+model = "gpt-4o-mini"
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `success_threshold` | int | `3` | Number of consecutive successful evaluator passes before an auto-generated skill graduates and evaluation stops. `0` means always evaluate. |
+
+**`[eval.model]`** — specifies a cheaper model to use for evaluation when the skill has passed at least once. If left empty, it falls back to `[router.medium]`.
 
 ---
 

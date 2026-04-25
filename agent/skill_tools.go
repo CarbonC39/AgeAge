@@ -5,9 +5,6 @@ package agent
 //  1. Per-turn injection when a matched skill declares them in required_tools.
 //  2. At factory time when listed in agent.tools config (global allowlist).
 //  3. At factory time when listed in the sub-agent allowedTools parameter.
-//
-// Factory signature: func(factory *AgentFactory, registry *tools.Registry) tools.Tool
-// Both parameters may be used by tools that need sub-agent creation or config access.
 
 import (
 	"context"
@@ -22,55 +19,62 @@ import (
 )
 
 // skillOnlyToolFactories is the registry of all skill-only tools.
-// Factory signature: func(factory, registry, agent) Tool
+// Factory signature: func(deps AgentDeps, registry, agent) Tool
 // The agent pointer is provided so tools can read/write per-run agent state
-// (e.g. todoStore) and access NotifyFunc.
-var skillOnlyToolFactories = map[string]func(*AgentFactory, *tools.Registry, *Agent) tools.Tool{
-	"grep": func(f *AgentFactory, _ *tools.Registry, _ *Agent) tools.Tool {
-		return &tools.GrepTool{Security: f.SecurityChecker}
+// (e.g. todoStore) and access Callbacks.
+// A factory may return nil if it requires capabilities beyond AgentDeps
+// (e.g. escalate needs a full *AgentFactory for model selection).
+var skillOnlyToolFactories = map[string]func(AgentDeps, *tools.Registry, *Agent) tools.Tool{
+	"grep": func(f AgentDeps, _ *tools.Registry, _ *Agent) tools.Tool {
+		return &tools.GrepTool{Security: f.GetSecurity()}
 	},
-	"glob": func(f *AgentFactory, _ *tools.Registry, _ *Agent) tools.Tool {
-		return &tools.GlobTool{Security: f.SecurityChecker, Workspace: f.Config.EffectiveWorkDir()}
+	"glob": func(f AgentDeps, _ *tools.Registry, _ *Agent) tools.Tool {
+		return &tools.GlobTool{Security: f.GetSecurity(), Workspace: f.GetConfig().EffectiveWorkDir()}
 	},
-	"tree": func(f *AgentFactory, _ *tools.Registry, _ *Agent) tools.Tool {
-		return &tools.TreeTool{WorkDir: f.Config.EffectiveWorkDir()}
+	"tree": func(f AgentDeps, _ *tools.Registry, _ *Agent) tools.Tool {
+		return &tools.TreeTool{WorkDir: f.GetConfig().EffectiveWorkDir()}
 	},
-	"update_todos": func(f *AgentFactory, _ *tools.Registry, a *Agent) tools.Tool {
+	"update_todos": func(_ AgentDeps, _ *tools.Registry, a *Agent) tools.Tool {
 		store := &tools.TodoStore{}
-		if a.TodoSendFunc != nil {
-			store.SendFunc = a.TodoSendFunc
-			store.EditFunc = a.TodoEditFunc
+		if a.Callbacks.TodoSend != nil {
+			store.SendFunc = a.Callbacks.TodoSend
+			store.EditFunc = a.Callbacks.TodoEdit
 		} else {
-			store.NotifyFunc = a.NotifyFunc
+			store.NotifyFunc = a.Callbacks.Notify
 		}
 		a.todoStore = store
 		return &tools.UpdateTodosTool{Store: store}
 	},
-	"ask_user": func(f *AgentFactory, _ *tools.Registry, a *Agent) tools.Tool {
+	"ask_user": func(f AgentDeps, _ *tools.Registry, a *Agent) tools.Tool {
 		return &tools.AskUserTool{
 			ChannelID:     a.GetChannelID(),
-			Manager:       f.UserInputMgr,
-			NotifyFuncPtr: &a.AskUserNotify,
+			Manager:       f.GetUserInputMgr(),
+			NotifyFuncPtr: &a.Callbacks.AskUser,
 		}
 	},
-	"escalate": func(f *AgentFactory, r *tools.Registry, _ *Agent) tools.Tool {
-		return &EscalateTool{factory: f, registry: r}
+	"escalate": func(f AgentDeps, r *tools.Registry, _ *Agent) tools.Tool {
+		// EscalateTool needs LLM client and debug flag, which require a full factory.
+		factory, ok := f.(*AgentFactory)
+		if !ok {
+			return nil
+		}
+		return &EscalateTool{factory: factory, registry: r}
 	},
-	"browser_navigate": func(f *AgentFactory, _ *tools.Registry, a *Agent) tools.Tool {
+	"browser_navigate": func(f AgentDeps, _ *tools.Registry, a *Agent) tools.Tool {
 		if a.browserSess == nil {
-			a.browserSess = tools.NewBrowserSession(&f.Config.Browser)
+			a.browserSess = tools.NewBrowserSession(&f.GetConfig().Browser)
 		}
 		return &tools.BrowserNavigateTool{Session: a.browserSess}
 	},
-	"browser_action": func(f *AgentFactory, _ *tools.Registry, a *Agent) tools.Tool {
+	"browser_action": func(f AgentDeps, _ *tools.Registry, a *Agent) tools.Tool {
 		if a.browserSess == nil {
-			a.browserSess = tools.NewBrowserSession(&f.Config.Browser)
+			a.browserSess = tools.NewBrowserSession(&f.GetConfig().Browser)
 		}
 		return &tools.BrowserActionTool{Session: a.browserSess}
 	},
-	"browser_content": func(f *AgentFactory, _ *tools.Registry, a *Agent) tools.Tool {
+	"browser_content": func(f AgentDeps, _ *tools.Registry, a *Agent) tools.Tool {
 		if a.browserSess == nil {
-			a.browserSess = tools.NewBrowserSession(&f.Config.Browser)
+			a.browserSess = tools.NewBrowserSession(&f.GetConfig().Browser)
 		}
 		return &tools.BrowserContentTool{Session: a.browserSess}
 	},
@@ -122,7 +126,6 @@ func runSkillDelegate(
 	modelCfg config.ModelConfig,
 	label string,
 ) (string, error) {
-	// Filter out delegation tools.
 	var safeTools []string
 	for _, t := range a.Tools {
 		if !delegateBlacklist[t] {
@@ -131,12 +134,11 @@ func runSkillDelegate(
 	}
 
 	subAgent := factory.CreateAgentFiltered(nil, "", UniqueStrings(safeTools))
-	subAgent.InjectSoul = false   // sub-agents never get personality injection
-	subAgent.InjectContext = false // delegate sub-agents don't need workspace context
-	subAgent.IsSubAgent = true
+	subAgent.Mode.InjectSoul = false
+	subAgent.Mode.InjectContext = false
+	subAgent.Mode.IsSubAgent = true
 	subAgent.MaxIterations = factory.Config.SubAgent.MaxIterations
 
-	// Resolve and apply model (falls back to base LLM if model config is empty).
 	modelName, apiKey, baseURL := modelCfg.Resolve(
 		factory.Config.LLM.Model,
 		factory.LLMClient.APIKey(),
@@ -148,7 +150,6 @@ func runSkillDelegate(
 		fmt.Printf("  ⤷  %-10s %s  [%s]\n", label, a.Task, modelName)
 	}
 
-	// Execute optional pre-tool.
 	if a.PreTool != "" {
 		if factory.Debug {
 			fmt.Printf("  ⤷  %-10s pre-tool: %s\n", label, a.PreTool)
@@ -163,7 +164,6 @@ func runSkillDelegate(
 		)
 	}
 
-	// Cap with SubAgent.Timeout if configured; inherit parent ctx so /stop propagates.
 	execCtx := ctx
 	if factory.Config.SubAgent.Timeout > 0 {
 		var cancel context.CancelFunc
@@ -188,8 +188,7 @@ func runSkillDelegate(
 // ── EscalateTool ────────────────────────────────────────────────────────────
 
 // EscalateTool delegates a sub-task to a powerful sub-agent using the
-// configured strong model. Skill-only; use when the task demands the highest
-// quality reasoning that the base agent model cannot provide.
+// configured strong model.
 type EscalateTool struct {
 	factory  *AgentFactory
 	registry *tools.Registry

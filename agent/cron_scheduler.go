@@ -67,12 +67,12 @@ func (s *CronScheduler) runEntry(ctx context.Context, e tools.CronEntry) {
 
 	ag := s.factory.CreateAgent(nil, "cron")
 	ag.SessionDir = sm.SessionDir(sessionID)
-	ag.InjectContext = false // no interactive CONTEXT.md for background tasks
-	ag.InjectSoul = false    // no personality for background tasks
+	ag.Mode.InjectContext = false
+	ag.Mode.InjectSoul = false
 
 	// Restore prior history so recurring tasks can build up context over time.
 	if msgs, err := sm.LoadHistory(sessionID); err == nil {
-		ag.messages = msgs
+		ag.SetMessages(msgs)
 	}
 
 	if s.factory.Debug {
@@ -89,7 +89,7 @@ func (s *CronScheduler) runEntry(ctx context.Context, e tools.CronEntry) {
 		fmt.Printf("[cron] %s done: %s\n", e.ID, truncateStr(result, 300))
 	}
 
-	if err := sm.SaveHistory(sessionID, ag.messages); err != nil {
+	if err := sm.SaveHistory(sessionID, ag.Messages()); err != nil {
 		fmt.Printf("[cron] %s: history save error: %v\n", e.ID, err)
 	}
 }

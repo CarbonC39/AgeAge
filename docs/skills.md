@@ -60,6 +60,15 @@ A one-line summary of what the skill does. Shown to the **router** when the skil
 description: "Review code files for bugs, style issues, and security problems."
 ```
 
+### `auto_generated` and `success_count` *(boolean/int, optional)*
+
+Used by the **Planner** and **Evaluator**. When the Planner creates a skill automatically, it sets `auto_generated: true` and `success_count: 0`. The background Evaluator checks these skills after execution and increments `success_count` on passes.
+
+```yaml
+auto_generated: true
+success_count: 0
+```
+
 ### `required_tools` *(string list, optional)*
 
 The tools the agent is allowed to use while this skill is active. Only tools that exist in the global registry (or the skill-only tool list below) can be listed.

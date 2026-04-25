@@ -32,6 +32,7 @@ type SessionInfo struct {
 	ID         string    // full session ID (directory name)
 	TurnCount  int       // number of completed user→assistant turns
 	ModTime    time.Time // last-modified time of the session directory
+	Preview    string    // first 50 chars of the last user message (best-effort)
 }
 
 // historyRecord is the on-disk representation of a single llm.Message.
@@ -115,12 +116,19 @@ func (sm *SessionManager) List() ([]SessionInfo, error) {
 		}
 		id := e.Name()
 
-		// Count turns (each turn = one user message + one assistant reply).
+		// Count turns and capture a preview of the last user message.
 		turns := 0
+		preview := ""
 		if msgs, err := sm.LoadHistory(id); err == nil {
 			for _, m := range msgs {
 				if m.Role == "user" {
 					turns++
+					// Keep updating so we end up with the LAST user message.
+					t := m.TextContent()
+					if len([]rune(t)) > 50 {
+						t = string([]rune(t)[:50]) + "…"
+					}
+					preview = t
 				}
 			}
 		}
@@ -131,7 +139,7 @@ func (sm *SessionManager) List() ([]SessionInfo, error) {
 			modTime = fi.ModTime()
 		}
 
-		infos = append(infos, SessionInfo{ID: id, TurnCount: turns, ModTime: modTime})
+		infos = append(infos, SessionInfo{ID: id, TurnCount: turns, ModTime: modTime, Preview: preview})
 	}
 
 	// Sort newest first.

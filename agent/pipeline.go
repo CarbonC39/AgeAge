@@ -26,8 +26,7 @@ const (
 //
 // Nodes run sequentially in isolation (each agent node gets a fresh sub-agent
 // with no shared conversation history). Variables flow between nodes via a
-// shared vars map. Context strings from output_context nodes accumulate and
-// are prepended to subsequent node prompts.
+// shared vars map.
 type PipelineExecutor struct {
 	ps        *skills.PipelineSkill
 	skill     *skills.Skill   // wrapping Skill metadata (name, description)
@@ -35,10 +34,14 @@ type PipelineExecutor struct {
 	sharedReg *tools.Registry // parent registry; used by auto nodes for direct tool calls
 
 	vars       map[string]interface{} // live pipeline variable state
-	contexts   []string               // accumulated context strings from output_context nodes
-	sessionDir string                 // directory for the active session (Bug Fix 1)
+	sessionDir string                 // directory for the active session
 	nestDepth  int                    // 0 = top-level; nested pipeline skills run at depth 1
 	debug      bool
+
+	// Soul injection: index of the last agent node in the pipeline.
+	// SOUL.md is injected only in that node (if factory.InjectSoul is true).
+	lastAgentNodeIdx int // -1 = no agent nodes
+	currentNodeIdx   int // updated each iteration in Run()
 
 	// Todo notification callbacks — mirror the parent Agent fields.
 	sendFn        func(text string) string
@@ -111,7 +114,16 @@ func (e *PipelineExecutor) Run(ctx context.Context) (string, error) {
 		e.updateTodos()
 	}
 
-	for _, node := range e.ps.Pipeline {
+	// Compute last agent node index once; only that node gets SOUL injection.
+	e.lastAgentNodeIdx = -1
+	for i, node := range e.ps.Pipeline {
+		if strings.ToLower(node.Type) != "auto" {
+			e.lastAgentNodeIdx = i
+		}
+	}
+
+	for i, node := range e.ps.Pipeline {
+		e.currentNodeIdx = i
 		if ctx.Err() != nil {
 			return "", ctx.Err()
 		}
@@ -121,21 +133,20 @@ func (e *PipelineExecutor) Run(ctx context.Context) (string, error) {
 			e.updateTodos()
 		}
 
-		// Each node execution returns outputs in a local map and a context string.
-		// Merging into e.vars and e.contexts happens here (after the node completes)
-		// so that node execution functions never write directly to shared state —
+		// Each node execution writes outputs into a local map.
+		// Merging into e.vars happens here (after the node completes) so that
+		// node execution functions never write directly to shared state —
 		// this is what makes parallel foreach safe.
 		out := make(map[string]interface{})
-		var nodeCtx string
 		var err error
 
 		if node.Foreach != "" {
 			err = e.execForeach(ctx, node)
-			// execForeach merges its own outputs/contexts directly; out is unused.
+			// execForeach merges its own outputs directly; out is unused.
 		} else {
-			nodeCtx, err = e.execNode(ctx, node, nil, -1, out)
+			err = e.execNode(ctx, node, nil, -1, out)
 			if err == nil {
-				e.mergeOutputs(node, out, nodeCtx)
+				e.mergeOutputs(out)
 			}
 		}
 
@@ -163,13 +174,7 @@ func (e *PipelineExecutor) Run(ctx context.Context) (string, error) {
 		}
 	}
 
-	// Build final result. Priority:
-	//   1. Accumulated context from output_context nodes.
-	//   2. Common output variable names.
-	//   3. Fallback message.
-	if len(e.contexts) > 0 {
-		return strings.Join(e.contexts, "\n\n"), nil
-	}
+	// Return the first common output variable found, or a fallback message.
 	for _, name := range []string{"result", "output", "answer"} {
 		if v, ok := e.vars[name]; ok {
 			return fmt.Sprintf("%v", v), nil
@@ -178,14 +183,11 @@ func (e *PipelineExecutor) Run(ctx context.Context) (string, error) {
 	return "Pipeline completed successfully.", nil
 }
 
-// mergeOutputs writes a node's out map into e.vars and appends context.
+// mergeOutputs writes a node's out map into e.vars.
 // Called by Run() for non-foreach nodes; execForeach manages its own merging.
-func (e *PipelineExecutor) mergeOutputs(node skills.PipelineNode, out map[string]interface{}, nodeCtx string) {
+func (e *PipelineExecutor) mergeOutputs(out map[string]interface{}) {
 	for pipelineVar, v := range out {
 		e.vars[pipelineVar] = v
-	}
-	if node.OutputContext && nodeCtx != "" {
-		e.contexts = append(e.contexts, nodeCtx)
 	}
 }
 
@@ -195,7 +197,12 @@ func (e *PipelineExecutor) mergeOutputs(node skills.PipelineNode, out map[string
 // After all iterations, per-output-key values are collected as slices and
 // written to e.vars. Parallel execution is used when Config.Pipeline.ForeachConcurrency > 1.
 func (e *PipelineExecutor) execForeach(ctx context.Context, node skills.PipelineNode) error {
-	arrayVal := e.resolveValue(node.Foreach, nil, -1)
+	// Normalize foreach var: bare names (no $ prefix) resolve as $vars.name.
+	foreachRef := node.Foreach
+	if foreachRef != "" && !strings.HasPrefix(foreachRef, "$") {
+		foreachRef = "$vars." + foreachRef
+	}
+	arrayVal := e.resolveValue(foreachRef, nil, -1)
 	if arrayVal == nil {
 		return fmt.Errorf("foreach variable %q is nil or not found", node.Foreach)
 	}
@@ -226,16 +233,12 @@ func (e *PipelineExecutor) execForeach(ctx context.Context, node skills.Pipeline
 				return ctx.Err()
 			}
 			out := make(map[string]interface{})
-			nodeCtx, err := e.execNode(ctx, node, item, idx, out)
-			if err != nil {
+			if err := e.execNode(ctx, node, item, idx, out); err != nil {
 				return fmt.Errorf("foreach iteration %d: %w", idx, err)
 			}
 			// Collect outputs per pipeline var (will become slices).
 			for pipelineVar := range node.Outputs {
 				outputAccum[pipelineVar] = append(outputAccum[pipelineVar], out[pipelineVar])
-			}
-			if node.OutputContext && nodeCtx != "" {
-				e.contexts = append(e.contexts, nodeCtx)
 			}
 		}
 	} else {
@@ -244,10 +247,9 @@ func (e *PipelineExecutor) execForeach(ctx context.Context, node skills.Pipeline
 		// e.vars. A cancellable sub-context lets the first error stop the
 		// remaining goroutines.
 		type iterResult struct {
-			idx     int
-			out     map[string]interface{}
-			context string
-			err     error
+			idx int
+			out map[string]interface{}
+			err error
 		}
 
 		subCtx, subCancel := context.WithCancel(ctx)
@@ -262,8 +264,8 @@ func (e *PipelineExecutor) execForeach(ctx context.Context, node skills.Pipeline
 				defer func() { <-sem }()
 
 				out := make(map[string]interface{})
-				nodeCtx, err := e.execNode(subCtx, node, item, idx, out)
-				resCh <- iterResult{idx: idx, out: out, context: nodeCtx, err: err}
+				err := e.execNode(subCtx, node, item, idx, out)
+				resCh <- iterResult{idx: idx, out: out, err: err}
 			}(i, it)
 		}
 
@@ -287,9 +289,6 @@ func (e *PipelineExecutor) execForeach(ctx context.Context, node skills.Pipeline
 			for pipelineVar := range node.Outputs {
 				outputAccum[pipelineVar] = append(outputAccum[pipelineVar], r.out[pipelineVar])
 			}
-			if node.OutputContext && r.context != "" {
-				e.contexts = append(e.contexts, r.context)
-			}
 		}
 	}
 
@@ -304,8 +303,7 @@ func (e *PipelineExecutor) execForeach(ctx context.Context, node skills.Pipeline
 
 // execNode validates and dispatches to the correct executor (agent or auto).
 // Outputs are written to `out` (keyed by PIPELINE VAR NAME from node.Outputs).
-// Returns (context_string, error); context is non-empty only when node.OutputContext=true.
-func (e *PipelineExecutor) execNode(ctx context.Context, node skills.PipelineNode, foreachItem interface{}, foreachIdx int, out map[string]interface{}) (string, error) {
+func (e *PipelineExecutor) execNode(ctx context.Context, node skills.PipelineNode, foreachItem interface{}, foreachIdx int, out map[string]interface{}) error {
 	if node.Validate == "not_empty" {
 		for argName, varRef := range node.Inputs {
 			val := e.resolveValue(varRef, foreachItem, foreachIdx)
@@ -314,7 +312,7 @@ func (e *PipelineExecutor) execNode(ctx context.Context, node skills.PipelineNod
 				isEmpty = true
 			}
 			if isEmpty {
-				return "", fmt.Errorf("node %q validation failed: input %q is empty", node.ID, argName)
+				return fmt.Errorf("node %q validation failed: input %q is empty", node.ID, argName)
 			}
 		}
 	}
@@ -325,7 +323,7 @@ func (e *PipelineExecutor) execNode(ctx context.Context, node skills.PipelineNod
 	case "auto":
 		return e.execAutoNode(ctx, node, foreachItem, foreachIdx, out)
 	default:
-		return "", fmt.Errorf("unknown node type %q (valid: agent, auto)", node.Type)
+		return fmt.Errorf("unknown node type %q (valid: agent, auto)", node.Type)
 	}
 }
 
@@ -334,15 +332,15 @@ func (e *PipelineExecutor) execNode(ctx context.Context, node skills.PipelineNod
 // execAutoNode calls a tool directly without involving an LLM.
 // Resolved inputs are marshalled to JSON and passed to the tool.
 // Outputs are written to `out` keyed by pipeline var name.
-func (e *PipelineExecutor) execAutoNode(ctx context.Context, node skills.PipelineNode, foreachItem interface{}, foreachIdx int, out map[string]interface{}) (string, error) {
+func (e *PipelineExecutor) execAutoNode(ctx context.Context, node skills.PipelineNode, foreachItem interface{}, foreachIdx int, out map[string]interface{}) error {
 	if ctx.Err() != nil {
-		return "", ctx.Err()
+		return ctx.Err()
 	}
 	if node.Tool == "" {
-		return "", fmt.Errorf("auto node %q must specify 'tool'", node.ID)
+		return fmt.Errorf("auto node %q must specify 'tool'", node.ID)
 	}
 	if e.sharedReg == nil {
-		return "", fmt.Errorf("auto node %q: no shared registry available for tool calls", node.ID)
+		return fmt.Errorf("auto node %q: no shared registry available for tool calls", node.ID)
 	}
 
 	// Resolve and marshal inputs.
@@ -357,14 +355,14 @@ func (e *PipelineExecutor) execAutoNode(ctx context.Context, node skills.Pipelin
 	}
 	argsJSON, err := json.Marshal(inputMap)
 	if err != nil {
-		return "", fmt.Errorf("auto node %q: failed to marshal inputs: %w", node.ID, err)
+		return fmt.Errorf("auto node %q: failed to marshal inputs: %w", node.ID, err)
 	}
 
 	e.debugf("Auto▷", "%s  tool=%s", node.ID, node.Tool)
 
 	result, err := e.sharedReg.Execute(ctx, node.Tool, argsJSON)
 	if err != nil {
-		return "", fmt.Errorf("auto node %q: tool %q failed: %w", node.ID, node.Tool, err)
+		return fmt.Errorf("auto node %q: tool %q failed: %w", node.ID, node.Tool, err)
 	}
 
 	e.debugf("Auto◁", "%s  %s", node.ID, truncateStr(result, 300))
@@ -396,27 +394,24 @@ func (e *PipelineExecutor) execAutoNode(ctx context.Context, node skills.Pipelin
 			out[pipelineVar] = v
 		}
 	}
-	return "", nil // auto nodes never produce output context
+	return nil
 }
 
 // ── Agent node ────────────────────────────────────────────────────────────────
 
 // execAgentNode creates an isolated sub-agent and runs it for a pipeline node.
 // The standard finish_task tool is replaced with node_complete so that the
-// node can report structured outputs and context back to the executor.
+// node can report structured outputs back to the executor.
 // Outputs are written to `out` keyed by pipeline var name.
-// Returns (context_string, error).
-//
-// When node.FallbackComplexity is set and the primary run returns an LLM error
-// (not a context cancellation or node_complete failure), the node is retried
-// once using the fallback model.
-func (e *PipelineExecutor) execAgentNode(ctx context.Context, node skills.PipelineNode, foreachItem interface{}, foreachIdx int, out map[string]interface{}) (string, error) {
+// On transient LLM errors the engine automatically retries with the next lower
+// complexity tier (complex→medium, medium→base).
+func (e *PipelineExecutor) execAgentNode(ctx context.Context, node skills.PipelineNode, foreachItem interface{}, foreachIdx int, out map[string]interface{}) error {
 	// Resolve the node's Skill (if specified).
 	var nodeSkill *skills.Skill
 	if node.Skill != "" {
 		nodeSkill = e.lookupSkill(node.Skill)
 		if nodeSkill == nil {
-			return "", fmt.Errorf("agent node %q: skill %q not found", node.ID, node.Skill)
+			return fmt.Errorf("agent node %q: skill %q not found", node.ID, node.Skill)
 		}
 		if nodeSkill.IsPipeline() {
 			return e.execNestedPipeline(ctx, node, nodeSkill, foreachItem, foreachIdx, out)
@@ -448,36 +443,32 @@ func (e *PipelineExecutor) execAgentNode(ctx context.Context, node skills.Pipeli
 		)
 	}
 
-	// Attempt execution, retrying with fallback_complexity on LLM errors.
-	complexities := []string{node.Complexity}
-	if node.FallbackComplexity != "" {
-		complexities = append(complexities, node.FallbackComplexity)
-	}
+	// Attempt execution, falling back one tier on transient LLM errors.
+	complexities := e.complexityFallbacks(node.Complexity)
 
 	var lastErr error
 	for attempt, complexity := range complexities {
 		if attempt > 0 {
 			e.debugf("Fallback", "%s  attempt %d failed (%s) → retrying with complexity=%s", node.ID, attempt, lastErr, complexity)
 		}
-		nodeCtx, nodeOut, err := e.runAgentNodeAttempt(ctx, node, nodeSkill, filteredTools, taskPrompt, complexity)
+		nodeOut, err := e.runAgentNodeAttempt(ctx, node, nodeSkill, filteredTools, taskPrompt, complexity)
 		if err == nil {
 			for k, v := range nodeOut {
 				out[k] = v
 			}
-			return nodeCtx, nil
+			return nil
 		}
 		// Do not retry on context cancellation — the user or timeout killed the run.
 		if ctx.Err() != nil {
-			return "", err
+			return err
 		}
 		lastErr = err
 	}
-	return "", lastErr
+	return lastErr
 }
 
 // runAgentNodeAttempt performs a single execution attempt for an agent node
 // using the given complexity (which may differ from node.Complexity on retry).
-// Returns (context_string, output_map, error).
 func (e *PipelineExecutor) runAgentNodeAttempt(
 	ctx context.Context,
 	node skills.PipelineNode,
@@ -485,17 +476,18 @@ func (e *PipelineExecutor) runAgentNodeAttempt(
 	filteredTools []string,
 	taskPrompt string,
 	complexity string,
-) (string, map[string]interface{}, error) {
+) (map[string]interface{}, error) {
 	// Create an isolated sub-agent. Sub-agents in pipelines:
 	//   - Do NOT get pipeline todo callbacks (would conflict with pipeline's own display).
 	//   - Do NOT load skills (IsSubAgent=true skips skill-only tool injection).
 	//   - Do NOT run the router.
 	subAgent := e.factory.CreateAgentFiltered(e.confirmMgr, e.channelID, filteredTools)
-	subAgent.IsSubAgent = true
-	subAgent.SessionDir = e.sessionDir // Bug Fix 1: Inherit session context to share state.
-	subAgent.InjectSoul = node.InjectSoul
-	subAgent.InjectContext = !node.NoContext // default true; opt-out per node with no_context: true
-	subAgent.AskUserNotify = e.askUserNotify // propagate so ask_user tool can reach the user
+	subAgent.Mode.IsSubAgent = true
+	subAgent.SessionDir = e.sessionDir
+	// SOUL is injected only in the last agent node; context is always injected.
+	subAgent.Mode.InjectSoul = e.factory.InjectSoul && (e.currentNodeIdx == e.lastAgentNodeIdx)
+	subAgent.Mode.InjectContext = true
+	subAgent.Callbacks.AskUser = e.askUserNotify
 	if e.factory.Config.SubAgent.MaxIterations > 0 {
 		subAgent.MaxIterations = e.factory.Config.SubAgent.MaxIterations
 	}
@@ -507,15 +499,14 @@ func (e *PipelineExecutor) runAgentNodeAttempt(
 	// determine the first turn; setting it here tells RunWithParts that the
 	// system prompt is already built and should not be overwritten.
 	sysprompt := subAgent.buildSystemPrompt(nodeSkill)
-	subAgent.messages = []llm.Message{{Role: "system", Content: sysprompt}}
+	subAgent.conv.Reset([]llm.Message{{Role: "system", Content: sysprompt}})
 
 	// Swap finish_task → node_complete.
 	resultCh := make(chan NodeResult, 1)
 	subAgent.registry.Unregister("finish_task")
 	subAgent.registry.Register(&NodeCompleteTool{
-		outputContext: node.OutputContext,
-		resultCh:      resultCh,
-		finishTool:    subAgent.finishTool,
+		resultCh:   resultCh,
+		finishTool: subAgent.finishTool,
 	})
 
 	e.debugf("Agent▷", "%s  %q", node.ID, truncateStr(taskPrompt, 200))
@@ -534,9 +525,10 @@ func (e *PipelineExecutor) runAgentNodeAttempt(
 		e.debugf("Warn", "%s  node_complete not called — falling back to last text output", node.ID)
 		fallback := runResult
 		if fallback == "" {
-			for i := len(subAgent.messages) - 1; i >= 0; i-- {
-				if subAgent.messages[i].Role == "assistant" && subAgent.messages[i].Content != "" {
-					fallback = subAgent.messages[i].Content
+			msgs := subAgent.conv.All()
+			for i := len(msgs) - 1; i >= 0; i-- {
+				if msgs[i].Role == "assistant" && msgs[i].Content != "" {
+					fallback = msgs[i].Content
 					break
 				}
 			}
@@ -553,12 +545,12 @@ func (e *PipelineExecutor) runAgentNodeAttempt(
 			reason = "node reported failure without a reason"
 		}
 		// node_complete(failure) is a deliberate agent decision — do not retry.
-		return "", nil, fmt.Errorf("%s", reason)
+		return nil, fmt.Errorf("%s", reason)
 	}
 
 	// Surface LLM errors that node_complete didn't mask.
 	if runErr != nil {
-		return "", nil, fmt.Errorf("agent node %q: %w", node.ID, runErr)
+		return nil, fmt.Errorf("agent node %q: %w", node.ID, runErr)
 	}
 
 	e.debugf("Agent◁", "%s  vars=%v", node.ID, nodeResult.Vars)
@@ -569,14 +561,14 @@ func (e *PipelineExecutor) runAgentNodeAttempt(
 			out[pipelineVar] = v
 		}
 	}
-	return nodeResult.Context, out, nil
+	return out, nil
 }
 
 // execNestedPipeline runs a pipeline skill referenced from a node's Skill field.
 // Nesting is limited to 1 level deep to prevent runaway recursion.
-func (e *PipelineExecutor) execNestedPipeline(ctx context.Context, node skills.PipelineNode, nestedSkill *skills.Skill, foreachItem interface{}, foreachIdx int, out map[string]interface{}) (string, error) {
+func (e *PipelineExecutor) execNestedPipeline(ctx context.Context, node skills.PipelineNode, nestedSkill *skills.Skill, foreachItem interface{}, foreachIdx int, out map[string]interface{}) error {
 	if e.nestDepth >= 1 {
-		return "", fmt.Errorf("agent node %q: pipeline skills may not be nested more than 1 level deep", node.ID)
+		return fmt.Errorf("agent node %q: pipeline skills may not be nested more than 1 level deep", node.ID)
 	}
 
 	// Resolve ALL node.Inputs as overrides for the nested pipeline's vars.
@@ -596,7 +588,7 @@ func (e *PipelineExecutor) execNestedPipeline(ctx context.Context, node skills.P
 		nestedSkill,
 		e.factory,
 		initialInput,
-		e.sessionDir, // Pass session dir (Bug Fix 1)
+		e.sessionDir,
 		e.nestDepth+1,
 		nil, nil, nil, nil, // no independent todo display for nested pipelines
 		e.confirmMgr,
@@ -611,7 +603,7 @@ func (e *PipelineExecutor) execNestedPipeline(ctx context.Context, node skills.P
 
 	result, err := nestedExec.Run(ctx)
 	if err != nil {
-		return "", fmt.Errorf("nested pipeline %q: %w", nestedSkill.Name, err)
+		return fmt.Errorf("nested pipeline %q: %w", nestedSkill.Name, err)
 	}
 
 	// Expose nested outputs: individual vars and the final result string.
@@ -626,7 +618,20 @@ func (e *PipelineExecutor) execNestedPipeline(ctx context.Context, node skills.P
 			out[pipelineVar] = v
 		}
 	}
-	return result, nil // expose nested result as context for output_context nodes
+	return nil
+}
+
+// complexityFallbacks returns the ordered list of complexity tiers to attempt.
+// On a transient LLM error the engine retries once with the next lower tier.
+func (e *PipelineExecutor) complexityFallbacks(primary string) []string {
+	tiers := []string{primary}
+	switch TaskComplexity(strings.ToLower(primary)) {
+	case TaskComplex:
+		tiers = append(tiers, string(TaskMedium))
+	case TaskMedium:
+		tiers = append(tiers, "") // empty = base model (no override)
+	}
+	return tiers
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -683,24 +688,11 @@ func (e *PipelineExecutor) applyNodeModel(subAgent *Agent, complexity string) {
 }
 
 // buildNodePrompt constructs the task string passed to a node's sub-agent.
-// Accumulated context from prior nodes is prepended; then the interpolated prompt.
-// Pipeline status is NOT included — sub-agents don't need infrastructure info.
 func (e *PipelineExecutor) buildNodePrompt(node skills.PipelineNode, foreachItem interface{}, foreachIdx int) string {
-	const maxContextChars = 8000
-	var parts []string
-	if ctx := strings.Join(e.contexts, "\n\n"); ctx != "" {
-		if runes := []rune(ctx); len(runes) > maxContextChars {
-			ctx = string(runes[:maxContextChars]) + "\n\n[...context truncated...]"
-		}
-		parts = append(parts, "[Context from previous pipeline nodes]\n"+ctx)
-	}
-	if node.Prompt != "" {
-		parts = append(parts, e.interpolatePrompt(node.Prompt, foreachItem, foreachIdx))
-	}
-	if len(parts) == 0 {
+	if node.Prompt == "" {
 		return "Complete the assigned task."
 	}
-	return strings.Join(parts, "\n\n---\n\n")
+	return e.interpolatePrompt(node.Prompt, foreachItem, foreachIdx)
 }
 
 // resolveValue resolves a pipeline value to its runtime counterpart.
@@ -740,8 +732,13 @@ func (e *PipelineExecutor) resolveValue(val interface{}, foreachItem interface{}
 		case strings.HasPrefix(v, "$vars."):
 			key := strings.TrimPrefix(v, "$vars.")
 			return e.vars[key]
+		case strings.HasPrefix(v, "$") &&
+			!strings.HasPrefix(v, "$foreach.") &&
+			!strings.HasPrefix(v, "$config."):
+			// $name shorthand for $vars.name
+			return e.vars[strings.TrimPrefix(v, "$")]
 		default:
-			// Expand any {{$vars.x}} / {{$foreach.*}} tokens embedded in literals.
+			// Expand any {{$vars.x}} / {{$foreach.*}} / {{name}} tokens embedded in literals.
 			return e.interpolatePrompt(v, foreachItem, foreachIdx)
 		}
 	case map[string]interface{}:
@@ -795,6 +792,7 @@ func (e *PipelineExecutor) interpolatePrompt(tmpl string, foreachItem interface{
 		val := fmt.Sprintf("%v", e.vars[k])
 		result = strings.ReplaceAll(result, "{{$vars."+k+"}}", val)
 		result = strings.ReplaceAll(result, "$vars."+k, val)
+		result = strings.ReplaceAll(result, "{{"+k+"}}", val)
 	}
 	return result
 }

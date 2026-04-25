@@ -76,10 +76,13 @@ graph TD
 
     subgraph AgentInstance [Agent]
         Router["<b>Router (optional)</b><br/>classifies intent, selects tools & model"]
+        Planner["<b>Planner (optional)</b><br/>auto-generates missing skills"]
         Loop["<b>Execution loop</b><br/>LLM call ↔ tool calls"]
         Summ["<b>Summarizer (optional)</b><br/>compresses old history"]
+        Eval["<b>Evaluator (bg)</b><br/>verifies auto-generated skills"]
         
-        Router --> Loop --> Summ
+        Router --> Planner --> Loop --> Summ
+        Loop -.-> Eval
     end
 
     subgraph Resources [Resources]
@@ -106,6 +109,8 @@ graph TD
 
 **Router** is an optional lightweight classifier that runs before each turn. It selects complexity level (`simple / medium / complex`) and the required tool subset, enabling model selection and tool scoping without any agent loop overhead.
 
+**Planner & Evaluator** work together for complex tasks with no existing skill. The Planner runs a sandboxed agent to author a new skill file. Afterwards, the Evaluator runs asynchronously in the background to review the execution and potentially patch the generated skill if it detects deficiencies.
+
 **Tool Registry** is a simple map with thread-safe register/execute methods. Global tools are always available; **skill-only tools** (`grep`, `glob`, `browser_*`, `escalate`) are injected at the start of a matched turn and removed when it returns.
 
 ---
@@ -119,16 +124,19 @@ User message
 ① Skill matching — word-boundary name match against loaded skills
 ② Skill-only tool injection — add declared tools; remove on turn exit (defer)
 ③ Router (optional) — classify complexity; pick tools & model; maybe answer directly
-④ Model & tool selection
+④ Planner (optional) — if task is complex and no skill exists, auto-generate one
+⑤ Model & tool selection
     simple  → direct answer, no loop
     medium  → router.medium model, no delegate
     complex → router.strong model, delegate injected
-⑤ Execution loop (up to max_iterations)
+⑥ Execution loop (up to max_iterations)
     LLM call → tool calls → LLM call → …
     <think> blocks stripped from streamed output
     Oldest turns compressed in-place to save tokens
     finish_task() called → save history → return
-⑥ Post-turn summarization (optional)
+⑦ Post-turn summarization & Evaluator
+    Background summarization (optional)
+    Background evaluator for auto-generated skills
 ```
 
 ---
@@ -257,6 +265,12 @@ base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
 
 [router.strong]                 # Best model for complex tasks
 model = "gpt-4o"
+
+[eval]                          # Auto-generated skill quality checker
+success_threshold = 3
+
+[pipeline]                      # Pipeline execution overrides
+foreach_concurrency = 4
 ```
 
 Run `ageage init` for an interactive setup wizard.

@@ -111,9 +111,12 @@ func (r *Router) buildRouterPrompt(availableTools []string) string {
 
 	// ── 4. Levels + JSON schema (fixed) ──────────────────────────────────────
 	sb.WriteString(`Levels:
-- "simple": Chat only, no tools needed. Provide "direct_answer".
-- "medium": Linear task, needs tools. List in "required_tools".
-- "complex": Multi-step, coding, deep reasoning. List all in "required_tools".
+- "simple": Pure conversation — no tools needed. Populate "direct_answer" with your reply.
+- "medium": Single-step or straightforward tool use (fetch a URL, run a command, look up a fact). No planning required; no matching skill.
+- "complex": Use this level for ALL of the following cases:
+    (a) A skill or pipeline from the list above clearly matches — fill "skill" with its exact name.
+    (b) The task requires multi-step planning, complex reasoning, or is worth capturing as a reusable workflow — leave "skill" empty (the system will create one automatically).
+  Always choose "complex" for pipeline skills.
 
 Output exactly this JSON and nothing else:
 {

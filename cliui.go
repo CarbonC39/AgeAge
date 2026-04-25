@@ -29,6 +29,11 @@ type ThinkStreamFilter struct {
 	inner     llm.StreamCallback
 	showThink bool
 
+	// Hooks called around think-block output so the caller can pause/resume
+	// any concurrent rendering (e.g. stop a spinner before printing, restart after).
+	OnThinkBegin func()
+	OnThinkEnd   func()
+
 	// streaming state
 	buf         string          // accumulates tokens until a safe flush point
 	inThink     bool
@@ -144,22 +149,29 @@ func (f *ThinkStreamFilter) onThinkEnd() {
 	f.LastThink = content
 	f.hasThink = true
 
+	// Stop any concurrent rendering (e.g. spinner) before writing to stdout.
+	if f.OnThinkBegin != nil {
+		f.OnThinkBegin()
+	}
+
 	if f.showThink {
-		// Print the full think content in dim colour with a header.
 		header := stGray.Render("┌── thinking ") + stDim.Render(line(38))
 		footer := stGray.Render("└" + line(50))
 		fmt.Println()
 		fmt.Println(header)
-		// Print each line dimmed.
 		for _, l := range strings.Split(strings.TrimSpace(content), "\n") {
 			fmt.Println(stDim.Render("│ " + l))
 		}
 		fmt.Println(footer)
 		fmt.Println()
 	} else {
-		// Summary line only.
 		chars := len([]rune(strings.TrimSpace(content)))
 		fmt.Println(stDim.Render(fmt.Sprintf("  ◆ thinking… (%d chars)", chars)))
+	}
+
+	// Resume concurrent rendering after output is complete.
+	if f.OnThinkEnd != nil {
+		f.OnThinkEnd()
 	}
 }
 
@@ -201,15 +213,17 @@ func splitAtPartialTag(s, tag string) (safe, held string) {
 }
 
 // ── Colour palette ────────────────────────────────────────────────────────────
+// Each color has a dark-background and a light-background variant.
+// lipgloss selects automatically based on the terminal's color profile.
 
 var (
-	colPink   = lipgloss.Color("#F472B6")
-	colBlue   = lipgloss.Color("#60A5FA")
-	colPurple = lipgloss.Color("#C084FC")
-	colGray   = lipgloss.Color("#6B7280")
-	colGreen  = lipgloss.Color("#34D399")
-	colRed    = lipgloss.Color("#F87171")
-	colAmber  = lipgloss.Color("#FBBF24")
+	colPink   = lipgloss.AdaptiveColor{Dark: "#F472B6", Light: "#BE185D"}
+	colBlue   = lipgloss.AdaptiveColor{Dark: "#60A5FA", Light: "#1D4ED8"}
+	colPurple = lipgloss.AdaptiveColor{Dark: "#C084FC", Light: "#7E22CE"}
+	colGray   = lipgloss.AdaptiveColor{Dark: "#9CA3AF", Light: "#6B7280"}
+	colGreen  = lipgloss.AdaptiveColor{Dark: "#34D399", Light: "#047857"}
+	colRed    = lipgloss.AdaptiveColor{Dark: "#F87171", Light: "#DC2626"}
+	colAmber  = lipgloss.AdaptiveColor{Dark: "#FBBF24", Light: "#B45309"}
 )
 
 var (
@@ -461,52 +475,192 @@ func (u *cliUI) printToolResult(name, result string) {
 
 // ── File diff display ─────────────────────────────────────────────────────────
 
-const diffMaxLines = 8
+const diffMaxLines = 16
 
 // printFileWrite renders the content being written to a file (first N lines).
 func (u *cliUI) printFileWrite(path, content string) {
-	fmt.Printf("  %s %s\n",
+	lines := strings.Split(content, "\n")
+	fmt.Printf("  %s %s %s\n",
 		stAmber.Render("┌─ Write"),
 		stBlue.Render(path),
+		stDim.Render(fmt.Sprintf("(%d lines)", len(lines))),
 	)
-	lines := strings.Split(content, "\n")
-	shown := 0
-	for _, l := range lines {
-		if shown >= diffMaxLines {
-			fmt.Printf("  %s\n", stDim.Render("    … (truncated)"))
+	for i, l := range lines {
+		if i >= diffMaxLines {
+			fmt.Printf("  %s\n", stDim.Render(fmt.Sprintf("    … (%d more lines)", len(lines)-diffMaxLines)))
 			break
 		}
 		fmt.Printf("  %s %s\n", stGreen.Render("+"), l)
-		shown++
 	}
 	fmt.Printf("  %s\n", stAmber.Render("└─────────────"))
 }
 
 // printFileEdit renders old→new diff for a file_edit operation.
 func (u *cliUI) printFileEdit(path, oldStr, newStr string) {
-	fmt.Printf("  %s %s\n",
-		stAmber.Render("┌─ Edit"),
-		stBlue.Render(path),
-	)
 	oldLines := strings.Split(oldStr, "\n")
 	newLines := strings.Split(newStr, "\n")
-	shown := 0
-	for _, l := range oldLines {
-		if shown >= diffMaxLines {
-			fmt.Printf("  %s\n", stDim.Render("    … (truncated)"))
+	fmt.Printf("  %s %s %s\n",
+		stAmber.Render("┌─ Edit"),
+		stBlue.Render(path),
+		stDim.Render(fmt.Sprintf("(-%d/+%d lines)", len(oldLines), len(newLines))),
+	)
+	for i, l := range oldLines {
+		if i >= diffMaxLines {
+			fmt.Printf("  %s\n", stDim.Render(fmt.Sprintf("    … (%d more lines)", len(oldLines)-diffMaxLines)))
 			break
 		}
 		fmt.Printf("  %s %s\n", stRed.Render("-"), stDim.Render(l))
-		shown++
 	}
-	shown = 0
-	for _, l := range newLines {
-		if shown >= diffMaxLines {
-			fmt.Printf("  %s\n", stDim.Render("    … (truncated)"))
+	for i, l := range newLines {
+		if i >= diffMaxLines {
+			fmt.Printf("  %s\n", stDim.Render(fmt.Sprintf("    … (%d more lines)", len(newLines)-diffMaxLines)))
 			break
 		}
 		fmt.Printf("  %s %s\n", stGreen.Render("+"), l)
-		shown++
 	}
 	fmt.Printf("  %s\n", stAmber.Render("└─────────────"))
+}
+
+// ── Bash display ──────────────────────────────────────────────────────────────
+
+const bashOutputMaxLines = 40
+
+// printBashCommand renders the shell command the agent is about to run.
+func (u *cliUI) printBashCommand(cmd string) {
+	lines := strings.Split(strings.TrimSpace(cmd), "\n")
+	header := stGray.Render("  $ ") + stBlue.Render(lines[0])
+	if len(lines) > 1 {
+		header += stDim.Render(" …")
+	}
+	fmt.Println(header)
+}
+
+// printBashOutput renders the output returned by the shell command.
+// When the output exceeds bashOutputMaxLines the LAST N lines are shown so
+// that error messages (which appear at the end) are never truncated away.
+func (u *cliUI) printBashOutput(output string) {
+	output = strings.TrimRight(output, "\n")
+	if output == "" {
+		return
+	}
+	lines := strings.Split(output, "\n")
+	if len(lines) > bashOutputMaxLines {
+		dropped := len(lines) - bashOutputMaxLines
+		fmt.Printf("  %s\n", stDim.Render(fmt.Sprintf("… (%d lines omitted)", dropped)))
+		lines = lines[dropped:]
+	}
+	for _, l := range lines {
+		fmt.Printf("  %s\n", stDim.Render(l))
+	}
+}
+
+// ── Markdown rendering ────────────────────────────────────────────────────────
+
+// renderInline processes inline markdown within a single text segment.
+// Handles **bold**, `code`, and [text](url) links using only stdlib + lipgloss.
+func renderInline(s string) string {
+	var out strings.Builder
+	for i := 0; i < len(s); {
+		// **bold** — two-char ASCII marker, safe to byte-index
+		if i+3 < len(s) && s[i] == '*' && s[i+1] == '*' {
+			if end := strings.Index(s[i+2:], "**"); end >= 0 {
+				out.WriteString(stBlue.Bold(true).Render(s[i+2 : i+2+end]))
+				i += 2 + end + 2
+				continue
+			}
+		}
+		// `code`
+		if s[i] == '`' {
+			if end := strings.Index(s[i+1:], "`"); end >= 0 {
+				out.WriteString(stAmber.Render(s[i+1 : i+1+end]))
+				i += 1 + end + 1
+				continue
+			}
+		}
+		// [text](url)
+		if s[i] == '[' {
+			if textEnd := strings.Index(s[i+1:], "]("); textEnd >= 0 {
+				urlStart := i + 1 + textEnd + 2
+				if urlEnd := strings.Index(s[urlStart:], ")"); urlEnd >= 0 {
+					text := s[i+1 : i+1+textEnd]
+					url := s[urlStart : urlStart+urlEnd]
+					out.WriteString(stBlue.Render(text))
+					out.WriteString(stGray.Render(" (" + url + ")"))
+					i = urlStart + urlEnd + 1
+					continue
+				}
+			}
+		}
+		// Pass all other bytes through (multi-byte UTF-8 chars copy correctly
+		// one byte at a time since non-ASCII bytes never match the markers above).
+		out.WriteByte(s[i])
+		i++
+	}
+	return out.String()
+}
+
+// renderMarkdown applies minimal terminal formatting to markdown text.
+// Handles code fences, headers, bullet/numbered lists, and inline markup —
+// no external dependencies.
+func (u *cliUI) renderMarkdown(text string) string {
+	// Normalize CR/CRLF: some LLM JSON responses encode \r as carriage return,
+	// which moves the terminal cursor to column 0 and corrupts the display.
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	text = strings.ReplaceAll(text, "\r", "")
+	lines := strings.Split(text, "\n")
+	var sb strings.Builder
+	inCode := false
+	lang := ""
+	for _, l := range lines {
+		// Code fence toggle.
+		if strings.HasPrefix(l, "```") {
+			if !inCode {
+				inCode = true
+				lang = strings.TrimPrefix(l, "```")
+				header := stGray.Render("  ┌─ ")
+				if lang != "" {
+					header += stDim.Render(lang)
+				}
+				sb.WriteString(header + "\n")
+			} else {
+				inCode = false
+				lang = ""
+				sb.WriteString(stGray.Render("  └─────────────") + "\n")
+			}
+			continue
+		}
+		if inCode {
+			sb.WriteString(stDim.Render("  │ ") + l + "\n")
+			continue
+		}
+		// Headers.
+		if strings.HasPrefix(l, "### ") {
+			sb.WriteString(stGray.Render(renderInline(l[4:])) + "\n")
+			continue
+		}
+		if strings.HasPrefix(l, "## ") {
+			sb.WriteString(stBlue.Render(renderInline(l[3:])) + "\n")
+			continue
+		}
+		if strings.HasPrefix(l, "# ") {
+			sb.WriteString(stBlue.Bold(true).Render(renderInline(l[2:])) + "\n")
+			continue
+		}
+		// Bullet lists.
+		if strings.HasPrefix(l, "- ") || strings.HasPrefix(l, "* ") {
+			sb.WriteString("  " + stGray.Render("•") + " " + renderInline(l[2:]) + "\n")
+			continue
+		}
+		// Numbered lists: "1. " through "99. "
+		if len(l) > 3 && l[0] >= '1' && l[0] <= '9' {
+			if dot := strings.Index(l, ". "); dot >= 1 && dot <= 3 {
+				prefix := l[:dot+2]
+				rest := l[dot+2:]
+				sb.WriteString("  " + stGray.Render(prefix) + renderInline(rest) + "\n")
+				continue
+			}
+		}
+		sb.WriteString(renderInline(l) + "\n")
+	}
+	return sb.String()
 }

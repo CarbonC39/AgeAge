@@ -10,10 +10,9 @@ import (
 
 // NodeResult is the structured output of a pipeline node's node_complete call.
 type NodeResult struct {
-	Status  string                 // "success" or "failure"
-	Context string                 // injected into subsequent agent nodes (output_context only)
-	Vars    map[string]interface{} // output variables written back to the pipeline
-	Reason  string                 // human-readable failure reason
+	Status string                 // "success" or "failure"
+	Vars   map[string]interface{} // output variables written back to the pipeline
+	Reason string                 // human-readable failure reason
 }
 
 // NodeCompleteTool replaces finish_task inside pipeline node agents.
@@ -25,10 +24,9 @@ type NodeResult struct {
 // The buffered channel (capacity 1) ensures the write never blocks even when
 // the executor hasn't yet drained it.
 type NodeCompleteTool struct {
-	outputContext bool
-	resultCh      chan<- NodeResult
-	finishTool    *tools.FinishTool // shared with the node's agent; marks loop done
-	finished      bool
+	resultCh   chan<- NodeResult
+	finishTool *tools.FinishTool // shared with the node's agent; marks loop done
+	finished   bool
 }
 
 func (t *NodeCompleteTool) Name() string { return "node_complete" }
@@ -36,8 +34,7 @@ func (t *NodeCompleteTool) Name() string { return "node_complete" }
 func (t *NodeCompleteTool) Description() string {
 	return "Signal that this pipeline node has finished. " +
 		"Call with status=\"success\" and any output vars, " +
-		"or status=\"failure\" and a reason (terminates the whole pipeline). " +
-		"You may include a \"context\" string with key findings for subsequent nodes."
+		"or status=\"failure\" and a reason (terminates the whole pipeline)."
 }
 
 func (t *NodeCompleteTool) Parameters() map[string]interface{} {
@@ -57,15 +54,10 @@ func (t *NodeCompleteTool) Parameters() map[string]interface{} {
 				"type":        "string",
 				"description": "Human-readable explanation (required when status=failure).",
 			},
-			"context": map[string]interface{}{
-				"type":        "string",
-				"description": "Key findings or context text for the next task/nodes.",
-			},
 		},
 		"required": []string{"status"},
 	}
 }
-
 
 func (t *NodeCompleteTool) Execute(_ context.Context, args json.RawMessage) (string, error) {
 	if t.finished {
@@ -73,10 +65,9 @@ func (t *NodeCompleteTool) Execute(_ context.Context, args json.RawMessage) (str
 	}
 
 	var p struct {
-		Status  string                 `json:"status"`
-		Context string                 `json:"context"`
-		Vars    map[string]interface{} `json:"vars"`
-		Reason  string                 `json:"reason"`
+		Status string                 `json:"status"`
+		Vars   map[string]interface{} `json:"vars"`
+		Reason string                 `json:"reason"`
 	}
 	if err := json.Unmarshal(args, &p); err != nil {
 		return "", fmt.Errorf("invalid arguments: %w", err)
@@ -93,10 +84,9 @@ func (t *NodeCompleteTool) Execute(_ context.Context, args json.RawMessage) (str
 	// Write to buffered channel first (non-blocking) so the executor can read
 	// the result immediately after Run() returns.
 	t.resultCh <- NodeResult{
-		Status:  p.Status,
-		Context: p.Context,
-		Vars:    p.Vars,
-		Reason:  p.Reason,
+		Status: p.Status,
+		Vars:   p.Vars,
+		Reason: p.Reason,
 	}
 
 	// Mark the shared FinishTool done → the agent loop exits after this tool call.

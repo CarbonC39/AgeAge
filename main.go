@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -776,30 +777,30 @@ func startChannels(factory *agent.AgentFactory) (*channel.Manager, int) {
 		if ch, ok := channelsByType[channelType]; ok {
 			if editable, ok := ch.(channel.Editable); ok {
 				cID := channelID
-				ag.TodoSendFunc = func(text string) string {
+				ag.Callbacks.TodoSend = func(text string) string {
 					msgID, err := editable.SendMessage(cID, text)
 					if err != nil {
 						fmt.Printf("[todo] send error: %s\n", err)
 					}
 					return msgID
 				}
-				ag.TodoEditFunc = func(msgID, text string) error {
+				ag.Callbacks.TodoEdit = func(msgID, text string) error {
 					return editable.EditMessage(cID, msgID, text)
 				}
 			}
 		}
-		ag.NotifyFunc = func(message string) {
+		ag.Callbacks.Notify = func(message string) {
 			if managerPtr != nil && channelType != "" {
 				managerPtr.Send(channelType, channelID, message)
 			}
 		}
-		ag.AskUserNotify = func(question string, options []string) {
+		ag.Callbacks.AskUser = func(question string, options []string) {
 			if managerPtr != nil && channelType != "" {
 				managerPtr.SendQuestion(channelType, channelID, question, options)
 			}
 		}
-		notifyFn := ag.NotifyFunc
-		ag.ToolStartCallback = func(name, args string) {
+		notifyFn := ag.Callbacks.Notify
+		ag.Callbacks.ToolStart = func(name, args string) {
 			if notifyFn == nil {
 				return
 			}
@@ -1495,8 +1496,7 @@ func runCLI(cmd *cobra.Command, args []string) error {
 	createSessionAgent := func(sessionID string) *agent.Agent {
 		newAg := factory.CreateAgent(nil, "")
 		newAg.SessionDir = sm.SessionDir(sessionID)
-		newAg.AskUserNotify = func(question string, options []string) {
-			// Print the question; the spinner is stopped by ToolStartCallback.
+		newAg.Callbacks.AskUser = func(question string, options []string) {
 			fmt.Println()
 			fmt.Printf("  ❓ %s\n", question)
 			for i, opt := range options {
@@ -1505,7 +1505,7 @@ func runCLI(cmd *cobra.Command, args []string) error {
 			fmt.Println("  (Type your answer, or /stop to cancel)")
 		}
 		// Pipeline node progress: print each status update on its own line.
-		newAg.NotifyFunc = func(msg string) {
+		newAg.Callbacks.Notify = func(msg string) {
 			fmt.Println()
 			fmt.Println(stGray.Render("  ◈ ") + stDim.Render(msg))
 		}
@@ -1544,68 +1544,124 @@ func runCLI(cmd *cobra.Command, args []string) error {
 		ui.printInfo(fmt.Sprintf("Resumed session '%s'.", activeSessionID))
 	}
 
-	// Read stdin in a dedicated goroutine so the main loop can remain
-	// responsive (e.g. to /stop) while the agent is running.
-	inputCh := make(chan string)
-	go func() {
-		scanner := bufio.NewScanner(os.Stdin)
-		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	// rl handles line editing (history, cursor movement, raw mode).
+	rl := &Readline{}
+	historyFile := filepath.Join(factory.Config.AgeAgeDirPath(), "cli_history")
+	rl.LoadHistory(historyFile)
+	promptMain := stPink.Render("You") + stGray.Render(" ▸ ")
+	promptCont := stGray.Render("... ▸ ")
+
+	// readMultiLine reads one logical input line, handling:
+	//   - lines ending with \ → continue on next line
+	//   - ``` blocks → accumulate until closing ```
+	// History is managed inside rl; each logical line is added once.
+	readMultiLine := func() (string, error) {
 		var accum strings.Builder
 		inBlock := false
-		for scanner.Scan() {
-			raw := scanner.Text()
+		for {
+			if inBlock || accum.Len() > 0 {
+				rl.PromptAnsi = promptCont
+			} else {
+				rl.PromptAnsi = promptMain
+			}
+			raw, err := rl.ReadLine()
+			if err != nil {
+				return accum.String(), err
+			}
 			if inBlock {
 				if strings.TrimSpace(raw) == "```" {
-					inBlock = false
-					inputCh <- strings.TrimRight(accum.String(), "\n")
-					accum.Reset()
-				} else {
-					accum.WriteString(raw + "\n")
-					fmt.Print(stGray.Render("... ▸ "))
+					return strings.TrimRight(accum.String(), "\n"), nil
 				}
+				accum.WriteString(raw + "\n")
 				continue
 			}
 			if strings.TrimSpace(raw) == "```" {
 				inBlock = true
-				fmt.Print(stGray.Render("... ▸ "))
 				continue
 			}
 			if trimmed, ok := strings.CutSuffix(raw, "\\"); ok {
 				accum.WriteString(trimmed + "\n")
-				fmt.Print(stGray.Render("... ▸ "))
 				continue
 			}
 			if accum.Len() > 0 {
 				accum.WriteString(raw)
-				inputCh <- accum.String()
-				accum.Reset()
-			} else {
-				inputCh <- raw
+				return accum.String(), nil
 			}
+			return raw, nil
 		}
-		close(inputCh)
+	}
+
+	// readyForInput is a semaphore: the goroutine waits for a token before
+	// printing the next prompt. The main loop sends a token when it has finished
+	// all output and is ready for the next user turn. This prevents readline's
+	// prompt from interleaving with agent streaming output.
+	readyForInput := make(chan struct{}, 1)
+	readyForInput <- struct{}{} // initial: ready immediately
+
+	// signalReady sends the readiness token; safe to call multiple times.
+	signalReady := func() {
+		select {
+		case readyForInput <- struct{}{}:
+		default:
+		}
+	}
+
+	// Read stdin in a dedicated goroutine so the main loop can remain
+	// responsive (e.g. to /stop) while the agent is running.
+	inputCh := make(chan string)
+	go func() {
+		for {
+			<-readyForInput // wait until the main loop is done printing
+			line, err := readMultiLine()
+			if err == ErrInterrupt {
+				// Ctrl+C while idle → exit. The signal handler handles Ctrl+C
+				// when the agent is running (terminal is then in cooked mode).
+				close(inputCh)
+				return
+			}
+			if err != nil {
+				close(inputCh)
+				return
+			}
+			if line != "" {
+				rl.AddHistory(line)
+			}
+			inputCh <- line
+			// Main loop calls signalReady() when its output is complete.
+		}
 	}()
 
-	// Ctrl+C: stop the running agent gracefully; if idle, exit.
-	// The signal handler captures `ag` by variable reference so it always sees
-	// the current agent even after a session switch.
+	// agentActive is true while the agent goroutine is running.
+	// The signal handler reads this to decide whether to stop or exit.
+	var agentActive atomic.Bool
+
+	// Ctrl+C handling:
+	//   SIGTERM        → always save + exit immediately
+	//   SIGINT, active → stop the running agent
+	//   SIGINT, idle   → ignored here; readline returns ErrInterrupt which sends
+	//                    "/stop" through inputCh, avoiding a double-exit race
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
-		<-sigCh
-		fmt.Println()
-		ag.Stop()
-		ui.printInfo("Interrupted.")
-		os.Exit(0)
+		for sig := range sigCh {
+			if sig == syscall.SIGTERM {
+				fmt.Println()
+				_ = sm.SaveHistory(activeSessionID, ag.Messages())
+				os.Exit(0)
+			}
+			// SIGINT: only act when the agent is running.
+			if agentActive.Load() {
+				fmt.Println()
+				ui.printWarn("Interrupted. Press Ctrl+C again to exit.")
+				ag.Stop()
+			}
+		}
 	}()
 
 	type agentResult struct {
-		result   string
-		streamed bool
-		err      error
+		result string
+		err    error
 	}
-
-	ui.printPrompt()
 
 	var agentCh chan agentResult
 
@@ -1617,7 +1673,7 @@ func runCLI(cmd *cobra.Command, args []string) error {
 			}
 			input = strings.TrimSpace(input)
 			if input == "" {
-				ui.printPrompt()
+				signalReady()
 				continue
 			}
 
@@ -1633,19 +1689,7 @@ func runCLI(cmd *cobra.Command, args []string) error {
 				case "": // /session — show current session + short list
 					infos, _ := sm.List()
 					fmt.Println()
-					for _, si := range infos {
-						marker := "  "
-						if si.ID == activeSessionID {
-							marker = stBlue.Render("▶ ")
-						}
-						age := fmtAge(si.ModTime)
-						fmt.Printf("  %s%-22s %s  %s\n",
-							marker,
-							si.ID,
-							stDim.Render(fmt.Sprintf("%2d turns", si.TurnCount)),
-							stDim.Render(age),
-						)
-					}
+					printSessionList(infos, activeSessionID)
 					fmt.Println()
 
 				case "list", "ls":
@@ -1654,19 +1698,7 @@ func runCLI(cmd *cobra.Command, args []string) error {
 						ui.printInfo("No sessions found.")
 					} else {
 						fmt.Println()
-						for _, si := range infos {
-							marker := "  "
-							if si.ID == activeSessionID {
-								marker = stBlue.Render("▶ ")
-							}
-							age := fmtAge(si.ModTime)
-							fmt.Printf("  %s%-22s %s  %s\n",
-								marker,
-								si.ID,
-								stDim.Render(fmt.Sprintf("%2d turns", si.TurnCount)),
-								stDim.Render(age),
-							)
-						}
+						printSessionList(infos, activeSessionID)
 						fmt.Println()
 					}
 
@@ -1777,9 +1809,10 @@ func runCLI(cmd *cobra.Command, args []string) error {
 							}
 						}
 						if turns > 0 {
-							fmt.Printf("  %s Delete session '%s' (%d turns)? [y/N] ",
+							rl.PromptAnsi = fmt.Sprintf("  %s Delete session '%s' (%d turns)? [y/N] ",
 								stAmber.Render("⚠"), resolved, turns)
-							line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+							line, _ := rl.ReadLine()
+							rl.PromptAnsi = promptMain
 							if strings.ToLower(strings.TrimSpace(line)) != "y" {
 								ui.printInfo("Cancelled.")
 								break
@@ -1796,7 +1829,7 @@ func runCLI(cmd *cobra.Command, args []string) error {
 					ui.printWarn("Usage: /session [list | new [name] | switch <name> | rename <new> | delete <name>]")
 					ui.printWarn("       Short forms: /s, ls, n, sw, mv, del")
 				}
-				ui.printPrompt()
+				signalReady()
 				continue
 			}
 
@@ -1809,18 +1842,20 @@ func runCLI(cmd *cobra.Command, args []string) error {
 					_ = sm.SaveHistory(activeSessionID, ag.Messages())
 					ui.printOK("Last turn undone.")
 				}
-				ui.printPrompt()
+				signalReady()
 				continue
 			}
 
 			// /retry [modifier] — re-run last message, optionally with extra text.
-			// Modifies `input` and sets retryParts so the default case runs the agent.
+			// directRun bypasses the switch so a retried message that happens to match
+			// a slash command (e.g. user originally typed "/clear") is never intercepted.
 			var retryParts []llm.ContentPart
+			directRun := false
 			if lower == "/retry" || strings.HasPrefix(lower, "/retry ") {
 				lastMsg, ok := ag.LastTurnUserMessage()
 				if !ok {
 					ui.printWarn("Nothing to retry.")
-					ui.printPrompt()
+					signalReady()
 					continue
 				}
 				modifier := strings.TrimSpace(input[len("/retry"):])
@@ -1830,117 +1865,125 @@ func runCLI(cmd *cobra.Command, args []string) error {
 					input += "\n\n" + modifier
 				}
 				ag.RollbackLastTurn()
-				// Fall through to switch default → agent execution.
+				directRun = true
 			}
 
-			switch input {
-			case "exit", "quit":
-				_ = sm.SaveHistory(activeSessionID, ag.Messages())
-				ui.printInfo("Goodbye!")
-				return nil
-
-			case "/clear":
-				ag.ClearHistory()
-				_ = sm.SaveHistory(activeSessionID, ag.Messages())
-				ui.printOK("History cleared.")
-				ui.printPrompt()
-
-			case "/stop":
-				ui.printWarn("No task running.")
-				ui.printPrompt()
-
-			case "/summarize":
-				ui.printStatus("Summarizing…")
-				summary, err := ag.ForceSummarize()
-				if err != nil {
-					ui.printErr(err.Error())
-				} else {
-					fmt.Println()
-					fmt.Println(summary)
-					fmt.Println()
+			shouldRun := directRun
+			if !directRun {
+				switch input {
+				case "exit", "quit":
 					_ = sm.SaveHistory(activeSessionID, ag.Messages())
-				}
-				ui.printPrompt()
+					_ = rl.SaveHistory(historyFile, 1000)
+					ui.printInfo("Goodbye!")
+					return nil
 
-			case "/think":
-				if thinkFilter.LastThink == "" {
-					ui.printInfo("No think-block captured yet.")
-				} else {
-					fmt.Println()
-					fmt.Println(stGray.Render("┌── last thinking ") + stDim.Render(line(34)))
-					for l := range strings.SplitSeq(strings.TrimSpace(thinkFilter.LastThink), "\n") {
-						fmt.Println(stDim.Render("│ " + l))
+				case "/clear":
+					ag.ClearHistory()
+					_ = sm.SaveHistory(activeSessionID, ag.Messages())
+					ui.printOK("History cleared.")
+					signalReady()
+
+				case "/stop":
+					ui.printWarn("No task running.")
+					signalReady()
+
+				case "/summarize":
+					ui.printStatus("Summarizing…")
+					summary, err := ag.ForceSummarize()
+					if err != nil {
+						ui.printErr(err.Error())
+					} else {
+						fmt.Println()
+						fmt.Println(summary)
+						fmt.Println()
+						_ = sm.SaveHistory(activeSessionID, ag.Messages())
 					}
-					fmt.Println(stGray.Render("└" + line(50)))
-					fmt.Println()
-				}
-				ui.printPrompt()
+					signalReady()
 
-			case "/skills":
-				skills := factory.GetSkills()
-				if len(skills) == 0 {
-					ui.printInfo("No skills loaded.")
-				} else {
-					fmt.Println()
-					for _, s := range skills {
-						tag := ""
-						if s.IsPipeline() {
-							tag = stDim.Render(" [pipeline]")
+				case "/think":
+					if thinkFilter.LastThink == "" {
+						ui.printInfo("No think-block captured yet.")
+					} else {
+						fmt.Println()
+						fmt.Println(stGray.Render("┌── last thinking ") + stDim.Render(line(34)))
+						for l := range strings.SplitSeq(strings.TrimSpace(thinkFilter.LastThink), "\n") {
+							fmt.Println(stDim.Render("│ " + l))
 						}
-						fmt.Printf("  %s  %s%s\n",
-							stBlue.Render("/"+s.CommandName()),
-							stGray.Render(s.Description),
-							tag,
-						)
+						fmt.Println(stGray.Render("└" + line(50)))
+						fmt.Println()
 					}
-					fmt.Println()
-				}
-				ui.printPrompt()
+					signalReady()
 
-			case "/help":
-				fmt.Println()
-				sections := []struct {
-					header string
-					rows   [][]string
-				}{
-					{"General", [][]string{
-						{"/help", "Show this help"},
-						{"/clear", "Clear conversation history"},
-						{"/stop", "Interrupt a running task"},
-						{"/summarize", "Compress conversation history"},
-						{"/undo", "Remove the last turn from history"},
-						{"/retry [text]", "Re-run the last message (optionally modified)"},
-						{"/think", "Show the last reasoning think-block"},
-						{"/skills", "List available skills"},
-						{"exit / quit", "Exit AgeAge"},
-					}},
-					{"Sessions  (/s is a shorthand for /session)", [][]string{
-						{"/s  or  /session", "List sessions with timestamps"},
-						{"/s new [name]", "Create and switch to a new session"},
-						{"/s switch <name>", "Switch (prefix matching supported)"},
-						{"/s rename <new>", "Rename the current session"},
-						{"/s rename <old> <new>", "Rename any session"},
-						{"/s delete <name>", "Delete a session (confirms if non-empty)"},
-					}},
-					{"Input", [][]string{
-						{"@/path/to/file", "Attach a file to your message"},
-						{"line ending with \\", "Continue input on next line"},
-						{"``` … ```", "Multi-line block input"},
-					}},
-				}
-				for _, sec := range sections {
-					fmt.Printf("  %s\n", stGray.Render(sec.header))
-					for _, row := range sec.rows {
-						fmt.Printf("    %s  %s\n",
-							stBlue.Render(fmt.Sprintf("%-30s", row[0])),
-							stGray.Render(row[1]),
-						)
+				case "/skills":
+					skills := factory.GetSkills()
+					if len(skills) == 0 {
+						ui.printInfo("No skills loaded.")
+					} else {
+						fmt.Println()
+						for _, s := range skills {
+							tag := ""
+							if s.IsPipeline() {
+								tag = stDim.Render(" [pipeline]")
+							}
+							fmt.Printf("  %s  %s%s\n",
+								stBlue.Render("/"+s.CommandName()),
+								stGray.Render(s.Description),
+								tag,
+							)
+						}
+						fmt.Println()
 					}
-					fmt.Println()
-				}
-				ui.printPrompt()
+					signalReady()
 
-			default:
+				case "/help":
+					fmt.Println()
+					sections := []struct {
+						header string
+						rows   [][]string
+					}{
+						{"General", [][]string{
+							{"/help", "Show this help"},
+							{"/clear", "Clear conversation history"},
+							{"/stop", "Interrupt a running task"},
+							{"/summarize", "Compress conversation history"},
+							{"/undo", "Remove the last turn from history"},
+							{"/retry [text]", "Re-run the last message (optionally modified)"},
+							{"/think", "Show the last reasoning think-block"},
+							{"/skills", "List available skills"},
+							{"exit / quit", "Exit AgeAge"},
+						}},
+						{"Sessions  (/s is a shorthand for /session)", [][]string{
+							{"/s  or  /session", "List sessions with timestamps"},
+							{"/s new [name]", "Create and switch to a new session"},
+							{"/s switch <name>", "Switch (prefix matching supported)"},
+							{"/s rename <new>", "Rename the current session"},
+							{"/s rename <old> <new>", "Rename any session"},
+							{"/s delete <name>", "Delete a session (confirms if non-empty)"},
+						}},
+						{"Input", [][]string{
+							{"@/path/to/file", "Attach a file to your message"},
+							{"line ending with \\", "Continue input on next line"},
+							{"``` … ```", "Multi-line block input"},
+						}},
+					}
+					for _, sec := range sections {
+						fmt.Printf("  %s\n", stGray.Render(sec.header))
+						for _, row := range sec.rows {
+							fmt.Printf("    %s  %s\n",
+								stBlue.Render(fmt.Sprintf("%-30s", row[0])),
+								stGray.Render(row[1]),
+							)
+						}
+						fmt.Println()
+					}
+					signalReady()
+
+				default:
+					shouldRun = true
+				}
+			}
+
+			if shouldRun {
 				// Parse @path file attachments from input.
 				cleanText, parts, warnings := agent.ParseCLIInput(input, factory.Config, ag.TmpManager())
 				for _, w := range warnings {
@@ -1956,12 +1999,19 @@ func runCLI(cmd *cobra.Command, args []string) error {
 				spinner := newSpinner()
 				spinner.Start("Thinking…")
 
-				// ToolStartCallback: show spinner with tool name; for file_write/
-				// file_edit also print a diff preview (spinner is stopped first).
-				ag.ToolStartCallback = func(name, args string) {
+				// ToolStartCallback: always stop the spinner before any tool output so
+				// the spinner's \r never overwrites tool result lines (rendering race).
+				ag.Callbacks.ToolStart = func(name, args string) {
+					spinner.Stop()
 					switch name {
+					case "bash":
+						var p struct {
+							Command string `json:"command"`
+						}
+						if json.Unmarshal([]byte(args), &p) == nil && p.Command != "" {
+							ui.printBashCommand(p.Command)
+						}
 					case "file_write":
-						spinner.Stop()
 						var p struct {
 							Path    string `json:"path"`
 							Content string `json:"content"`
@@ -1970,7 +2020,6 @@ func runCLI(cmd *cobra.Command, args []string) error {
 							ui.printFileWrite(p.Path, p.Content)
 						}
 					case "file_edit":
-						spinner.Stop()
 						var p struct {
 							Path    string `json:"path"`
 							Search  string `json:"search"`
@@ -1979,40 +2028,42 @@ func runCLI(cmd *cobra.Command, args []string) error {
 						if json.Unmarshal([]byte(args), &p) == nil && p.Path != "" {
 							ui.printFileEdit(p.Path, p.Search, p.Replace)
 						}
-					case "ask_user":
-						spinner.Stop() // AskUserNotify will print the question
-					default:
-						spinner.Update("Running " + name + "…")
 					}
 				}
-				ag.ToolEndCallback = func(name string) {
-					switch name {
-					case "file_write", "file_edit":
-						spinner.Start("Thinking…")
-					default:
-						spinner.Update("Thinking…")
+				ag.Callbacks.ToolResult = func(name, result string) {
+					if name == "bash" {
+						ui.printBashOutput(result)
+						return
 					}
-				}
-				ag.ToolResultCallback = func(name, result string) {
 					ui.printToolResult(name, result)
+				}
+				ag.Callbacks.ToolEnd = func(name string) {
+					spinner.Start("Thinking…")
 				}
 
 				thinkFilter.Reset()
+				// Pause/resume spinner around think-block output to prevent
+				// the spinner's \r from overwriting the think summary lines.
+				thinkFilter.OnThinkBegin = func() { spinner.Stop() }
+				thinkFilter.OnThinkEnd = func() { spinner.Start("Thinking…") }
 				agentCh = make(chan agentResult, 1)
+				agentActive.Store(true)
 				go func(text string, ps []llm.ContentPart, ch chan agentResult) {
-					streamed := false
-					// inner: the real output function, stops spinner on first token.
+					var buf strings.Builder
 					thinkFilter.inner = func(token string) {
-						if !streamed {
-							spinner.Stop()
-							streamed = true
+						buf.WriteString(token)
+						approxTokens := buf.Len() / 4
+						if approxTokens > 0 {
+							spinner.Update(fmt.Sprintf("Writing… (~%d tokens)", approxTokens))
 						}
-						fmt.Print(token)
 					}
 					result, err := ag.RunWithParts(context.Background(), text, ps, thinkFilter.Wrap())
 					thinkFilter.Flush()
 					spinner.Stop()
-					ch <- agentResult{result, streamed, err}
+					if buf.Len() > 0 {
+						result = buf.String()
+					}
+					ch <- agentResult{result, err}
 				}(cleanText, parts, agentCh)
 			}
 
@@ -2020,24 +2071,36 @@ func runCLI(cmd *cobra.Command, args []string) error {
 			select {
 			case res := <-agentCh:
 				agentCh = nil
+				agentActive.Store(false)
 				// Save history after every completed turn (best-effort).
 				_ = sm.SaveHistory(activeSessionID, ag.Messages())
+				// Auto-rename auto-generated session names (session-N) to a slug
+				// derived from the first user message so sessions are easy to identify.
+				if isAutoSessionName(activeSessionID) && res.err == nil {
+					if slug := firstMessageSlug(ag.Messages()); slug != "" && slug != activeSessionID {
+						if err := sm.Rename(activeSessionID, slug); err == nil {
+							ag.SessionDir = sm.SessionDir(slug)
+							activeSessionID = slug
+						}
+					}
+				}
 				if res.err != nil {
 					fmt.Println()
 					ui.printErr(res.err.Error())
 				} else {
-					if !res.streamed && res.result != "" {
-						fmt.Print(res.result)
+					if res.result != "" {
+						fmt.Println()
+						fmt.Print(ui.renderMarkdown(res.result))
 					}
-					fmt.Println()
 					ui.printUsage(ag.LastRunUsage())
 				}
 				fmt.Println()
-				ui.printPrompt()
+				signalReady()
 
 			case input, ok := <-inputCh:
 				if !ok {
 					ag.Stop()
+					agentActive.Store(false)
 					factory.UserInputMgr.Cancel("")
 					<-agentCh
 					_ = sm.SaveHistory(activeSessionID, ag.Messages())
@@ -2058,6 +2121,7 @@ func runCLI(cmd *cobra.Command, args []string) error {
 	}
 
 	_ = sm.SaveHistory(activeSessionID, ag.Messages())
+	_ = rl.SaveHistory(historyFile, 1000)
 	return nil
 }
 
@@ -2192,6 +2256,80 @@ func resolveSession(sm *agent.SessionManager, query string) (string, error) {
 		}
 		return "", fmt.Errorf("ambiguous prefix %q — matches: %s", query, strings.Join(names, ", "))
 	}
+}
+
+// printSessionList prints a formatted session list with dynamic column widths.
+// activeID marks the currently active session with a ▶ indicator.
+func printSessionList(infos []agent.SessionInfo, activeID string) {
+	// Compute the widest session ID so columns stay aligned regardless of name length.
+	maxW := 7 // minimum width ("default")
+	for _, si := range infos {
+		if len(si.ID) > maxW {
+			maxW = len(si.ID)
+		}
+	}
+	if maxW > 42 {
+		maxW = 42
+	}
+	for _, si := range infos {
+		marker := "  "
+		if si.ID == activeID {
+			marker = stBlue.Render("▶ ")
+		}
+		id := si.ID
+		if len(id) > maxW {
+			id = id[:maxW-1] + "…"
+		}
+		preview := ""
+		if si.Preview != "" {
+			preview = "  " + stDim.Render(`"`+si.Preview+`"`)
+		}
+		fmt.Printf("  %s%-*s  %s  %s%s\n",
+			marker,
+			maxW,
+			id,
+			stDim.Render(fmt.Sprintf("%2d turns", si.TurnCount)),
+			stDim.Render(fmtAge(si.ModTime)),
+			preview,
+		)
+	}
+}
+
+// isAutoSessionName reports whether s is an auto-generated name like "session-3".
+func isAutoSessionName(s string) bool {
+	if !strings.HasPrefix(s, "session-") {
+		return false
+	}
+	suffix := s[len("session-"):]
+	if suffix == "" {
+		return false
+	}
+	for _, c := range suffix {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// firstMessageSlug derives a short slug from the first user message in a conversation.
+// Returns "" if no user message is found or the slug would be empty after sanitizing.
+func firstMessageSlug(msgs []llm.Message) string {
+	for _, m := range msgs {
+		if m.Role == "user" {
+			words := strings.Fields(m.TextContent())
+			if len(words) > 5 {
+				words = words[:5]
+			}
+			s := agent.SanitizeSessionID(strings.Join(words, "-"))
+			if len(s) > 32 {
+				s = s[:32]
+			}
+			s = strings.TrimRight(s, "-")
+			return s
+		}
+	}
+	return ""
 }
 
 // imDiffWrite builds a Markdown diff block for a file_write operation.

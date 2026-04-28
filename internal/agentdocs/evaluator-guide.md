@@ -14,7 +14,7 @@ You have access to:
 
 ## Verdict Format
 
-Your `finish_task` summary **must** be valid JSON:
+Call `finish_task` with `status="success"` and a summary that is **valid JSON**:
 
 ```json
 {"verdict":"pass","fixed":false,"report_to_user":""}

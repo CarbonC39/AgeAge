@@ -64,16 +64,14 @@ Trigger with `/code-review <context>` — the skill activates immediately (hot-r
 
 ## Complexity and Model Selection
 
-When the router is enabled (`router.enabled = true`):
+| complexity  | model used                              | delegate tool |
+|-------------|-----------------------------------------|---------------|
+| `direct`    | base `[llm]` model                      | no            |
+| `atomic`    | `[router.medium]` model (if configured) | no            |
+| `workflow`  | `[router.strong]` model (if configured) | yes           |
 
-| complexity | model used |
-|-----------|------------|
-| direct | `router.classifier` model (lightweight) |
-| atomic | main `[llm]` model |
-| workflow | `router.strong` model |
-
-Omitting `complexity` defaults to atomic routing.
-Legacy values `simple`, `medium`, `complex` are still accepted.
+Omitting `complexity` lets the router decide per turn.
+Legacy values `simple`, `medium`, `complex` are still accepted (mapped to `direct`, `atomic`, `workflow`).
 
 ---
 

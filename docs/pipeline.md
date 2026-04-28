@@ -28,7 +28,7 @@ Pipeline skills are standalone `.yaml` files in the `skills/` directory. They ar
 name: my-pipeline
 version: "1.0"
 description: "One-line summary for the router."
-complexity: complex
+complexity: workflow
 vars:
   topic: "" # declare variables and their defaults
 pipeline:
@@ -52,7 +52,7 @@ pipeline:
 | `name` | string | Skill identifier. Defaults to the filename without extension. |
 | `version` | string | Informational only. |
 | `description` | string | Shown to the router for skill selection. |
-| `complexity` | string | `simple` / `medium` / `complex`.  Pipelines default to `complex`. |
+| `complexity` | string | `direct` / `atomic` / `workflow`. Pipelines default to `workflow`. |
 | `vars` | map | Initial variable values. `$vars.input` is always set from the user's message. |
 | `pipeline` | list | Ordered list of nodes executed sequentially. |
 
@@ -117,8 +117,8 @@ Every node in the `pipeline` list supports these fields:
 | `prompt` | string | — | The task given to the node's agent. Supports template syntax. |
 | `skill` | string | — | Activate a named skill inside this node. May reference another pipeline skill (nested, max 1 level). |
 | `tools` | list | — | Tool allowlist for this node. If empty and no skill, all global tools are available. |
-| `complexity` | string | — | `simple` / `medium` / `complex`. Selects the LLM model for this node. |
-| `fallback_complexity` | string | — | Fallback model complexity if the primary model call fails (e.g. API error). Same values as `complexity`. |
+| `complexity` | string | — | `direct` / `atomic` / `workflow`. Selects the LLM model for this node. |
+| `fallback_complexity` | string | — | Fallback model complexity on API failure. Same values as `complexity`. |
 | `inject_soul` | bool | `false` | Whether to include `SOUL.md` in this node's system prompt. |
 | `no_context` | bool | `false` | Suppress `.ageage/CONTEXT.md` injection for this node. |
 | `output_context` | bool | `false` | Allow this node to pass a context string to all subsequent nodes via `node_complete`. |
@@ -481,8 +481,8 @@ When a node's primary model is unavailable or returns an API error, you can conf
 
 ```yaml
 - id: synthesize
-  complexity: complex          # try the strong model first
-  fallback_complexity: simple  # fall back to the base model on API failure
+  complexity: workflow         # try the strong model first
+  fallback_complexity: direct  # fall back to the base model on API failure
   prompt: |
     Synthesize the findings into a final report.
   outputs:
@@ -538,7 +538,7 @@ pipeline:
       - context: a brief summary of the key facts (2–3 sentences)
 
   - id: write_report
-    complexity: complex # use the strongest model for synthesis
+    complexity: workflow # use the strongest model for synthesis
     prompt: |
       Write a comprehensive research report based on the findings above.
       Structure it with an executive summary, key findings, and conclusion.

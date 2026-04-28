@@ -180,29 +180,30 @@ func runInit(cmd *cobra.Command, args []string) error {
 	fmt.Println("AgeAge Setup Wizard")
 	fmt.Println(strings.Repeat("═", 52))
 
-	// ─── 1/6  Storage ────────────────────────────────────────
-	printInitSection("1/6  Storage")
+	// ─── 1/7  Storage ────────────────────────────────────────
+	printInitSection("1/7  Storage")
 	fmt.Println("AgeAge directory — one folder for config.toml, AGENT.md, SOUL.md,")
-	fmt.Println("memories, skills, and session data. Pass it with: ageage cli -c <dir>/config.toml")
+	fmt.Println("memories, skills, and session data.")
+	fmt.Println("Launch with: ageage cli -c <dir>/config.toml")
 	fmt.Print("AgeAge directory (default: ./ageage): ")
 	ageageDir, _ := filepath.Abs(readLine(reader, "./ageage"))
 	cfgPath := filepath.Join(ageageDir, "config.toml")
 
 	fmt.Println()
-	fmt.Println("Workspace — the directory of files the agent reads and writes.")
-	fmt.Println("In CLI mode the launch directory is always used regardless of this setting.")
-	fmt.Println("In channel/serve mode the agent operates here by default.")
-	fmt.Print("Workspace (default: . — current directory at runtime): ")
+	fmt.Println("Workspace — the directory the agent reads and writes files in.")
+	fmt.Println("CLI mode always uses the shell's launch directory, regardless of this setting.")
+	fmt.Println("Channel/serve mode uses the workspace path below.")
+	fmt.Print("Workspace (default: . — runtime launch directory): ")
 	workspace := readLine(reader, ".")
-	// Keep "." as-is so it resolves at runtime relative to the ageage dir.
 
-	// ─── 2/6  LLM Provider ───────────────────────────────────
-	printInitSection("2/6  LLM Provider")
+	// ─── 2/7  LLM Provider ───────────────────────────────────
+	printInitSection("2/7  LLM Provider")
 	fmt.Println("Base URL examples:")
 	fmt.Println("  OpenAI:    https://api.openai.com/v1")
 	fmt.Println("  Anthropic: https://api.anthropic.com/v1")
 	fmt.Println("  DeepSeek:  https://api.deepseek.com/v1")
 	fmt.Println("  Gemini:    https://generativelanguage.googleapis.com/v1beta/openai")
+	fmt.Println("  Mistral:   https://api.mistral.ai/v1")
 	fmt.Println("  Ollama:    http://localhost:11434/v1  (no API key needed)")
 	fmt.Print("Base URL (default: https://api.openai.com/v1): ")
 	baseURL := readLine(reader, "https://api.openai.com/v1")
@@ -211,7 +212,7 @@ func runInit(cmd *cobra.Command, args []string) error {
 	if envKey != "" {
 		fmt.Printf("API Key (found %s — press Enter to use it): ", envName)
 	} else {
-		fmt.Print("API Key: ")
+		fmt.Print("API Key (press Enter to skip for keyless providers like Ollama): ")
 	}
 	apiKey := readLine(reader, envKey)
 	if apiKey == envKey && envKey != "" {
@@ -220,12 +221,12 @@ func runInit(cmd *cobra.Command, args []string) error {
 
 	model := pickModel(reader, baseURL, apiKey)
 
-	// ─── 3/6  Agent Behavior ─────────────────────────────────
-	printInitSection("3/6  Agent Behavior")
+	// ─── 3/7  Agent Behavior ─────────────────────────────────
+	printInitSection("3/7  Agent Behavior")
 	fmt.Println("Mode:")
-	fmt.Println("  1) supervised — prompt for confirmation on every tool call")
-	fmt.Println("                  Best for CLI: you review before each action")
-	fmt.Println("  2) full       — autonomous, no confirmation prompts")
+	fmt.Println("  1) supervised — pause for confirmation before every tool call")
+	fmt.Println("                  Recommended for CLI use; you review each action")
+	fmt.Println("  2) full       — fully autonomous, no confirmation prompts")
 	fmt.Println("                  Required for channel mode (Telegram/Discord/Matrix)")
 	fmt.Print("Select mode (default: 1): ")
 	agentMode := "supervised"
@@ -233,31 +234,50 @@ func runInit(cmd *cobra.Command, args []string) error {
 		agentMode = "full"
 	}
 
-	// ─── 4/6  Intent Router ──────────────────────────────────
-	printInitSection("4/6  Intent Router  (optional)")
-	fmt.Println("Routes requests to different model tiers by task complexity.")
-	fmt.Println("Example: cheap model for Q&A, powerful model for code/reasoning.")
+	// ─── 4/7  Intent Router ──────────────────────────────────
+	printInitSection("4/7  Intent Router  (optional)")
+	fmt.Println("The router classifies each request by answering 3 factual checks")
+	fmt.Println("(needs tools? needs multiple steps? needs synthesis?) and routes to")
+	fmt.Println("the right model tier — direct, atomic, or workflow.")
+	fmt.Println("Requires at least a cheap classifier model; strong model is optional.")
 	fmt.Println("Skip if you use a single model for everything.")
 	fmt.Print("Configure router? (y/N): ")
 	routerEnabled := strings.ToLower(readLine(reader, "n")) == "y"
 	var routerClassifier, routerMedium, routerStrong string
 	if routerEnabled {
 		classDefault := suggestModel(baseURL)
-		fmt.Printf("  Classifier model (routing decisions, pick something cheap; default: %s): ", classDefault)
+		fmt.Printf("  Classifier model (cheap; used for intent classification; default: %s): ", classDefault)
 		routerClassifier = readLine(reader, classDefault)
-		fmt.Printf("  Medium model (moderate tasks; default: %s): ", model)
+		fmt.Printf("  Atomic model (single-tool tasks; default: %s): ", model)
 		routerMedium = readLine(reader, model)
-		strongDefault := getStrongModel(model)
-		fmt.Printf("  Strong model (complex tasks; default: %s): ", strongDefault)
+		strongDefault := getStrongModel(baseURL, model)
+		fmt.Printf("  Workflow model (multi-step tasks; default: %s): ", strongDefault)
 		routerStrong = readLine(reader, strongDefault)
 	}
 
-	// ─── 5/6  Web Tools ──────────────────────────────────────
-	printInitSection("5/6  Web Tools")
+	// ─── 5/7  Skill Quality  ─────────────────────────────────
+	printInitSection("5/7  Skill Quality  (optional)")
+	fmt.Println("The Evaluator reviews auto-generated skills after they run,")
+	fmt.Println("patching deficiencies in the background. It stops once a skill")
+	fmt.Println("passes N consecutive times (success threshold).")
+	fmt.Print("Enable Evaluator? (y/N): ")
+	evalEnabled := strings.ToLower(readLine(reader, "n")) == "y"
+	evalThreshold := 3
+	if evalEnabled {
+		fmt.Print("  Success threshold (default: 3): ")
+		if t := readLine(reader, "3"); t != "3" {
+			if _, err := fmt.Sscanf(t, "%d", &evalThreshold); err != nil || evalThreshold < 1 {
+				evalThreshold = 3
+			}
+		}
+	}
+
+	// ─── 6/7  Web Tools ──────────────────────────────────────
+	printInitSection("6/7  Web Tools")
 	fmt.Println("Search backend:")
-	fmt.Println("  1) DuckDuckGo  — no API key, works out of the box")
-	fmt.Println("  2) Brave       — higher quality results (needs Brave Search API key)")
-	fmt.Println("  3) Tavily      — optimized for LLM agents (needs Tavily API key)")
+	fmt.Println("  1) DuckDuckGo  — no API key, works immediately")
+	fmt.Println("  2) Brave       — higher quality results (Brave Search API key required)")
+	fmt.Println("  3) Tavily      — optimized for LLM agents (Tavily API key required)")
 	fmt.Println("  4) SearXNG     — self-hosted, privacy-friendly")
 	fmt.Print("Select (default: 1): ")
 	searchBackend, searxngURL, tavilyKey, braveKey := parseSearchChoice(reader, readLine(reader, "1"))
@@ -269,8 +289,8 @@ func runInit(cmd *cobra.Command, args []string) error {
 	fmt.Print("Select (default: 1): ")
 	fetchBackend, jinaKey, pythonCmd := parseFetchChoice(reader, readLine(reader, "1"))
 
-	// ─── 6/6  Default Tools ───────────────────────────────────
-	printInitSection("6/6  Default Tools")
+	// ─── 7/7  Default Tools ───────────────────────────────────
+	printInitSection("7/7  Default Tools")
 	fmt.Println("All tools are enabled by default. An allowlist restricts the agent to")
 	fmt.Println("only the tools you name (useful for leaner or constrained deployments).")
 	fmt.Print("Customize tool allowlist? (y/N): ")
@@ -301,6 +321,7 @@ func runInit(cmd *cobra.Command, args []string) error {
 	if writeConfig {
 		content := buildInitConfig(workspace, apiKey, baseURL, model, agentMode, toolsLine,
 			routerEnabled, routerClassifier, routerMedium, routerStrong,
+			evalEnabled, evalThreshold,
 			searchBackend, searxngURL, tavilyKey, braveKey,
 			fetchBackend, jinaKey, pythonCmd)
 		if err := os.WriteFile(cfgPath, []byte(content), 0o644); err != nil {
@@ -314,11 +335,13 @@ func runInit(cmd *cobra.Command, args []string) error {
 ## Execution Directives
 
 - Use tools to gather information and perform actions.
-- Call finish_task when done with a final, complete answer.
-- Think step by step for complex tasks.
-- Never say "see above" or "refer to results" — always include the full answer.
-- Use memory_store and memory_recall to persist context across sessions.
-- Minimize unnecessary tool calls; batch related reads when possible.
+- Call finish_task(status="success", summary=...) when done with a complete answer.
+- Use status="failure" for early exit (missing information, unrecoverable error).
+- If you used update_todos, all todos must be done before calling status="success".
+- Think step by step for complex tasks; use delegate or escalate for heavy subtasks.
+- Never say "see above" or "refer to results" — always include the full answer inline.
+- Use memory_store and memory_recall to persist important context across sessions.
+- Minimize unnecessary tool calls; batch independent reads in a single response.
 - Stay honest about limitations and uncertainty.
 - Always respond in the same language the user uses.
 `)
@@ -338,11 +361,17 @@ You are a helpful, friendly, and knowledgeable AI assistant.
 	fmt.Println(strings.Repeat("─", 52))
 	fmt.Println("Setup complete!")
 	fmt.Println()
-	fmt.Printf("  CLI mode:     ageage cli -c %s\n", cfgPath)
-	fmt.Printf("  Channel mode: ageage connect -c %s\n", cfgPath)
-	fmt.Printf("  Tool select:  ageage tools -c %s\n", cfgPath)
+	fmt.Printf("  Start chatting:  ageage cli -c %s\n", cfgPath)
+	fmt.Printf("  Channel mode:    ageage connect -c %s\n", cfgPath)
+	fmt.Printf("  Tool select:     ageage tools -c %s\n", cfgPath)
 	fmt.Println()
-	fmt.Println("Other features to configure in config.toml:")
+	fmt.Println("Useful commands once running:")
+	fmt.Println("  /build [description] — create a reusable skill or pipeline")
+	fmt.Println("  /session new [name]  — start a fresh named session")
+	fmt.Println("  /undo                — roll back the last turn")
+	fmt.Println("  /help                — list all commands")
+	fmt.Println()
+	fmt.Println("More options in config.toml:")
 	fmt.Println("  [summarize]    — auto-compress long conversation history")
 	fmt.Println("  [channels.*]   — Telegram, Discord, Matrix connectors")
 	fmt.Println("  [mcp.servers]  — connect external MCP tool servers")
@@ -491,6 +520,7 @@ func parseFetchChoice(reader *bufio.Reader, choice string) (backend, jinaKey, py
 func buildInitConfig(
 	workspace, apiKey, baseURL, model, agentMode, toolsLine string,
 	routerEnabled bool, routerClassifier, routerMedium, routerStrong string,
+	evalEnabled bool, evalThreshold int,
 	searchBackend, searxngURL, tavilyKey, braveKey string,
 	fetchBackend, jinaKey, pythonCmd string,
 ) string {
@@ -526,9 +556,9 @@ func buildInitConfig(
 
 	p("[pipeline]\n")
 	p("# foreach_concurrency = 4  # max parallel foreach iterations; 0 = sequential\n")
-	p("# [pipeline.models.simple]\n# model = \"\"\n")
-	p("# [pipeline.models.medium]\n# model = \"\"\n")
-	p("# [pipeline.models.complex]\n# model = \"\"\n\n")
+	p("# [pipeline.models.simple]\n# model = \"\"  # → direct complexity\n")
+	p("# [pipeline.models.medium]\n# model = \"\"  # → atomic complexity\n")
+	p("# [pipeline.models.complex]\n# model = \"\"  # → workflow complexity\n\n")
 
 	if routerEnabled {
 		p("[router]\n")
@@ -549,7 +579,17 @@ func buildInitConfig(
 		p("# max_history = 8\n")
 		p("# [router.classifier]\n# model = \"gpt-4o-mini\"  # cheap intent classifier\n")
 		p("# [router.medium]\n# model = %q\n", model)
-		p("# [router.strong]\n# model = %q\n\n", getStrongModel(model))
+		p("# [router.strong]\n# model = %q\n\n", getStrongModel(baseURL, model))
+	}
+
+	p("[eval]\n")
+	if evalEnabled {
+		p("# Evaluator reviews auto-generated skills after they run and patches deficiencies.\n")
+		p("success_threshold = %d  # stop evaluating after N consecutive passes\n\n", evalThreshold)
+	} else {
+		p("# Evaluator reviews auto-generated skills after they run and patches deficiencies.\n")
+		p("# enabled           = true\n")
+		p("# success_threshold = 3\n\n")
 	}
 
 	p("[summarize]\n")
@@ -682,14 +722,18 @@ func readLine(reader *bufio.Reader, defaultVal string) string {
 	return input
 }
 
-func getStrongModel(baseModel string) string {
+func getStrongModel(baseURL, baseModel string) string {
 	switch {
+	case strings.Contains(baseURL, "anthropic"):
+		return "claude-opus-4-7"
+	case strings.Contains(baseURL, "mistral"):
+		return "mistral-large-latest"
+	case strings.Contains(baseURL, "generativelanguage") || strings.Contains(baseURL, "gemini"):
+		return strings.ReplaceAll(baseModel, "flash", "pro")
+	case strings.Contains(baseURL, "deepseek"):
+		return "deepseek-reasoner"
 	case strings.Contains(baseModel, "gpt-4o-mini"):
 		return "gpt-4o"
-	case strings.Contains(baseModel, "deepseek"):
-		return "deepseek-reasoner"
-	case strings.Contains(baseModel, "gemini") && strings.Contains(baseModel, "flash"):
-		return "gemini-2.0-pro"
 	default:
 		return baseModel
 	}

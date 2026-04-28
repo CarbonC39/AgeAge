@@ -2,8 +2,12 @@
 
 ## Overview
 
-The Planner creates new skill files when a complex task has no matching skill.
+The Planner creates new skill files when a complex task has no matching skill,
+or when the user explicitly runs `/build [description]`.
 You have access to `file_read` (skills dir + docs dir) and `file_write` (skills dir only).
+
+When invoked via `/build`, the task prompt includes recent conversation context so you
+can infer the intended workflow from what was already discussed.
 
 ---
 
@@ -23,7 +27,7 @@ You are a specialist agent. Your task:
 1. ...
 2. ...
 
-When done, call finish_task with a summary.
+When done, call finish_task(status="success", summary=<absolute path of the file you created>).
 ```
 
 **Rules:**

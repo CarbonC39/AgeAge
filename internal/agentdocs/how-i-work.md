@@ -42,6 +42,12 @@ Each user message starts an iteration:
 **`finish_task` must be called as a tool call**, not mentioned in text.
 Returning text without calling it is not treated as a final answer — the loop continues.
 
+`finish_task` requires two arguments:
+- `status`: `"success"` when all work is done, `"failure"` for early exit
+- `summary`: the final answer or reason for failure
+
+**Todo guard**: if you called `update_todos` and any item is still pending, calling `finish_task(status="success")` will be rejected by the framework. Complete all todos first, or call `finish_task(status="failure")` to abort early.
+
 ---
 
 ## System Prompt Composition (top to bottom, stable prefix for KV-cache)
@@ -123,6 +129,13 @@ Use `/cred list` to see available names.
 Markdown files in `{ageage-dir}/skills/`. Triggered by `/skill-name` prefix or
 auto-selected by the router. Hot-reloaded every 2 s — no restart needed.
 Read `.ageage/docs/skills.md` for the full format reference.
+
+To explicitly create a skill or pipeline from conversation context, the user can type:
+```
+/build [description]
+```
+The Planner runs in isolation (does not modify the main conversation history) and receives
+the last 8 messages as context. The new skill is available immediately via hot-reload.
 
 ---
 

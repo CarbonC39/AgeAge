@@ -721,10 +721,20 @@ func startChannels(factory *agent.AgentFactory) (*channel.Manager, int) {
 
 	// Per-session agent pool. In channel mode, session IDs are prefixed with a
 	// sanitised chatKey so each chat's sessions are independent.
-	agents := make(map[string]*agent.Agent) // sessionID → agent
-	activeSessions := make(map[string]string)        // chatKey → active sessionID
-	chatKeyBySessionID := make(map[string]string)    // sessionID → original chatKey (for matrix.to links)
+	agents := make(map[string]*agent.Agent)       // sessionID → agent
+	activeSessions := make(map[string]string)     // chatKey → active sessionID
+	chatKeyBySessionID := make(map[string]string) // sessionID → original chatKey (for matrix.to links)
 	var agentMu sync.Mutex
+
+	// activeReactions tracks the pending ⏳ reaction for each running task so
+	// the /stop handler (which bypasses the per-chat mutex) can remove it.
+	type reactionInfo struct {
+		channelType string
+		channelID   string
+		msgID       string // original task message ID (to React 🛑 onto)
+		eventID     string // reaction event ID returned by React (to Unreact)
+	}
+	activeReactions := make(map[string]reactionInfo) // chatKey → pending reaction
 
 	confirmMgr := tools.NewConfirmationManager()
 
@@ -1060,8 +1070,15 @@ func startChannels(factory *agent.AgentFactory) (*channel.Manager, int) {
 					ag.Stop()
 				}
 			}
+			react := activeReactions[chatKey]
 			agentMu.Unlock()
 			factory.UserInputMgr.Cancel(msg.ChannelID)
+			if react.eventID != "" {
+				if r, ok := channelsByType[react.channelType].(channel.Reactor); ok {
+					_ = r.Unreact(react.channelID, react.eventID)
+					_, _ = r.React(react.channelID, react.msgID, "🛑")
+				}
+			}
 			return respond(msg, "🛑 Task stopped.")
 		}
 
@@ -1179,15 +1196,26 @@ func startChannels(factory *agent.AgentFactory) (*channel.Manager, int) {
 			return respond(msg, handleSessionCmd(rKey, chatKey, text))
 		}
 
+		// /build [description] — create a skill or pipeline without entering the agent loop.
+		// The planner runs isolated; the main conversation history is untouched.
+		if textLow == "/build" || strings.HasPrefix(textLow, "/build ") {
+			task := strings.TrimSpace(msg.Text[len("/build"):])
+			ag, _ := getAgent(chatKey)
+			history := ag.Messages()
+			docsDir := filepath.Join(factory.Config.AgeAgeDirPath(), "docs")
+			planner := agent.NewPlanner(factory, docsDir)
+			skill, err := planner.CreateSkill(context.Background(), task, history)
+			if err != nil {
+				return respond(msg, fmt.Sprintf("❌ Build failed: %s", err))
+			}
+			return respond(msg, fmt.Sprintf("✅ Built `%s` — use `/%s` to activate.", skill.Name, skill.CommandName()))
+		}
+
 		switch textLow {
 		case "/clear":
-			agentMu.Lock()
-			sessionID := chatSessionID(chatKey)
-			if ag, ok := agents[sessionID]; ok {
-				ag.ClearHistory()
-				_ = sm.SaveHistory(sessionID, ag.Messages())
-			}
-			agentMu.Unlock()
+			ag, sessionID := getAgent(chatKey)
+			ag.ClearHistory()
+			_ = sm.SaveHistory(sessionID, ag.Messages())
 			return respond(msg, "🗑️ Conversation history cleared.")
 
 		case "/summarize":
@@ -1211,6 +1239,7 @@ func startChannels(factory *agent.AgentFactory) (*channel.Manager, int) {
 		case "/help":
 			return respond(msg, "Available commands:\n"+
 				"/clear — Clear conversation history (keeps session)\n"+
+				"/build [description] — Create a skill or pipeline (uses conversation context)\n"+
 				"/stop — Stop the current task\n"+
 				"/summarize — Summarize conversation\n"+
 				"/undo — Remove the last turn from history\n"+
@@ -1252,6 +1281,11 @@ func startChannels(factory *agent.AgentFactory) (*channel.Manager, int) {
 		var reactEventID string
 		if r, ok := channelsByType[msg.ChannelType].(channel.Reactor); ok {
 			reactEventID, _ = r.React(msg.ChannelID, msg.ReplyTo, "⏳")
+			if reactEventID != "" {
+				agentMu.Lock()
+				activeReactions[chatKey] = reactionInfo{msg.ChannelType, msg.ChannelID, msg.ReplyTo, reactEventID}
+				agentMu.Unlock()
+			}
 		}
 
 		ag, sessionID := getAgent(chatKey)
@@ -1278,6 +1312,9 @@ func startChannels(factory *agent.AgentFactory) (*channel.Manager, int) {
 		_ = sm.SaveHistory(sessionID, ag.Messages())
 
 		// Remove ⏳; add ❌ only on error.
+		agentMu.Lock()
+		delete(activeReactions, chatKey)
+		agentMu.Unlock()
 		if reactEventID != "" {
 			if r, ok := channelsByType[msg.ChannelType].(channel.Reactor); ok {
 				_ = r.Unreact(msg.ChannelID, reactEventID)

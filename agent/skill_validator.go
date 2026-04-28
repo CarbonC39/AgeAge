@@ -59,13 +59,14 @@ func ValidateSkillFile(path string, knownTools []string) []ValidationError {
 		errs = append(errs, ValidationError{Field: "description", Message: "required field missing"})
 	}
 	switch skill.Complexity {
-	case "simple", "medium", "complex":
+	case "direct", "atomic", "workflow", "simple", "medium", "complex":
+		// valid (new names + legacy aliases)
 	case "":
 		errs = append(errs, ValidationError{Field: "complexity", Message: "required field missing"})
 	default:
 		errs = append(errs, ValidationError{
 			Field:   "complexity",
-			Message: fmt.Sprintf("invalid value %q — must be simple, medium, or complex", skill.Complexity),
+			Message: fmt.Sprintf("invalid value %q — must be direct, atomic, or workflow", skill.Complexity),
 		})
 	}
 

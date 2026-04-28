@@ -36,7 +36,7 @@ type AgentFactory struct {
 	OnAlwaysAllow   func(operation string)        // Optional: called when user selects "a" (always-allow) in CLI confirm
 	CredMgr         *creds.Manager                // Optional: nil when credentials feature is unavailable
 
-	mcpMu    sync.RWMutex // Bug Fix 2: Protect MCPSessions
+	mcpMu    sync.RWMutex
 	skillsMu sync.RWMutex
 	Skills   []skills.Skill
 }
@@ -292,7 +292,7 @@ func (f *AgentFactory) CreateAgent(confirmMgr *tools.ConfirmationManager, channe
 
 // CreateAgentFiltered instantiates a new Agent with a subset of tools if allowedTools is provided.
 func (f *AgentFactory) CreateAgentFiltered(confirmMgr *tools.ConfirmationManager, channelID string, allowedTools []string) *Agent {
-	f.ensureMCPSessions() // Bug Fix 6: Reconnect dead MCP servers.
+	f.ensureMCPSessions()
 
 	registry := tools.NewRegistry()
 
@@ -405,9 +405,9 @@ func (f *AgentFactory) CreateAgentFiltered(confirmMgr *tools.ConfirmationManager
 	// Both contain the absolute path as a distinct segment, so checking for the
 	// canonical sub-path "/.ageage/sessions/<id>/CONTEXT.md" is sufficient.
 	fileConfirmFunc := func(operation string) bool {
-		slashed := filepath.ToSlash(operation)
+		slashed := strings.ToLower(filepath.ToSlash(operation))
 		// Match any session CONTEXT.md: */.ageage/sessions/<id>/CONTEXT.md
-		if strings.Contains(slashed, "/.ageage/sessions/") && strings.Contains(slashed, "/CONTEXT.md") {
+		if strings.Contains(slashed, "/.ageage/sessions/") && strings.Contains(slashed, "/context.md") {
 			return true
 		}
 		return confirmFunc(operation)

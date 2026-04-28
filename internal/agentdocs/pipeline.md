@@ -12,7 +12,7 @@ Pipeline skills are **standalone `.yaml` files** in `{ageage-dir}/skills/`.
 ```yaml
 name: my-pipeline
 description: "One-line summary for the router."
-complexity: complex        # simple | medium | complex
+complexity: workflow       # direct | atomic | workflow
 vars:
   topic: ""                # declare vars and defaults; input = user message
 
@@ -66,7 +66,7 @@ are optional but recommended for readability.
 | `prompt` | Task prompt; supports `{{name}}` and `{{$vars.name}}` syntax |
 | `skill` | Name of a regular or pipeline skill to embed in this node |
 | `tools` | Tool allowlist for this node; omit for all available tools |
-| `complexity` | Model tier for this node (`simple`/`medium`/`complex`) |
+| `complexity` | Model tier for this node (`direct`/`atomic`/`workflow`) |
 
 ### Auto-only
 
@@ -94,7 +94,7 @@ All three forms are equivalent when the node key is always `result`.
 |------|-----|
 | **CONTEXT.md** | Always injected into every agent node |
 | **SOUL** | Injected only into the last agent node (if the parent agent has SOUL enabled) |
-| **Complexity fallback** | On transient LLM error: `complex→medium`, `medium→base` |
+| **Complexity fallback** | On transient LLM error: `workflow→atomic`, `atomic→base` |
 
 No per-node flags needed — the engine decides.
 

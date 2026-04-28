@@ -230,8 +230,10 @@ func trashDir(dir string) error {
 		)
 		return exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", script).Run()
 	case "darwin":
-		script := fmt.Sprintf(`tell application "Finder" to delete POSIX file "%s"`,
-			strings.ReplaceAll(dir, `"`, `\"`))
+		sanitized := strings.ReplaceAll(dir, `"`, `\"`)
+		sanitized = strings.ReplaceAll(sanitized, "\n", "")
+		sanitized = strings.ReplaceAll(sanitized, "\r", "")
+		script := fmt.Sprintf(`tell application "Finder" to delete POSIX file "%s"`, sanitized)
 		return exec.Command("osascript", "-e", script).Run()
 	default: // Linux and others
 		if _, err := exec.LookPath("trash-put"); err == nil {
@@ -282,11 +284,15 @@ func (sm *SessionManager) SaveHistory(id string, msgs []llm.Message) error {
 			break
 		}
 	}
-	f.Close()
+	closeErr := f.Close()
 
 	if writeErr != nil {
 		_ = os.Remove(tmp)
 		return writeErr
+	}
+	if closeErr != nil {
+		_ = os.Remove(tmp)
+		return closeErr
 	}
 	return os.Rename(tmp, path)
 }

@@ -36,7 +36,10 @@ func NewPlanner(factory *AgentFactory, docsDir string) *Planner {
 // CreateSkill asks a sandboxed agent to author a new skill file, validates it,
 // and returns the loaded Skill. It retries up to maxPlannerRetries times when
 // the generated file fails validation. Returns an error if all attempts fail.
-func (p *Planner) CreateSkill(ctx context.Context, userTask string) (*skills.Skill, error) {
+//
+// history is an optional snapshot of the caller's conversation (used by /build
+// to give the planner context). Pass nil for the automatic workflow invocation.
+func (p *Planner) CreateSkill(ctx context.Context, userTask string, history []llm.Message) (*skills.Skill, error) {
 	if err := os.MkdirAll(p.skillsDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create skills dir: %w", err)
 	}
@@ -47,7 +50,7 @@ func (p *Planner) CreateSkill(ctx context.Context, userTask string) (*skills.Ski
 	preFiles := fileNameSet(p.skillsDir)
 
 	var (
-		prompt      = p.buildPrompt(userTask)
+		prompt      = p.buildPrompt(userTask, history)
 		trackedPath string // the file created in the first successful attempt
 	)
 
@@ -63,11 +66,15 @@ func (p *Planner) CreateSkill(ctx context.Context, userTask string) (*skills.Ski
 
 		// On the first attempt, find the newly created file.
 		if trackedPath == "" {
-			trackedPath = firstNewSkillFile(p.skillsDir, preFiles)
+			// Extract trackedPath from finish_task summary
+			trackedPath = strings.TrimSpace(ag.finishTool.Summary)
+			if trackedPath == "" || !strings.HasPrefix(trackedPath, p.skillsDir) {
+				trackedPath = firstNewSkillFile(p.skillsDir, preFiles)
+			}
 			if trackedPath == "" {
 				prompt = fmt.Sprintf(
-					"You did not create any skill file. Write a .md or .yaml file to %s "+
-						"and then call finish_task.", p.skillsDir)
+					"You did not create any skill file or failed to provide its path. Write a .md or .yaml file to %s "+
+						"and then call finish_task with its absolute path as the summary.", p.skillsDir)
 				preFiles = fileNameSet(p.skillsDir)
 				continue
 			}
@@ -143,14 +150,39 @@ Framework docs (read these first): %s
 Rules:
 - Write exactly ONE file to the skills directory.
 - Set "auto_generated: true" and "success_count: 0" in the file.
-- For agent skills (.md): use YAML frontmatter with name, description, complexity, auto_generated, success_count.
+- For agent skills (.md): use YAML frontmatter with name, description, complexity, required_tools, auto_generated, success_count.
+  IMPORTANT: always set required_tools to the minimal list of tools the skill actually needs (e.g. bash, file_read, file_write, web_search, web_fetch, finish_task). Do not omit required_tools.
 - For pipeline skills (.yaml): follow the schema in %s/pipeline.md.
-- Valid complexity values: simple, medium, complex.
-- Always call finish_task when done.`, p.skillsDir, p.docsDir, p.docsDir)
+- Valid complexity values: direct, atomic, workflow (legacy: simple, medium, complex still accepted).
+- Always call finish_task when done, and set the 'summary' argument to the absolute path of the file you created.`, p.skillsDir, p.docsDir, p.docsDir)
 }
 
-func (p *Planner) buildPrompt(userTask string) string {
-	return fmt.Sprintf("Create a reusable skill or pipeline for the following task:\n\n%s", userTask)
+func (p *Planner) buildPrompt(userTask string, history []llm.Message) string {
+	var sb strings.Builder
+	if len(history) > 0 {
+		sb.WriteString("## Recent Conversation Context\n\n")
+		start := len(history) - 8
+		if start < 0 {
+			start = 0
+		}
+		for _, m := range history[start:] {
+			text := m.TextContent()
+			if text == "" || (m.Role != "user" && m.Role != "assistant") {
+				continue
+			}
+			label := "User"
+			if m.Role == "assistant" {
+				label = "Assistant"
+			}
+			fmt.Fprintf(&sb, "[%s]: %s\n\n", label, text)
+		}
+	}
+	if userTask != "" {
+		fmt.Fprintf(&sb, "## Task\n\nCreate a reusable skill or pipeline for:\n\n%s", userTask)
+	} else {
+		sb.WriteString("## Task\n\nBased on the conversation above, create a reusable skill or pipeline that captures this recurring workflow.")
+	}
+	return sb.String()
 }
 
 // reloadFactorySkills forces a hot-reload of the factory's skill list so the

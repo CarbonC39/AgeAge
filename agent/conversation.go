@@ -1,6 +1,8 @@
 package agent
 
 import (
+	"fmt"
+
 	"ageage/llm"
 )
 
@@ -87,8 +89,12 @@ func (c *Conversation) ToolHistory() []ToolRecord {
 		switch msg.Role {
 		case "assistant":
 			pending = make(map[string]llm.FunctionCall)
-			for _, tc := range msg.ToolCalls {
-				pending[tc.ID] = tc.Function
+			for idx, tc := range msg.ToolCalls {
+				id := tc.ID
+				if id == "" {
+					id = fmt.Sprintf("%s_%d", tc.Function.Name, idx)
+				}
+				pending[id] = tc.Function
 			}
 		case "tool":
 			if fn, ok := pending[msg.ToolCallID]; ok {

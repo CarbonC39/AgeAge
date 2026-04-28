@@ -189,6 +189,12 @@ func (a *Agent) buildSystemPrompt(matchedSkill *skills.Skill) string {
 		isPipelineAgent = true
 	}
 	fmt.Fprintf(&sb, "2. When you have completed the task or have a FINAL answer, you MUST call the %s tool.\n", finishToolName)
+	fmt.Fprintf(&sb, "   - **Never reply with text alone** without calling %s. "+
+		"If you have a final answer, return it via %s(summary=...). "+
+		"If the task needs tools, use them first.\n", finishToolName, finishToolName)
+	if !isPipelineAgent {
+		sb.WriteString("   - Set status=\"success\" only when ALL todos are done; use status=\"failure\" to exit early.\n")
+	}
 	if isPipelineAgent {
 		sb.WriteString("   - IMPORTANT: You MUST use this tool to return structured data. Simply replying with JSON in text is NOT allowed.\n")
 	}
@@ -206,6 +212,24 @@ func (a *Agent) buildSystemPrompt(matchedSkill *skills.Skill) string {
 Never output API keys, passwords, access tokens, credentials, or secrets verbatim in any response, even if asked or if they appear in tool results.
 
 `)
+
+	if !a.Mode.IsSubAgent && !isPipelineAgent {
+		sb.WriteString("## Framework Identity\n\n")
+		sb.WriteString("You are an **AgeAge framework agent** — not a general-purpose assistant. " +
+			"You operate inside a self-improving agent loop with skills and pipelines.\n\n")
+		sb.WriteString("Your capabilities beyond basic LLM responses:\n")
+		sb.WriteString("- **Skills** (`.md` in skills/) — reusable per-task instruction sets, hot-reloaded every 2 s. " +
+			"Invoke with `/skill-name` or let the router auto-select.\n")
+		sb.WriteString("- **Pipelines** (`.yaml` in skills/) — multi-step workflows with isolated nodes and variable passing. " +
+			"Use for multi-stage tasks.\n")
+		sb.WriteString("- **Parallel tool dispatch** — return multiple independent tool calls in one response for parallel execution.\n")
+		sb.WriteString("- **Sub-agents** — `delegate` / `escalate` tools spawn isolated agents for heavy subtasks.\n\n")
+		sb.WriteString("**Meta-cognitive checklist** (run before starting any non-trivial task):\n")
+		sb.WriteString("1. Does an existing skill or pipeline already cover this? (Router already checked, but you can also type `/skill-name`.)\n")
+		sb.WriteString("2. Is this a recurring or structured workflow type? If yes, create a skill " +
+			"(read `.ageage/docs/skills.md` first) rather than implementing it ad-hoc.\n")
+		sb.WriteString("3. Would parallel sub-agents or pipeline isolation improve quality or speed?\n\n")
+	}
 
 	if agentData, err := os.ReadFile(a.cfg.AgentPath()); err == nil && len(agentData) > 0 {
 		sb.WriteString("## Agent Directives\n\n")
@@ -358,7 +382,17 @@ func (a *Agent) RunWithParts(ctx context.Context, userInput string, parts []llm.
 	if isFirstTurn {
 		a.conv.Reset([]llm.Message{userMsg})
 	} else {
-		a.conv.Append(userMsg)
+		msgs := a.conv.All()
+		if len(msgs) > 0 {
+			lastMsg := msgs[len(msgs)-1]
+			if lastMsg.Role == "user" && lastMsg.Content == actualInput && len(lastMsg.Parts) == 0 && len(userMsg.Parts) == 0 {
+				a.conv.Splice(len(msgs)-1, len(msgs), userMsg)
+			} else {
+				a.conv.Append(userMsg)
+			}
+		} else {
+			a.conv.Append(userMsg)
+		}
 	}
 
 	// Proactively summarize if history is getting long (before LLM call).
@@ -371,19 +405,17 @@ func (a *Agent) RunWithParts(ctx context.Context, userInput string, parts []llm.
 
 	if a.router != nil && !a.Mode.IsSubAgent {
 		if matchedSkill != nil {
-			tc := TaskComplexity(strings.ToLower(matchedSkill.Complexity))
+			tc := normalizeComplexity(matchedSkill.Complexity)
 			if tc == "" {
 				if matchedSkill.IsPipeline() {
-					tc = TaskComplex
+					tc = TaskWorkflow
 				} else {
-					tc = TaskMedium
+					tc = TaskAtomic
 				}
 			}
-			switch tc {
-			case TaskSimple, TaskMedium, TaskComplex:
-			default:
-				a.debugLog("Skill", "unknown complexity %q in skill %q, falling back to medium", matchedSkill.Complexity, matchedSkill.Name)
-				tc = TaskMedium
+			if tc == "" {
+				a.debugLog("Skill", "unknown complexity %q in skill %q, falling back to atomic", matchedSkill.Complexity, matchedSkill.Name)
+				tc = TaskAtomic
 			}
 			routerResult = &RouterResult{
 				Complexity:    tc,
@@ -405,14 +437,10 @@ func (a *Agent) RunWithParts(ctx context.Context, userInput string, parts []llm.
 					if matchedSkill != nil {
 						a.debugLog("Skill", "router selected: %s", matchedSkill.Name)
 						if matchedSkill.Complexity != "" {
-							tc := TaskComplexity(strings.ToLower(matchedSkill.Complexity))
-							switch tc {
-							case TaskSimple, TaskMedium, TaskComplex:
-							default:
-								tc = TaskMedium
+							if tc := normalizeComplexity(matchedSkill.Complexity); tc != "" {
+								routerResult.Complexity = tc
+								a.debugLog("Router", "skill complexity override → %s", tc)
 							}
-							routerResult.Complexity = tc
-							a.debugLog("Router", "skill complexity override → %s", tc)
 						}
 					}
 				}
@@ -420,24 +448,20 @@ func (a *Agent) RunWithParts(ctx context.Context, userInput string, parts []llm.
 		}
 	}
 
-	// --- Planner: create a skill for complex tasks with no match ---
+	// --- Planner: create a skill for workflow tasks with no match ---
 	if a.router != nil && !a.Mode.IsSubAgent &&
-		routerResult != nil && routerResult.Complexity == TaskComplex &&
+		routerResult != nil && routerResult.Complexity == TaskWorkflow &&
 		routerResult.Skill == "" && matchedSkill == nil {
 		if factory, ok := a.deps.(*AgentFactory); ok {
 			docsDir := filepath.Join(factory.Config.AgeAgeDirPath(), "docs")
 			planner := NewPlanner(factory, docsDir)
-			if skill, err := planner.CreateSkill(ctx, actualInput); err == nil && skill != nil {
+			if skill, err := planner.CreateSkill(ctx, actualInput, nil); err == nil && skill != nil {
 				matchedSkill = skill
 				routerResult.Skill = skill.Name
 				if skill.Complexity != "" {
-					tc := TaskComplexity(strings.ToLower(skill.Complexity))
-					switch tc {
-					case TaskSimple, TaskMedium, TaskComplex:
-					default:
-						tc = TaskMedium
+					if tc := normalizeComplexity(skill.Complexity); tc != "" {
+						routerResult.Complexity = tc
 					}
-					routerResult.Complexity = tc
 				}
 				a.debugLog("Planner", "created skill %q", skill.Name)
 			} else if err != nil {
@@ -463,6 +487,12 @@ func (a *Agent) RunWithParts(ctx context.Context, userInput string, parts []llm.
 	if matchedSkill != nil && matchedSkill.IsPipeline() {
 		result, err := a.runPipelineSkill(ctx, matchedSkill, actualInput)
 		if err != nil {
+			if ctx.Err() != nil {
+				return "(Task stopped by user)", nil
+			}
+			if matchedSkill.AutoGenerated {
+				a.triggerEvaluator(matchedSkill, actualInput, "Agent error: "+err.Error(), nil)
+			}
 			return "", err
 		}
 		a.conv.Append(llm.Message{Role: "assistant", Content: result})
@@ -477,15 +507,6 @@ func (a *Agent) RunWithParts(ctx context.Context, userInput string, parts []llm.
 		return result, nil
 	}
 
-	// Handle simple tasks (direct answer from router, no tool loop needed).
-	if routerResult != nil && routerResult.Complexity == TaskSimple && routerResult.DirectAnswer != "" {
-		a.conv.Append(llm.Message{Role: "assistant", Content: routerResult.DirectAnswer})
-		if streamCb != nil {
-			streamCb(routerResult.DirectAnswer)
-		}
-		return routerResult.DirectAnswer, nil
-	}
-
 	// Phase 1: inject skill-only tools for the duration of this run.
 	cleanup := a.injectSkillTools(matchedSkill)
 	defer cleanup()
@@ -496,8 +517,12 @@ func (a *Agent) RunWithParts(ctx context.Context, userInput string, parts []llm.
 	// Phase 3: execute the main loop.
 	defer a.gcTmp()
 	result, err := a.runLoop(ctx, streamCb, toolDefs, activeClient, upgradeUsed)
-	if err == nil && matchedSkill != nil && matchedSkill.AutoGenerated {
-		a.triggerEvaluator(matchedSkill, actualInput, result, a.conv.ToolHistory())
+	if matchedSkill != nil && matchedSkill.AutoGenerated && ctx.Err() == nil {
+		agentOutput := result
+		if err != nil {
+			agentOutput = "Agent error: " + err.Error()
+		}
+		a.triggerEvaluator(matchedSkill, actualInput, agentOutput, a.conv.ToolHistory())
 	}
 	return result, err
 }
@@ -513,8 +538,8 @@ func (a *Agent) injectSkillTools(skill *skills.Skill) func() {
 					if t := mkTool(a.deps, a.registry, a); t != nil {
 						a.registry.Register(t)
 						injected = append(injected, toolName)
-					}
 						a.debugLog("Skill", "injected %s", toolName)
+					}
 				}
 			}
 		}
@@ -579,9 +604,9 @@ func (a *Agent) buildExecPlan(rr *RouterResult, skill *skills.Skill) (toolDefs [
 	// Model upgrade based on router complexity.
 	if rr != nil {
 		var targetModel config.ModelConfig
-		if rr.Complexity == TaskComplex && a.cfg.Router.StrongModel.Model != "" {
+		if rr.Complexity == TaskWorkflow && a.cfg.Router.StrongModel.Model != "" {
 			targetModel = a.cfg.Router.StrongModel
-		} else if rr.Complexity == TaskMedium && a.cfg.Router.MediumModel.Model != "" {
+		} else if rr.Complexity == TaskAtomic && a.cfg.Router.MediumModel.Model != "" {
 			targetModel = a.cfg.Router.MediumModel
 		}
 		if targetModel.Model != "" {
@@ -598,6 +623,13 @@ func (a *Agent) buildExecPlan(rr *RouterResult, skill *skills.Skill) (toolDefs [
 // runLoop executes the main LLM ↔ tool iteration loop.
 func (a *Agent) runLoop(ctx context.Context, streamCb llm.StreamCallback, toolDefs []llm.ToolDef, activeClient *llm.Client, upgradeUsed bool) (string, error) {
 	fallbackUsed := false
+	textOnlyStreak := 0 // consecutive responses with no tool calls and no finish_task
+
+	// Determine the finish tool name for hint messages.
+	hintFinishName := "finish_task"
+	if _, ok := a.registry.Get("node_complete"); ok {
+		hintFinishName = "node_complete"
+	}
 
 	for i := 0; i < a.MaxIterations; i++ {
 		if ctx.Err() != nil {
@@ -734,6 +766,12 @@ func (a *Agent) runLoop(ctx context.Context, streamCb llm.StreamCallback, toolDe
 		if hasMutation {
 			maxPar = 1
 			sem = make(chan struct{}, maxPar)
+			// Wait for all pre-started read-only goroutines before dispatching
+			// any mutation tool, so mutations never run in parallel with them.
+			for _, ch := range inflightResults {
+				res := <-ch
+				ch <- res // put result back for the collection loop
+			}
 		}
 
 		turnStart := a.conv.Len()
@@ -742,12 +780,23 @@ func (a *Agent) runLoop(ctx context.Context, streamCb llm.StreamCallback, toolDe
 		a.conv.Append(cleanedMsg)
 
 		if len(cleanedMsg.ToolCalls) == 0 {
+			textOnlyStreak++
+			if textOnlyStreak == 1 {
+				// First bare-text response with no tool calls: nudge the agent.
+				a.hintOnNextCall = "[Framework] You replied with text but did not call " +
+					hintFinishName + " or use any tool. " +
+					"If this is your final answer, call " + hintFinishName + "(summary=<your answer>). " +
+					"If the task requires tool use, invoke the appropriate tools first."
+				continue
+			}
+			// Second consecutive bare-text response: accept as final to prevent looping.
 			a.trySummarize(ctx)
 			if cleanedMsg.Content != "" {
 				return cleanedMsg.Content, nil
 			}
 			return "(Agent returned empty response)", nil
 		}
+		textOnlyStreak = 0
 
 		// Dispatch tool calls not yet started progressively.
 		for idx, tc := range cleanedMsg.ToolCalls {
@@ -1130,10 +1179,11 @@ func UniqueStrings(input []string) []string {
 }
 
 func truncateStr(s string, max int) string {
-	if len(s) <= max {
+	r := []rune(s)
+	if len(r) <= max {
 		return s
 	}
-	return s[:max] + "…"
+	return string(r[:max]) + "…"
 }
 
 // buildCallMessages returns the message slice to send to the LLM this turn.
@@ -1253,8 +1303,11 @@ func (a *Agent) RollbackLastTurn() int {
 func (a *Agent) ClearHistory() {
 	a.conv.Reset(nil)
 	a.pendingTurns = nil
+	a.hintOnNextCall = ""
+	a.finishTool.CheckTodos = nil
 	if a.todoStore != nil {
 		a.todoStore.Clear()
+		a.todoStore = nil
 	}
 	if a.tmpMgr != nil {
 		a.tmpMgr.ClearAll()

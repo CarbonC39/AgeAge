@@ -13,7 +13,7 @@ You have access to `file_read` (skills dir + docs dir) and `file_write` (skills 
 ---
 name: My Skill
 description: What this skill does (one sentence).
-complexity: medium          # simple | medium | complex
+complexity: atomic          # direct | atomic | workflow
 required_tools: [bash, file_read]
 auto_generated: true
 success_count: 0
@@ -39,7 +39,7 @@ When done, call finish_task with a summary.
 ```yaml
 name: My Pipeline
 description: What this pipeline does.
-complexity: complex
+complexity: workflow
 auto_generated: true
 success_count: 0
 
@@ -49,14 +49,14 @@ vars:
 
 pipeline:
   - id: step1
-    complexity: medium
+    complexity: atomic
     prompt: |
       Do something with {{input}}.
     tools: [file_read, bash]
     outputs: result        # shorthand: stores node key "result" → $vars.result
 
   - id: step2
-    complexity: medium
+    complexity: atomic
     prompt: |
       Now process: {{result}}
     outputs: answer
@@ -101,5 +101,5 @@ outputs: {answer: result}     # explicit map (same as scalar form above)
 | Using `{{foo}}` without declaring `foo` in `vars:` | Add `foo: ""` under `vars:` |
 | Referencing an unknown tool | Check the tool list; use only registered tool names |
 | Missing `name` or `description` | Add them — they are required |
-| Missing `complexity` | Add `complexity: medium` (or simple/complex) |
+| Missing `complexity` | Add `complexity: atomic` (or direct/workflow) |
 | Forgetting `auto_generated: true` | Always set this for planner-created files |

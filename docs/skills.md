@@ -162,28 +162,25 @@ pipeline:
   - id: get_content
     type: auto
     tool: web_fetch
-    foreach: $vars.urls
+    foreach: urls           # bare name resolves to $vars.urls
     inputs:
       url: $foreach.current
-    outputs:
-      result: contents
+    outputs: contents       # scalar: pipeline var "contents" ← node key "result"
 
   - id: summarize
     type: agent
-    foreach: $vars.contents
+    foreach: contents       # bare name resolves to $vars.contents
     prompt: |
       Summarize this article:
       {{$foreach.current}}
-    outputs:
-      result: summaries
+    outputs: summaries      # scalar: pipeline var "summaries" ← node key "result"
 
   - id: final_report
     type: agent
     prompt: |
       Combine these summaries into a single report:
-      {{$vars.summaries}}
-    outputs:
-      result: final_output
+      {{summaries}}
+    outputs: final_output
 ```
 
 ### Pipeline Concepts

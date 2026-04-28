@@ -103,6 +103,23 @@ func (s *TodoStore) IsComplete() bool {
 	return true
 }
 
+// PendingList returns a newline-separated list of tasks that are not yet in a
+// terminal state (done/skipped/cancelled). Returns "" when all are done.
+func (s *TodoStore) PendingList() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var lines []string
+	for _, item := range s.items {
+		switch strings.ToLower(strings.TrimSpace(item.Status)) {
+		case "done", "completed", "finished", "skipped", "cancelled", "canceled":
+			// terminal — skip
+		default:
+			lines = append(lines, fmt.Sprintf("- [%s] %s", item.Status, item.Task))
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
 // Format returns the task list as a human-readable string, or "" when empty.
 func (s *TodoStore) Format() string {
 	s.mu.Lock()

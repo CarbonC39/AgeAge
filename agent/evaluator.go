@@ -178,8 +178,8 @@ func parseEvalVerdict(summary string) (verdict string, fixed bool, reportToUser 
 		ReportToUser string `json:"report_to_user"`
 	}
 	if err := jsonutil.ParseToolArgs(summary, &v); err != nil {
-		// Unrecognised format — treat as a pass with no fix so the count increments.
-		return "pass", false, ""
+		// Unrecognised format — return fail so it doesn't wrongly increment success count
+		return "fail", false, "Evaluator output format invalid"
 	}
 	return v.Verdict, v.Fixed, v.ReportToUser
 }

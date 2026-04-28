@@ -651,7 +651,7 @@ func (u *cliUI) renderMarkdown(text string) string {
 			sb.WriteString("  " + stGray.Render("•") + " " + renderInline(l[2:]) + "\n")
 			continue
 		}
-		// Numbered lists: "1. " through "99. "
+		// Numbered lists: "1. " through "999. "
 		if len(l) > 3 && l[0] >= '1' && l[0] <= '9' {
 			if dot := strings.Index(l, ". "); dot >= 1 && dot <= 3 {
 				prefix := l[:dot+2]

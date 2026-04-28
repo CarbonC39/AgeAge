@@ -177,8 +177,7 @@ func (m *Manager) ContainsCredPath(text string) bool {
 		return false
 	}
 	return strings.Contains(text, m.credPath) ||
-		strings.Contains(text, filepath.ToSlash(m.credPath)) ||
-		strings.Contains(text, filepath.Base(m.credPath))
+		strings.Contains(text, filepath.ToSlash(m.credPath))
 }
 
 // Path returns the credentials file path.

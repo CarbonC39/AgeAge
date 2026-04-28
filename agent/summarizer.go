@@ -89,6 +89,11 @@ func (s *Summarizer) Summarize(ctx context.Context, messages []llm.Message) ([]l
 	var convText strings.Builder
 	for _, m := range oldMessages {
 		switch m.Role {
+		case "system":
+			if strings.HasPrefix(m.Content, "[Previous conversation summary]") {
+				summary := strings.TrimPrefix(m.Content, "[Previous conversation summary]\n")
+				convText.WriteString(fmt.Sprintf("Earlier summary: %s\n", summary))
+			}
 		case "user":
 			convText.WriteString(fmt.Sprintf("User: %s\n", m.Content))
 		case "assistant":
@@ -101,7 +106,6 @@ func (s *Summarizer) Summarize(ctx context.Context, messages []llm.Message) ([]l
 				}
 			}
 		case "tool":
-			// Truncate tool results for summarization.
 			content := m.Content
 			if len(content) > 200 {
 				content = content[:200] + "..."
@@ -123,17 +127,6 @@ func (s *Summarizer) Summarize(ctx context.Context, messages []llm.Message) ([]l
 		s.debug,
 		0, // summarization calls don't need a token cap
 	)
-
-	// Strip existing summaries from the oldMessages slice so we don't summarize
-	// a previous summary of a summary.
-	var oldFiltered strings.Builder
-	for _, m := range oldMessages {
-		if m.Role == "system" && strings.HasPrefix(m.Content, "[Previous conversation summary]") {
-			oldFiltered.WriteString(fmt.Sprintf("Earlier summary: %s\n", strings.TrimPrefix(m.Content, "[Previous conversation summary]\n")))
-			continue
-		}
-		// ... (the existing logic for convText already covers other roles)
-	}
 
 	summaryMessages := []llm.Message{
 		{

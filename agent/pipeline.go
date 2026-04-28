@@ -4,7 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"sort"
+	"reflect"
+	"regexp"
 	"strings"
 
 	"ageage/config"
@@ -12,6 +13,9 @@ import (
 	"ageage/skills"
 	"ageage/tools"
 )
+
+// varInterpolateRe matches {{$vars.name}}, $vars.name, and {{name}} tokens in prompts.
+var varInterpolateRe = regexp.MustCompile(`\{\{\$vars\.([a-zA-Z_][a-zA-Z0-9_]*)\}\}|\$vars\.([a-zA-Z_][a-zA-Z0-9_]*)|\{\{([a-zA-Z_][a-zA-Z0-9_]*)\}\}`)
 
 // Node status values for todo display.
 const (
@@ -263,9 +267,17 @@ func (e *PipelineExecutor) execForeach(ctx context.Context, node skills.Pipeline
 				sem <- struct{}{}
 				defer func() { <-sem }()
 
+				var result iterResult
+				defer func() {
+					if r := recover(); r != nil {
+						result = iterResult{idx: idx, out: nil, err: fmt.Errorf("panic: %v", r)}
+					}
+					resCh <- result
+				}()
+
 				out := make(map[string]interface{})
 				err := e.execNode(subCtx, node, item, idx, out)
-				resCh <- iterResult{idx: idx, out: out, err: err}
+				result = iterResult{idx: idx, out: out, err: err}
 			}(i, it)
 		}
 
@@ -308,8 +320,16 @@ func (e *PipelineExecutor) execNode(ctx context.Context, node skills.PipelineNod
 		for argName, varRef := range node.Inputs {
 			val := e.resolveValue(varRef, foreachItem, foreachIdx)
 			isEmpty := val == nil || val == ""
-			if s, ok := val.([]interface{}); ok && len(s) == 0 {
+			if s, ok := val.(string); ok && strings.TrimSpace(s) == "" {
 				isEmpty = true
+			} else if val != nil {
+				v := reflect.ValueOf(val)
+				switch v.Kind() {
+				case reflect.Slice, reflect.Array, reflect.Map:
+					if v.Len() == 0 {
+						isEmpty = true
+					}
+				}
 			}
 			if isEmpty {
 				return fmt.Errorf("node %q validation failed: input %q is empty", node.ID, argName)
@@ -625,10 +645,10 @@ func (e *PipelineExecutor) execNestedPipeline(ctx context.Context, node skills.P
 // On a transient LLM error the engine retries once with the next lower tier.
 func (e *PipelineExecutor) complexityFallbacks(primary string) []string {
 	tiers := []string{primary}
-	switch TaskComplexity(strings.ToLower(primary)) {
-	case TaskComplex:
-		tiers = append(tiers, string(TaskMedium))
-	case TaskMedium:
+	switch normalizeComplexity(primary) {
+	case TaskWorkflow:
+		tiers = append(tiers, string(TaskAtomic))
+	case TaskAtomic:
 		tiers = append(tiers, "") // empty = base model (no override)
 	}
 	return tiers
@@ -657,20 +677,20 @@ func (e *PipelineExecutor) applyNodeModel(subAgent *Agent, complexity string) {
 	}
 	pm := e.factory.Config.Pipeline.Models
 	var targetModel config.ModelConfig
-	switch TaskComplexity(strings.ToLower(complexity)) {
-	case TaskComplex:
+	switch normalizeComplexity(complexity) {
+	case TaskWorkflow:
 		if pm.Complex.Model != "" {
 			targetModel = pm.Complex
 		} else {
 			targetModel = e.factory.Config.Router.StrongModel
 		}
-	case TaskMedium:
+	case TaskAtomic:
 		if pm.Medium.Model != "" {
 			targetModel = pm.Medium
 		} else {
 			targetModel = e.factory.Config.Router.MediumModel
 		}
-	case TaskSimple:
+	case TaskDirect:
 		if pm.Simple.Model != "" {
 			targetModel = pm.Simple
 		}
@@ -780,20 +800,23 @@ func (e *PipelineExecutor) interpolatePrompt(tmpl string, foreachItem interface{
 		result = strings.ReplaceAll(result, "{{$config.workspace}}", workDir)
 		result = strings.ReplaceAll(result, "$config.workspace", workDir)
 	}
-	// Sort keys by length descending so that longer names (e.g. "foobar") are
-	// replaced before shorter prefixes (e.g. "foo"), preventing "$vars.foo" from
-	// clobbering the "foo" portion inside "$vars.foobar" on a lucky map iteration.
-	varKeys := make([]string, 0, len(e.vars))
-	for k := range e.vars {
-		varKeys = append(varKeys, k)
-	}
-	sort.Slice(varKeys, func(i, j int) bool { return len(varKeys[i]) > len(varKeys[j]) })
-	for _, k := range varKeys {
-		val := fmt.Sprintf("%v", e.vars[k])
-		result = strings.ReplaceAll(result, "{{$vars."+k+"}}", val)
-		result = strings.ReplaceAll(result, "$vars."+k, val)
-		result = strings.ReplaceAll(result, "{{"+k+"}}", val)
-	}
+
+	result = varInterpolateRe.ReplaceAllStringFunc(result, func(match string) string {
+		m := varInterpolateRe.FindStringSubmatch(match)
+		var key string
+		if m[1] != "" {
+			key = m[1]
+		} else if m[2] != "" {
+			key = m[2]
+		} else if m[3] != "" {
+			key = m[3]
+		}
+		if v, ok := e.vars[key]; ok {
+			return fmt.Sprintf("%v", v)
+		}
+		return match
+	})
+
 	return result
 }
 

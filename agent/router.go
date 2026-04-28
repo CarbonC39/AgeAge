@@ -16,18 +16,63 @@ import (
 type TaskComplexity string
 
 const (
-	TaskSimple  TaskComplexity = "simple"
-	TaskMedium  TaskComplexity = "medium"
-	TaskComplex TaskComplexity = "complex"
+	TaskDirect   TaskComplexity = "direct"   // pure conversation, no tools
+	TaskAtomic   TaskComplexity = "atomic"   // single tool call, fixed target
+	TaskWorkflow TaskComplexity = "workflow"  // multi-step, planning, skill/pipeline
+
+	// Deprecated aliases kept for backward compatibility with existing skill files.
+	TaskSimple  = TaskDirect
+	TaskMedium  = TaskAtomic
+	TaskComplex = TaskWorkflow
 )
+
+// normalizeComplexity maps both the current names ("direct", "atomic", "workflow")
+// and the legacy names ("simple", "medium", "complex") to a canonical TaskComplexity.
+// Returns "" for unrecognised values.
+func normalizeComplexity(s string) TaskComplexity {
+	switch strings.ToLower(s) {
+	case "direct", "simple":
+		return TaskDirect
+	case "atomic", "medium":
+		return TaskAtomic
+	case "workflow", "complex":
+		return TaskWorkflow
+	default:
+		return ""
+	}
+}
+
+// RouterChecks is the factual checklist the router answers about the user request.
+// The engine derives TaskComplexity from these fields rather than asking the LLM
+// to label it directly (removes semantic bias).
+type RouterChecks struct {
+	NeedsTools         bool `json:"needs_tools"`
+	NeedsMultipleCalls bool `json:"needs_multiple_calls"`
+	NeedsSynthesis     bool `json:"needs_synthesis"`
+}
 
 // RouterResult is the output of the intent router.
 type RouterResult struct {
-	Complexity    TaskComplexity `json:"complexity"`
+	Complexity    TaskComplexity `json:"-"`              // derived by deriveComplexity(), not parsed
+	Checks        RouterChecks   `json:"checks"`
 	Skill         string         `json:"skill"`          // Name of the skill the router selected (empty = none)
 	RequiredTools []string       `json:"required_tools"`
 	Reasoning     string         `json:"reasoning"`
-	DirectAnswer  string         `json:"direct_answer,omitempty"`
+}
+
+// deriveComplexity computes Complexity from Checks and RequiredTools.
+// Called after JSON parsing; fallback results set Complexity directly.
+func (r *RouterResult) deriveComplexity() {
+	multiTool := len(r.RequiredTools) >= 2
+	c := r.Checks
+	switch {
+	case c.NeedsMultipleCalls || c.NeedsSynthesis || multiTool:
+		r.Complexity = TaskWorkflow
+	case c.NeedsTools || len(r.RequiredTools) > 0:
+		r.Complexity = TaskAtomic
+	default:
+		r.Complexity = TaskDirect
+	}
 }
 
 // Router classifies user intent and selects appropriate tools/model.
@@ -68,28 +113,54 @@ func NewRouter(cfg *config.Config, client *llm.Client, loadedSkills []skills.Ski
 // buildRouterPrompt constructs the router system prompt.
 //
 // Cache layout (ordered from most-stable to least-stable):
-//   1. Fixed instruction header                — never changes
-//   2. Skill catalog (all skills, name+desc)   — changes only on hot-reload
-//   3. Tool list                               — changes per turn
-//   4. Levels + JSON schema                    — never changes
-//
-// Placing the stable skill catalog BEFORE the variable tool list means the
-// model can cache the entire prefix up to the tool list, giving a cache hit
-// on every turn that has the same skill set.
+//   1. Fixed: checklist questions, rules, calibration examples — never changes
+//   2. Skill catalog (all skills, name+desc)                   — changes on hot-reload
+//   3. Tool list                                               — changes per turn
+//   4. Fixed: JSON schema                                      — never changes
 func (r *Router) buildRouterPrompt(availableTools []string) string {
 	var sb strings.Builder
 
-	// ── 1. Fixed header ───────────────────────────────────────────────────────
-	sb.WriteString("[SYSTEM: TASK EVALUATION PROTOCOL]\n")
-	sb.WriteString("Analyze the request and return ONLY the JSON object specified below.\n")
-	sb.WriteString("Rules: no markdown fences, no tool calls, no preamble, no text before or after the JSON.\n")
-	sb.WriteString("Self-reference docs in .ageage/docs/ (file_read): how-i-work.md, skills.md, pipeline.md, troubleshooting.md.\n\n")
+	// ── 1. Fixed: checklist questions + rules + examples ─────────────────────
+	sb.WriteString(`[SYSTEM: TASK CLASSIFICATION PROTOCOL]
+You are a one-shot classifier. Output ONLY the JSON object at the end of this prompt.
+No markdown fences, no tool calls, no preamble, no text outside the JSON.
 
-	// ── 2. Skill catalog (stable prefix) ─────────────────────────────────────
-	// Always show ALL skills so the router can select one. Users can also
-	// invoke a skill explicitly with /skill-name, bypassing this selection.
+STEP 1 — Skill match (check this first)
+  Does a skill from the list below CLEARLY and SPECIFICALLY match this request?
+  → YES: set skill="<exact name>", continue to STEP 2.
+  → NO:  leave skill="" and continue to STEP 2.
+
+STEP 2 — Answer these three factual checks about the request:
+
+  needs_tools: Does answering this completely require ANY external tool call?
+    false — answer comes entirely from training data: math, greetings, well-known concepts
+    true  — task involves files, web content, system state, code, APIs, real-time data
+    (When uncertain → true. Tool call beats hallucination.)
+
+  needs_multiple_calls: Are 2 or more separate tool calls required?
+    true  — web search + read results; multiple files; multi-stage operation
+    false — exactly one named file; exactly one known command
+    ANY web/internet search → always true (fetch is call 1; reading results is call 2+)
+
+  needs_synthesis: Does the answer require combining/analyzing results from multiple sources?
+    true  — comparison, research, "explain how our X works" (read files + analyze)
+    false — single-source retrieval; run one command and return raw output
+
+Calibration:
+  "hello"                           needs_tools=false, needs_multiple_calls=false, needs_synthesis=false
+  "what is recursion"               needs_tools=false, needs_multiple_calls=false, needs_synthesis=false
+  "read /etc/hosts"                 needs_tools=true,  needs_multiple_calls=false, needs_synthesis=false, tools=[file_read]
+  "run: git status"                 needs_tools=true,  needs_multiple_calls=false, needs_synthesis=false, tools=[bash]
+  "fetch https://api.example.com/x" needs_tools=true,  needs_multiple_calls=false, needs_synthesis=false, tools=[web_fetch]
+  "search for ActivityPub libs"     needs_tools=true,  needs_multiple_calls=true,  needs_synthesis=true,  tools=[web_search]
+  "what's the weather in Tokyo"     needs_tools=true,  needs_multiple_calls=true,  needs_synthesis=true,  tools=[web_search]
+  "explain our auth flow"           needs_tools=true,  needs_multiple_calls=true,  needs_synthesis=true,  tools=[file_read,grep]
+
+`)
+
+	// ── 2. Skill catalog (changes on hot-reload) ──────────────────────────────
 	if len(r.skills) > 0 {
-		sb.WriteString("Available skills (choose at most 1 by its exact name, or leave \"skill\" empty):\n")
+		sb.WriteString("Skills (pick at most one by its exact name, or leave \"skill\" empty):\n")
 		for _, s := range r.skills {
 			desc := s.Description
 			if desc == "" {
@@ -97,7 +168,7 @@ func (r *Router) buildRouterPrompt(availableTools []string) string {
 			}
 			typeSuffix := ""
 			if s.IsPipeline() {
-				typeSuffix = " [pipeline - always use \"complex\" for these]"
+				typeSuffix = " [pipeline]"
 			}
 			fmt.Fprintf(&sb, "- %s: %s%s\n", s.Name, desc, typeSuffix)
 		}
@@ -105,28 +176,23 @@ func (r *Router) buildRouterPrompt(availableTools []string) string {
 	}
 
 	// ── 3. Tool list (variable per turn) ─────────────────────────────────────
-	sb.WriteString("Tools: ")
+	sb.WriteString("Available tools: ")
 	sb.WriteString(strings.Join(availableTools, ", "))
 	sb.WriteString("\n\n")
 
-	// ── 4. Levels + JSON schema (fixed) ──────────────────────────────────────
-	sb.WriteString(`Levels:
-- "simple": Pure conversation — no tools needed. Populate "direct_answer" with your reply.
-- "medium": Single-step or straightforward tool use (fetch a URL, run a command, look up a fact). No planning required; no matching skill.
-- "complex": Use this level for ALL of the following cases:
-    (a) A skill or pipeline from the list above clearly matches — fill "skill" with its exact name.
-    (b) The task requires multi-step planning, complex reasoning, or is worth capturing as a reusable workflow — leave "skill" empty (the system will create one automatically).
-  Always choose "complex" for pipeline skills.
-
-Output exactly this JSON and nothing else:
+	// ── 4. Fixed: JSON schema ─────────────────────────────────────────────────
+	sb.WriteString(`Output exactly this JSON and nothing else:
 {
-  "complexity": "simple|medium|complex",
   "skill": "exact skill name or empty string",
   "required_tools": ["tool1", ...],
-  "reasoning": "brief",
-  "direct_answer": "..."
+  "reasoning": "one sentence",
+  "checks": {
+    "needs_tools": false,
+    "needs_multiple_calls": false,
+    "needs_synthesis": false
+  }
 }
-DO NOT wrap the JSON in code fences. DO NOT call any tools or functions. DO NOT add any text outside the JSON object.
+DO NOT wrap in code fences. DO NOT call any tools. DO NOT add any text outside the JSON object.
 `)
 
 	return sb.String()
@@ -172,10 +238,10 @@ func (r *Router) Route(ctx context.Context, userInput string, availableTools []s
 	}
 	if err != nil {
 		if r.debug {
-			fmt.Printf("  ◆  %-10s router call failed, falling back to medium: %v\n", "Router", err)
+			fmt.Printf("  ◆  %-10s router call failed, falling back to atomic: %v\n", "Router", err)
 		}
 		return &RouterResult{
-			Complexity:    TaskMedium,
+			Complexity:    TaskAtomic,
 			RequiredTools: availableTools,
 			Reasoning:     "router LLM call failed",
 		}, nil
@@ -183,10 +249,10 @@ func (r *Router) Route(ctx context.Context, userInput string, availableTools []s
 
 	if len(resp.Choices) == 0 || resp.Choices[0].Message.Content == "" {
 		if r.debug {
-			fmt.Printf("  ◆  %-10s router returned empty response, falling back to medium\n", "Router")
+			fmt.Printf("  ◆  %-10s router returned empty response, falling back to atomic\n", "Router")
 		}
 		return &RouterResult{
-			Complexity:    TaskMedium,
+			Complexity:    TaskAtomic,
 			RequiredTools: availableTools,
 			Reasoning:     "router returned empty response",
 		}, nil
@@ -200,14 +266,13 @@ func (r *Router) Route(ctx context.Context, userInput string, availableTools []s
 
 	result, err := r.parseRouterResponse(content)
 	if err != nil {
-		// Fallback: treat as medium complexity, use all tools.
 		if r.debug {
 			fmt.Printf("  ◆  %-10s parse failed, using all tools\n", "Router")
 		}
 		return &RouterResult{
-			Complexity:    TaskMedium,
+			Complexity:    TaskAtomic,
 			RequiredTools: availableTools,
-			Reasoning:     "Router parse failed",
+			Reasoning:     "router parse failed",
 		}, nil
 	}
 
@@ -244,14 +309,6 @@ func (r *Router) parseRouterResponse(content string) (*RouterResult, error) {
 		return nil, fmt.Errorf("failed to parse router JSON: %w", err)
 	}
 
-	// Validate complexity.
-	switch result.Complexity {
-	case TaskSimple, TaskMedium, TaskComplex:
-		// Valid.
-	default:
-		result.Complexity = TaskMedium
-	}
-
 	// Validate skill.
 	if result.Skill != "" {
 		found := false
@@ -269,6 +326,9 @@ func (r *Router) parseRouterResponse(content string) (*RouterResult, error) {
 			result.Skill = ""
 		}
 	}
+
+	// Derive complexity from the checklist and required_tools count.
+	result.deriveComplexity()
 
 	return &result, nil
 }

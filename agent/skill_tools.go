@@ -43,6 +43,9 @@ var skillOnlyToolFactories = map[string]func(AgentDeps, *tools.Registry, *Agent)
 			store.NotifyFunc = a.Callbacks.Notify
 		}
 		a.todoStore = store
+		a.finishTool.CheckTodos = func() (bool, string) {
+			return store.IsComplete(), store.PendingList()
+		}
 		return &tools.UpdateTodosTool{Store: store}
 	},
 	"ask_user": func(f AgentDeps, _ *tools.Registry, a *Agent) tools.Tool {

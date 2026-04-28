@@ -63,7 +63,6 @@ type EvalConfig struct {
 	Model            ModelConfig `toml:"model"`
 }
 
-
 // MCPConfig holds MCP client/server settings.
 type MCPConfig struct {
 	Enabled bool               `toml:"enabled"`

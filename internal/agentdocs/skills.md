@@ -15,7 +15,7 @@ Hot-reloaded every 2 seconds — no restart needed after saving.
 ---
 name: skill-name
 description: One-line description (shown in /skills list and used for routing)
-complexity: medium
+complexity: atomic
 tools: [bash, file_read, file_write]
 prompt: |
   System instructions for this skill.
@@ -29,7 +29,7 @@ prompt: |
 |-------|----------|--------|--------|
 | name | yes | slug | command name and routing key |
 | description | yes | string | shown in `/skills`, used by router |
-| complexity | no | simple / medium / complex | model selection when router enabled |
+| complexity | no | direct / atomic / workflow | model selection when router enabled |
 | tools | no | list of tool names | restricts available tools for this skill |
 | prompt | no | string | prepended to system prompt when skill is active |
 | pipeline | no | true | marks this as a pipeline skill (see pipeline doc) |
@@ -47,7 +47,7 @@ Use `file_write` to create `{ageage-dir}/skills/my-skill.md`:
 ---
 name: code-review
 description: Review code for correctness, style, and security issues
-complexity: complex
+complexity: workflow
 tools: [file_read, glob, grep, bash]
 prompt: |
   You are a senior code reviewer. Focus on:
@@ -68,11 +68,12 @@ When the router is enabled (`router.enabled = true`):
 
 | complexity | model used |
 |-----------|------------|
-| simple | `router.classifier` model (lightweight) |
-| medium | main `[llm]` model |
-| complex | `router.strong` model |
+| direct | `router.classifier` model (lightweight) |
+| atomic | main `[llm]` model |
+| workflow | `router.strong` model |
 
-Omitting `complexity` defaults to medium routing.
+Omitting `complexity` defaults to atomic routing.
+Legacy values `simple`, `medium`, `complex` are still accepted.
 
 ---
 

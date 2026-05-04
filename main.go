@@ -556,9 +556,9 @@ func buildInitConfig(
 
 	p("[pipeline]\n")
 	p("# foreach_concurrency = 4  # max parallel foreach iterations; 0 = sequential\n")
-	p("# [pipeline.models.simple]\n# model = \"\"  # → direct complexity\n")
-	p("# [pipeline.models.medium]\n# model = \"\"  # → atomic complexity\n")
-	p("# [pipeline.models.complex]\n# model = \"\"  # → workflow complexity\n\n")
+	p("# [pipeline.models.base]\n# model = \"\"    # tier=base nodes (uses [llm] model by default)\n")
+	p("# [pipeline.models.medium]\n# model = \"\"  # tier=medium nodes\n")
+	p("# [pipeline.models.strong]\n# model = \"\"  # tier=strong nodes\n\n")
 
 	if routerEnabled {
 		p("[router]\n")
@@ -566,20 +566,26 @@ func buildInitConfig(
 		p("enabled     = true\n")
 		p("max_history = 8\n\n")
 		p("[router.classifier]\n")
-		p("model = %q  # lightweight model for intent classification\n\n", routerClassifier)
+		p("model    = %q  # lightweight model for intent classification\n", routerClassifier)
+		p("# api_key  = \"\"  # override [llm].api_key for this tier (optional)\n")
+		p("# base_url = \"\"  # override [llm].base_url for this tier (optional)\n\n")
 		p("[router.medium]\n")
-		p("model = %q\n\n", routerMedium)
+		p("model    = %q\n", routerMedium)
+		p("# api_key  = \"\"\n")
+		p("# base_url = \"\"\n\n")
 		p("[router.strong]\n")
-		p("model = %q\n\n", routerStrong)
+		p("model    = %q\n", routerStrong)
+		p("# api_key  = \"\"\n")
+		p("# base_url = \"\"\n\n")
 	} else {
 		p("[router]\n")
 		p("# Routes requests to model tiers by task complexity.\n")
 		p("# Set enabled = true and configure the sub-sections below to activate.\n")
 		p("enabled     = false\n")
 		p("# max_history = 8\n")
-		p("# [router.classifier]\n# model = \"gpt-4o-mini\"  # cheap intent classifier\n")
-		p("# [router.medium]\n# model = %q\n", model)
-		p("# [router.strong]\n# model = %q\n\n", getStrongModel(baseURL, model))
+		p("# [router.classifier]\n# model    = \"gpt-4o-mini\"  # cheap intent classifier\n# api_key  = \"\"\n# base_url = \"\"\n")
+		p("# [router.medium]\n# model    = %q\n# api_key  = \"\"\n# base_url = \"\"\n", model)
+		p("# [router.strong]\n# model    = %q\n# api_key  = \"\"\n# base_url = \"\"\n\n", getStrongModel(baseURL, model))
 	}
 
 	p("[eval]\n")
@@ -853,8 +859,8 @@ func startChannels(factory *agent.AgentFactory) (*channel.Manager, int) {
 				managerPtr.SendQuestion(channelType, channelID, question, options)
 			}
 		}
-		notifyFn := ag.Callbacks.Notify
 		ag.Callbacks.ToolStart = func(name, args string) {
+			notifyFn := ag.Callbacks.Notify
 			if notifyFn == nil {
 				return
 			}
@@ -1244,13 +1250,45 @@ func startChannels(factory *agent.AgentFactory) (*channel.Manager, int) {
 		// The planner runs isolated; the main conversation history is untouched.
 		if textLow == "/build" || strings.HasPrefix(textLow, "/build ") {
 			task := strings.TrimSpace(msg.Text[len("/build"):])
+
+			// Typing indicator while the planner runs.
+			if ti, ok := channelsByType[msg.ChannelType].(channel.TypingIndicator); ok {
+				_ = ti.SendTyping(msg.ChannelID, true)
+				defer func() { _ = ti.SendTyping(msg.ChannelID, false) }()
+			}
+
+			// ⏳ reaction while building.
+			var buildReactID string
+			if r, ok := channelsByType[msg.ChannelType].(channel.Reactor); ok {
+				buildReactID, _ = r.React(msg.ChannelID, msg.ReplyTo, "⏳")
+				if buildReactID != "" {
+					agentMu.Lock()
+					activeReactions[chatKey] = reactionInfo{msg.ChannelType, msg.ChannelID, msg.ReplyTo, buildReactID}
+					agentMu.Unlock()
+				}
+			}
+
 			ag, _ := getAgent(chatKey)
 			history := ag.Messages()
 			docsDir := filepath.Join(factory.Config.AgeAgeDirPath(), "docs")
-			planner := agent.NewPlanner(factory, docsDir)
-			skill, err := planner.CreateSkill(context.Background(), task, history)
-			if err != nil {
-				return respond(msg, fmt.Sprintf("❌ Build failed: %s", err))
+			planner := agent.NewPlanner(factory, docsDir, factory.GetStandardToolNames())
+			skill, buildErr := planner.CreateSkill(context.Background(), task, history)
+
+			// Remove ⏳; add ❌ on failure.
+			agentMu.Lock()
+			delete(activeReactions, chatKey)
+			agentMu.Unlock()
+			if buildReactID != "" {
+				if r, ok := channelsByType[msg.ChannelType].(channel.Reactor); ok {
+					_ = r.Unreact(msg.ChannelID, buildReactID)
+					if buildErr != nil {
+						_, _ = r.React(msg.ChannelID, msg.ReplyTo, "❌")
+					}
+				}
+			}
+
+			if buildErr != nil {
+				return respond(msg, fmt.Sprintf("❌ Build failed: %s", buildErr))
 			}
 			return respond(msg, fmt.Sprintf("✅ Built `%s` — use `/%s` to activate.", skill.Name, skill.CommandName()))
 		}
@@ -1334,6 +1372,28 @@ func startChannels(factory *agent.AgentFactory) (*channel.Manager, int) {
 
 		ag, sessionID := getAgent(chatKey)
 		ag.SetChannelID(msg.ChannelID)
+
+		// Override callbacks to route notifications into the thread for this message.
+		// Restored via defer so the next room-level message uses the original callbacks.
+		if msg.Respond != nil {
+			savedNotify := ag.Callbacks.Notify
+			savedAskUser := ag.Callbacks.AskUser
+			respondFn := msg.Respond
+			ag.Callbacks.Notify = func(message string) { _ = respondFn(message) }
+			ag.Callbacks.AskUser = func(question string, options []string) {
+				var sb strings.Builder
+				sb.WriteString("❓ ")
+				sb.WriteString(question)
+				for i, opt := range options {
+					fmt.Fprintf(&sb, "\n%d. %s", i+1, opt)
+				}
+				_ = respondFn(sb.String())
+			}
+			defer func() {
+				ag.Callbacks.Notify = savedNotify
+				ag.Callbacks.AskUser = savedAskUser
+			}()
+		}
 
 		runText := msg.Text
 		if retryText != "" {

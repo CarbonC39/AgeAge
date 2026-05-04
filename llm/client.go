@@ -11,6 +11,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"ageage/jsonutil"
 )
 
 // ContentPart is a single element of a multimodal content array.
@@ -302,9 +304,20 @@ func (c *Client) isGemini() bool {
 func (c *Client) prepareMessages(messages []Message) []Message {
 	// Strip ReasoningContent from every message — it is captured from responses
 	// for observability but must never be echoed back in requests.
+	// Also re-encode tool-call arguments so any raw control characters inside
+	// string values are properly escaped — some providers re-parse `arguments`
+	// server-side and reject requests with unescaped control chars.
 	out := make([]Message, len(messages))
 	for i, m := range messages {
 		m.ReasoningContent = ""
+		if len(m.ToolCalls) > 0 {
+			fixed := make([]ToolCall, len(m.ToolCalls))
+			for j, tc := range m.ToolCalls {
+				tc.Function.Arguments = jsonutil.SanitizeArgs(tc.Function.Arguments)
+				fixed[j] = tc
+			}
+			m.ToolCalls = fixed
+		}
 		out[i] = m
 	}
 	if c.isGemini() {
@@ -449,7 +462,9 @@ func (c *Client) chatCompletion(ctx context.Context, messages []Message, tools [
 			return nil, fmt.Errorf("create request: %w", err)
 		}
 		httpReq.Header.Set("Content-Type", "application/json")
-		httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
+		if c.apiKey != "" {
+			httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
+		}
 
 		resp, err := c.http.Do(httpReq)
 		if err != nil {
@@ -605,7 +620,9 @@ func (c *Client) ChatCompletionStream(ctx context.Context, messages []Message, t
 			return nil, nil, fmt.Errorf("create request: %w", err)
 		}
 		httpReq.Header.Set("Content-Type", "application/json")
-		httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
+		if c.apiKey != "" {
+			httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
+		}
 
 		resp, err = c.http.Do(httpReq)
 		if err != nil {

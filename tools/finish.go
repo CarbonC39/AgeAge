@@ -22,9 +22,9 @@ type FinishTool struct {
 func (t *FinishTool) Name() string { return "finish_task" }
 
 func (t *FinishTool) Description() string {
-	return "Call this tool to end the current task and return the final summary to the user. " +
-		"You MUST call this tool when you have completed the task or have a final answer. " +
-		"Use status=\"success\" when all work is done; status=\"failure\" to exit early."
+	return "Call this tool to deliver your final response to the user and end the task. " +
+		"You MUST call this tool when you have a final answer or have completed all work. " +
+		"Use status=\"success\" when done; status=\"failure\" to exit early."
 }
 
 func (t *FinishTool) Parameters() map[string]interface{} {
@@ -33,12 +33,14 @@ func (t *FinishTool) Parameters() map[string]interface{} {
 		"properties": map[string]interface{}{
 			"status": map[string]interface{}{
 				"type":        "string",
-				"description": "\"success\" when all work is done; \"failure\" for early exit (todos may be incomplete).",
+				"description": "\"success\" when all work is done; \"failure\" for early exit.",
 				"enum":        []string{"success", "failure"},
 			},
 			"summary": map[string]interface{}{
-				"type":        "string",
-				"description": "The final summary or answer to present to the user.",
+				"type": "string",
+				"description": "The exact message to send to the user. " +
+					"Write it as you would write a reply — the actual content, not a description of what you said. " +
+					"For example: write \"Here are the results: ...\" not \"Presented the results to the user.\"",
 			},
 		},
 		"required": []string{"status", "summary"},

@@ -130,13 +130,11 @@ func (t *DelegateTool) Execute(ctx context.Context, args json.RawMessage) (strin
 	result, err := subAgent.Run(execCtx, a.Task, nil)
 	if err != nil {
 		// FALLBACK LOGIC: If independent model fails, retry with default agent model.
+		// Keep conversation history (including pre-tool data) so the retry has full context.
 		if t.factory.Config.SubAgent.Model.Model != "" {
 			if t.factory.Debug {
 				fmt.Printf("  ⤷  %-10s model failed (%v) — retrying with default\n", "Delegate", err)
 			}
-			// Reset sub-agent for fallback retry: clear the failed conversation history
-			// so the retry starts fresh without the failed attempt confusing the LLM.
-			subAgent.ClearHistory()
 			subAgent.SetLLMClient(t.factory.LLMClient)
 			result, err = subAgent.Run(ctx, a.Task, nil)
 			if err == nil {

@@ -12,7 +12,7 @@ Pipeline skills are **standalone `.yaml` files** in `{ageage-dir}/skills/`.
 ```yaml
 name: my-pipeline
 description: "One-line summary for the router."
-complexity: workflow       # direct | atomic | workflow
+tier: strong             # base | medium | strong
 vars:
   topic: ""                # declare vars and defaults; input = user message
 
@@ -66,7 +66,7 @@ are optional but recommended for readability.
 | `prompt` | Task prompt; supports `{{name}}` and `{{$vars.name}}` syntax |
 | `skill` | Name of a regular or pipeline skill to embed in this node |
 | `tools` | Tool allowlist for this node; omit for all available tools |
-| `complexity` | Model tier for this node (`direct`/`atomic`/`workflow`) |
+| `tier` | Model tier for this node (`base`/`medium`/`strong`) |
 
 ### Auto-only
 
@@ -94,7 +94,7 @@ All three forms are equivalent when the node key is always `result`.
 |------|-----|
 | **CONTEXT.md** | Always injected into every agent node |
 | **SOUL** | Injected only into the last agent node (if the parent agent has SOUL enabled) |
-| **Complexity fallback** | On transient LLM error: `workflow→atomic`, `atomic→base` |
+| **Tier fallback** | On transient LLM error: `strong→medium`, `medium→base` |
 
 No per-node flags needed — the engine decides.
 
@@ -171,9 +171,9 @@ You can tune pipeline execution behavior in `config.toml`:
 foreach_concurrency = 1   # Set to >1 to run foreach iterations in parallel (default: sequential)
 
 [pipeline.models]
-# Override the [router] models for specific pipeline node complexities:
-simple = { model = "gpt-4o-mini" }
+# Override the [router] models for specific pipeline node tiers:
+base = { model = "gpt-4o-mini" }
 medium = { model = "claude-3-haiku" }
-complex = { model = "gpt-4o" }
+strong = { model = "gpt-4o" }
 ```
 Each iteration in a parallel foreach loop remains an isolated sub-agent.

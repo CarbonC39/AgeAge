@@ -32,12 +32,12 @@ type Config struct {
 	Eval      EvalConfig      `toml:"eval"`
 }
 
-// PipelineModels maps pipeline node complexity levels to specific model configs.
+// PipelineModels maps pipeline node model tiers to specific model configs.
 // Takes precedence over [router] model settings when set.
 type PipelineModels struct {
-	Simple  ModelConfig `toml:"simple"`  // Model for complexity=simple nodes
-	Medium  ModelConfig `toml:"medium"`  // Model for complexity=medium nodes
-	Complex ModelConfig `toml:"complex"` // Model for complexity=complex nodes
+	Base   ModelConfig `toml:"base"`   // Model for tier=base nodes
+	Medium ModelConfig `toml:"medium"` // Model for tier=medium nodes
+	Strong ModelConfig `toml:"strong"` // Model for tier=strong nodes
 }
 
 // PipelineConfig holds settings for pipeline execution.

@@ -9,12 +9,34 @@ import (
 // ParseToolArgs attempts to parse a possibly malformed JSON string from LLM output.
 // It applies several fixups for common LLM formatting issues before parsing.
 func ParseToolArgs(raw string, target interface{}) error {
-	cleaned := cleanJSON(raw)
+	cleaned := CleanJSON(raw)
 	return json.Unmarshal([]byte(cleaned), target)
 }
 
-// cleanJSON applies fixups for common LLM JSON formatting issues.
-func cleanJSON(s string) string {
+// SanitizeArgs cleans a tool-call arguments string and re-encodes it through
+// Go's json package so that any raw control characters inside string values are
+// properly escaped. Some LLM providers re-parse `arguments` server-side as JSON
+// and reject requests where it contains unescaped control chars (e.g. literal
+// newlines in a `content` field). Returns the original string on parse failure
+// so the agent loop can still surface the error downstream.
+func SanitizeArgs(raw string) string {
+	if raw == "" {
+		return raw
+	}
+	cleaned := CleanJSON(raw)
+	var v interface{}
+	if err := json.Unmarshal([]byte(cleaned), &v); err != nil {
+		return cleaned
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return cleaned
+	}
+	return string(b)
+}
+
+// CleanJSON applies fixups for common LLM JSON formatting issues.
+func CleanJSON(s string) string {
 	s = strings.TrimSpace(s)
 
 	// Strip markdown code fences (```json ... ``` or ``` ... ```)

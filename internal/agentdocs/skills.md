@@ -15,7 +15,7 @@ Hot-reloaded every 2 seconds — no restart needed after saving.
 ---
 name: skill-name
 description: One-line description (shown in /skills list and used for routing)
-complexity: atomic
+tier: medium
 tools: [bash, file_read, file_write]
 prompt: |
   System instructions for this skill.
@@ -29,7 +29,7 @@ prompt: |
 |-------|----------|--------|--------|
 | name | yes | slug | command name and routing key |
 | description | yes | string | shown in `/skills`, used by router |
-| complexity | no | direct / atomic / workflow | model selection when router enabled |
+| tier | no | base / medium / strong | model selection when router enabled |
 | tools | no | list of tool names | restricts available tools for this skill |
 | prompt | no | string | prepended to system prompt when skill is active |
 | pipeline | no | true | marks this as a pipeline skill (see pipeline doc) |
@@ -47,7 +47,7 @@ Use `file_write` to create `{ageage-dir}/skills/my-skill.md`:
 ---
 name: code-review
 description: Review code for correctness, style, and security issues
-complexity: workflow
+tier: strong
 tools: [file_read, glob, grep, bash]
 prompt: |
   You are a senior code reviewer. Focus on:
@@ -62,16 +62,16 @@ Trigger with `/code-review <context>` — the skill activates immediately (hot-r
 
 ---
 
-## Complexity and Model Selection
+## Model Tier Selection
 
-| complexity  | model used                              | delegate tool |
-|-------------|-----------------------------------------|---------------|
-| `direct`    | base `[llm]` model                      | no            |
-| `atomic`    | `[router.medium]` model (if configured) | no            |
-| `workflow`  | `[router.strong]` model (if configured) | yes           |
+| tier     | model used                              | delegate tool |
+|----------|-----------------------------------------|---------------|
+| `base`   | base `[llm]` model                      | no            |
+| `medium` | `[router.medium]` model (if configured) | no            |
+| `strong` | `[router.strong]` model (if configured) | yes           |
 
-Omitting `complexity` lets the router decide per turn.
-Legacy values `simple`, `medium`, `complex` are still accepted (mapped to `direct`, `atomic`, `workflow`).
+Omitting `tier` lets the router decide per turn based on its checklist.
+Legacy values `direct`/`atomic`/`workflow` are still accepted.
 
 ---
 

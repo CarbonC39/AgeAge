@@ -15,21 +15,70 @@ import (
 
 const maxPlannerRetries = 3
 
+// pipelineSchemaHint is a compact pipeline YAML reference injected into
+// planner and evaluator prompts to prevent hallucinations about field names
+// and outputs semantics.
+const pipelineSchemaHint = `## Pipeline YAML — Compact Schema
+
+` + "```" + `yaml
+name: my-skill
+description: "..."
+tier: base|medium|strong      # optional; skips router when set
+returns: answer               # which pipeline var to return to user; defaults to result/output/answer
+vars:                         # default values; primitives auto-coerced to string
+  my_var: ""
+
+pipeline:
+  - id: step1                 # required, unique
+    type: agent               # default — uses LLM; OR type: auto — direct tool call (no LLM)
+
+    # agent-only
+    prompt: |                 # {{my_var}} {{$vars.x}} {{$foreach.current}} {{$foreach.index}}
+      Do something with {{input}}
+    tools: [file_read, bash]  # optional allowlist for this node's sub-agent
+    tier: medium              # base | medium | strong
+
+    # auto-only
+    tool: web_fetch           # required for type:auto
+    inputs:                   # key → literal or $vars.x or $foreach.current
+      url: $vars.input
+
+    # both
+    outputs: my_var           # SCALAR  → reads "result" key from node_complete → stored as my_var
+    # outputs: [a, b]         # LIST    → a reads key "a", b reads key "b" (each var = own key name)
+    # outputs: {x: result}    # MAP     → pipeline var x reads the node_complete key named "result"
+    foreach: my_list          # iterate over array var
+    validate: not_empty       # fail node if any resolved input is empty
+` + "```" + `
+
+**node_complete rules (agent nodes):**
+- Call: node_complete(status="success"|"failure", vars={...}, reason="...", context="...")
+- Scalar outputs: put the value under key "result"
+- List outputs: put each value under its own name (e.g. vars={"a": ..., "b": ...})
+- Map outputs: put each value under the right-hand key declared in the map
+- NEVER invent key names — use exactly what the schema declares
+- CRITICAL: The end user CANNOT see the agent's internal work. You MUST include
+  COMPLETE results in the vars — never signal just "done". The vars content IS
+  the only output the user receives.`
+
 // Planner creates new skill files for complex tasks that have no matching skill.
 // It runs an isolated strong-model agent, validates the generated file with
 // ValidateSkillFile, and retries up to maxPlannerRetries times on failure.
 type Planner struct {
-	factory   *AgentFactory
-	docsDir   string
-	skillsDir string
+	factory      *AgentFactory
+	docsDir      string
+	skillsDir    string
+	toolNames    []string
 }
 
 // NewPlanner returns a Planner scoped to the given docs directory.
-func NewPlanner(factory *AgentFactory, docsDir string) *Planner {
+// toolNames is the list of tools available to the main agent (not the planner itself).
+func NewPlanner(factory *AgentFactory, docsDir string, toolNames []string) *Planner {
 	return &Planner{
 		factory:   factory,
 		docsDir:   docsDir,
 		skillsDir: factory.Config.SkillsDir(),
+		toolNames: toolNames,
 	}
 }
 
@@ -86,6 +135,19 @@ func (p *Planner) CreateSkill(ctx context.Context, userTask string, history []ll
 			if err != nil || skill == nil {
 				return nil, fmt.Errorf("load generated skill %s: %v", trackedPath, err)
 			}
+			// Normalise the filename so it matches skill.CommandName(). Prevents
+			// snake_case-vs-kebab-case mismatches between the on-disk name and
+			// the YAML's `name:` field (which break /command lookups and produce
+			// duplicate files on subsequent agent runs).
+			canonical := filepath.Join(filepath.Dir(trackedPath), skill.CommandName()+filepath.Ext(trackedPath))
+			if canonical != trackedPath {
+				if rErr := os.Rename(trackedPath, canonical); rErr == nil {
+					trackedPath = canonical
+					skill.FilePath = canonical
+				}
+			}
+			// Remove any other skill files the agent created besides the tracked one.
+			cleanupExtraSkillFiles(p.skillsDir, preFiles, filepath.Base(trackedPath))
 			p.reloadFactorySkills()
 			return skill, nil
 		}
@@ -135,26 +197,79 @@ func (p *Planner) makeAgent() *Agent {
 	ag.Mode = AgentMode{IsSubAgent: true}
 	ag.MaxIterations = 15
 
-	// Pre-populate the system prompt so the agent keeps it on repeated Run() calls.
-	ag.conv.Reset([]llm.Message{{Role: "system", Content: p.systemPrompt()}})
+	// Embed doc content directly so models that skip file_read still get the schema.
+	guide := readDoc(filepath.Join(p.docsDir, "planner-guide.md"))
+	pipeline := readDoc(filepath.Join(p.docsDir, "pipeline.md"))
+	ag.conv.Reset([]llm.Message{{Role: "system", Content: p.buildSystemPrompt(guide, pipeline)}})
 
 	return ag
 }
 
-func (p *Planner) systemPrompt() string {
-	return fmt.Sprintf(`You are a skill architect. Your only job is to create a single reusable skill file.
+// readDoc reads a file and returns its content, or empty string on error.
+func readDoc(path string) string {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
 
-Skills directory: %s
-Framework docs (read these first): %s
+func (p *Planner) buildSystemPrompt(guide, pipeline string) string {
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "You are a skill architect. Your only job is to create a single reusable skill file.\n\n")
+	fmt.Fprintf(&sb, "Skills directory: %s\n\n", p.skillsDir)
 
-Rules:
-- Write exactly ONE file to the skills directory.
-- Set "auto_generated: true" and "success_count: 0" in the file.
-- For agent skills (.md): use YAML frontmatter with name, description, complexity, required_tools, auto_generated, success_count.
-  IMPORTANT: always set required_tools to the minimal list of tools the skill actually needs (e.g. bash, file_read, file_write, web_search, web_fetch, finish_task). Do not omit required_tools.
-- For pipeline skills (.yaml): follow the schema in %s/pipeline.md.
-- Valid complexity values: direct, atomic, workflow (legacy: simple, medium, complex still accepted).
-- Always call finish_task when done, and set the 'summary' argument to the absolute path of the file you created.`, p.skillsDir, p.docsDir, p.docsDir)
+	if len(p.toolNames) > 0 {
+		sb.WriteString("## Available Tools\n\n")
+		sb.WriteString("Use ONLY these tool names in required_tools, node `tools:`, and `tool:` fields:\n")
+		sb.WriteString(strings.Join(p.toolNames, ", "))
+		sb.WriteString("\n\nReferencing a tool not in this list will cause runtime failures.\n\n")
+	}
+
+	if guide != "" {
+		sb.WriteString("## Framework Reference\n\n")
+		sb.WriteString(guide)
+		sb.WriteString("\n\n")
+	}
+	if pipeline != "" {
+		sb.WriteString("## Pipeline Schema\n\n")
+		sb.WriteString(pipeline)
+		sb.WriteString("\n\n")
+	}
+
+	sb.WriteString("## Rules\n" +
+		"- Write exactly ONE file to the skills directory (.md for agent skills, .yaml for pipelines).\n" +
+		"- Set auto_generated: true and success_count: 0 in the file.\n" +
+		"- Use the `tier:` field (not `complexity:`). Valid values: base, medium, strong.\n" +
+		"- For agent skills (.md): always set required_tools to the minimal list the skill needs.\n" +
+		"- For pipeline .yaml files: if the YAML fails validation, use file_read to read the ENTIRE\n" +
+		"  file back first, then rewrite it completely from scratch — never patch individual lines.\n" +
+		"- For pipeline agent nodes: the end user CANNOT see the node's internal tool calls or " +
+		"  intermediate steps. The ONLY way to deliver results is through node_complete vars. " +
+		"  Always include a prompt instruction telling the agent to put complete findings in vars.\n" +
+		"- Call finish_task(status=\"success\", summary=<absolute path of file>) when done.\n\n" +
+		"## Node type selection\n\n" +
+		"Choose the MOST specific type — prefer deterministic over LLM-driven:\n\n" +
+		"  type: auto  — deterministic action (tool + args fully known at authoring time).\n" +
+		"               Zero LLM cost. Use for: file reads, bash commands, web fetches\n" +
+		"               of known URLs, API calls with known params.\n\n" +
+		"  delegate    — use the delegate tool inside a type:agent node when you know the\n" +
+		"               sub-task and can supply a pre_tool. Better than a bare agent node.\n\n" +
+		"  type: agent — ONLY when genuine LLM reasoning is required (analysis, synthesis,\n" +
+		"               decision-making). Do NOT use for deterministic actions.\n\n" +
+		"Priority: auto > delegate > agent.\n\n")
+
+	sb.WriteString("## Skill Format Selection\n\n" +
+		"Default to .md (agent skill). Only use .yaml (pipeline) when ALL of the following are true:\n" +
+		"1. The task has genuinely parallel independent steps with no data dependencies between them,\n" +
+		"   OR different stages need completely isolated and incompatible tool sets.\n" +
+		"2. Step count is ≥ 3.\n\n" +
+		"A single agent in a .md skill calling multiple tools is simpler and less error-prone than a\n" +
+		"multi-node pipeline. Two-step flows like 'search then summarize' or 'read file then process'\n" +
+		"→ use .md, not a pipeline.\n\n")
+
+	sb.WriteString(pipelineSchemaHint)
+	return sb.String()
 }
 
 func (p *Planner) buildPrompt(userTask string, history []llm.Message) string {
@@ -208,6 +323,26 @@ func fileNameSet(dir string) map[string]bool {
 		set[e.Name()] = true
 	}
 	return set
+}
+
+// cleanupExtraSkillFiles removes any .md/.yaml/.yml files in dir that are NOT in
+// the existing set and are not the keepBase. Used to drop stray duplicates the
+// planner agent may have written under a non-canonical name.
+func cleanupExtraSkillFiles(dir string, existing map[string]bool, keepBase string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if e.IsDir() || existing[e.Name()] || e.Name() == keepBase {
+			continue
+		}
+		ext := strings.ToLower(filepath.Ext(e.Name()))
+		if ext != ".md" && ext != ".yaml" && ext != ".yml" {
+			continue
+		}
+		_ = os.Remove(filepath.Join(dir, e.Name()))
+	}
 }
 
 // firstNewSkillFile returns the absolute path of the first .md/.yaml/.yml file

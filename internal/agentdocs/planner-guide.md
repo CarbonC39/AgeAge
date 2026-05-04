@@ -2,7 +2,7 @@
 
 ## Overview
 
-The Planner creates new skill files when a complex task has no matching skill,
+The Planner creates new skill files when a strong-tier task has no matching skill,
 or when the user explicitly runs `/build [description]`.
 You have access to `file_read` (skills dir + docs dir) and `file_write` (skills dir only).
 
@@ -17,7 +17,7 @@ can infer the intended workflow from what was already discussed.
 ---
 name: My Skill
 description: What this skill does (one sentence).
-complexity: atomic          # direct | atomic | workflow
+tier: medium            # base | medium | strong
 required_tools: [bash, file_read]
 auto_generated: true
 success_count: 0
@@ -32,7 +32,7 @@ When done, call finish_task(status="success", summary=<absolute path of the file
 
 **Rules:**
 - `name` and `description` are required.
-- `complexity` controls which LLM model is used; required.
+- `tier` selects the LLM model used when this skill is active; required.
 - `required_tools` lists tools the agent will need (optional but recommended).
 - Set `auto_generated: true` and `success_count: 0` for all planner-created files.
 
@@ -43,7 +43,7 @@ When done, call finish_task(status="success", summary=<absolute path of the file
 ```yaml
 name: My Pipeline
 description: What this pipeline does.
-complexity: workflow
+tier: strong
 auto_generated: true
 success_count: 0
 
@@ -53,14 +53,14 @@ vars:
 
 pipeline:
   - id: step1
-    complexity: atomic
+    tier: medium
     prompt: |
       Do something with {{input}}.
     tools: [file_read, bash]
     outputs: result        # shorthand: stores node key "result" → $vars.result
 
   - id: step2
-    complexity: atomic
+    tier: medium
     prompt: |
       Now process: {{result}}
     outputs: answer
@@ -76,7 +76,7 @@ pipeline:
 - Use `outputs:` to save a node's `node_complete` vars into `$vars.*` for later nodes.
 - The engine automatically injects CONTEXT.md into every agent node.
 - The engine automatically injects SOUL only into the last agent node.
-- On transient LLM errors the engine retries with the next lower complexity tier.
+- On transient LLM errors the engine retries with the next lower model tier.
 
 ---
 
@@ -105,5 +105,5 @@ outputs: {answer: result}     # explicit map (same as scalar form above)
 | Using `{{foo}}` without declaring `foo` in `vars:` | Add `foo: ""` under `vars:` |
 | Referencing an unknown tool | Check the tool list; use only registered tool names |
 | Missing `name` or `description` | Add them — they are required |
-| Missing `complexity` | Add `complexity: atomic` (or direct/workflow) |
+| Missing `tier` | Add `tier: medium` (or base/strong) |
 | Forgetting `auto_generated: true` | Always set this for planner-created files |

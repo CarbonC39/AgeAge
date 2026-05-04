@@ -15,7 +15,7 @@ A skill file is a Markdown document with a YAML frontmatter block at the top:
 name: my-skill
 version: "1.0"
 description: "One-line summary shown to the router."
-complexity: atomic
+tier: medium
 required_tools:
   - web_search
   - web_fetch
@@ -100,25 +100,25 @@ Some tools are not globally registered. They are injected only when a matched sk
 
 All three `browser_*` tools share one `BrowserSession` per `Run()` call and clean up automatically on turn completion. Configure the browser backend in `[browser]` — see [config.md](config.md#browser).
 
-### `complexity` *(string, optional)*
+### `tier` *(string, optional)*
 
-When set, **bypasses the router LLM call entirely** and synthesises a routing decision directly. This saves one LLM round-trip per user turn for skills where the complexity is always known in advance.
+When set, **bypasses the router LLM call entirely** and synthesises a routing decision directly. This saves one LLM round-trip per user turn for skills where the model tier is always known in advance.
 
 ```yaml
-complexity: atomic
+tier: medium
 ```
 
-| Value      | Effect |
-|------------|--------|
-| `direct`   | Router skipped; base `[llm]` model; no `delegate` tool. |
-| `atomic`   | Router skipped; uses `[router.medium]` model if configured; no `delegate` tool. |
-| `workflow` | Router skipped; uses `[router.strong]` model if configured; `delegate` tool injected. |
+| Value    | Effect |
+|----------|--------|
+| `base`   | Router skipped; base `[llm]` model; no `delegate` tool. |
+| `medium` | Router skipped; uses `[router.medium]` model if configured; no `delegate` tool. |
+| `strong` | Router skipped; uses `[router.strong]` model if configured; `delegate` tool injected. |
 
-Legacy values `simple`, `medium`, and `complex` are still accepted (mapped to `direct`, `atomic`, and `workflow` respectively).
+Legacy values `direct`/`atomic`/`workflow` are still accepted.
 
 If an unrecognised value is used, a warning is logged and the normal router flow runs instead.
 
-When multiple skills are matched simultaneously, the **highest** complexity wins.
+When multiple skills are matched simultaneously, the **highest** tier wins.
 
 ---
 
@@ -196,7 +196,7 @@ pipeline:
 - **Context Accumulation (`output_context: true`)**: `agent` nodes can return a `context` string via `node_complete` which is automatically prepended to the prompt of all subsequent nodes.
 - **Workspace Context (`no_context: true`)**: By default, every pipeline `agent` node has `.ageage/CONTEXT.md` injected into its system prompt (the same workspace context the main agent sees). Set `no_context: true` on a node to suppress this — useful for pure generation tasks that don't need project context.
 
-**Routing:** When the router selects a pipeline skill (or it is triggered via `/skill-name`), it is automatically treated as `workflow` complexity — ensuring the strong model and full tool set are available to orchestrate multiple sub-tasks. This can be overridden with a top-level `complexity:` field in the YAML file.
+**Routing:** When the router selects a pipeline skill (or it is triggered via `/skill-name`), it is automatically treated as `strong` tier — ensuring the strong model and full tool set are available to orchestrate multiple sub-tasks. This can be overridden with a top-level `tier:` field in the YAML file.
 
 > For a complete reference on all pipeline fields, syntax, and patterns, see [pipeline.md](pipeline.md).
 
@@ -210,7 +210,7 @@ pipeline:
 ---
 name: summarize
 description: "Summarize a document or URL."
-complexity: atomic
+tier: medium
 required_tools:
   - web_fetch
 ---
@@ -224,7 +224,7 @@ Fetch the given URL with `web_fetch`, then write a concise summary in plain para
 ---
 name: research
 description: "Deep research using parallel web searches."
-complexity: workflow
+tier: strong
 required_tools:
   - web_search
   - web_fetch
@@ -248,7 +248,7 @@ required_tools:
 ---
 name: migration
 description: "Database schema migration planning."
-complexity: workflow
+tier: strong
 required_tools:
   - bash
   - file_read
@@ -308,7 +308,7 @@ Use clear formatting when helpful. Keep responses focused.
 ---
 name: web-automation
 description: "Interact with JavaScript-heavy sites or pages requiring login."
-complexity: workflow
+tier: strong
 required_tools:
   - browser_navigate
   - browser_action
@@ -327,6 +327,6 @@ browser session within a turn. Call `finish_task` with your findings.
 
 - **Keep skill names unique and specific.** Generic names like `help` or `task` will match too broadly.
 - **List only the tools the skill actually needs.** Fewer tools means a smaller, cleaner context for the LLM.
-- **Use `complexity` to skip the router** for skills with a predictable workload — it saves latency and tokens on every matched turn. Use `direct`, `atomic`, or `workflow`.
+- **Use `tier` to skip the router** for skills with a predictable workload — it saves latency and tokens on every matched turn. Use `base`, `medium`, or `strong`.
 - **Use `update_todos`** for multi-step skills where the user benefits from seeing progress (e.g. long file processing, multi-source research).
 - **Skills are live-reloaded** — edit a `.md` file and the change takes effect within 2 seconds without restarting the server.

@@ -28,7 +28,7 @@ Pipeline skills are standalone `.yaml` files in the `skills/` directory. They ar
 name: my-pipeline
 version: "1.0"
 description: "One-line summary for the router."
-complexity: workflow
+tier: strong
 vars:
   topic: "" # declare variables and their defaults
 pipeline:
@@ -52,7 +52,7 @@ pipeline:
 | `name` | string | Skill identifier. Defaults to the filename without extension. |
 | `version` | string | Informational only. |
 | `description` | string | Shown to the router for skill selection. |
-| `complexity` | string | `direct` / `atomic` / `workflow`. Pipelines default to `workflow`. |
+| `tier` | string | `base` / `medium` / `strong`. Pipelines default to `strong`. |
 | `vars` | map | Initial variable values. `$vars.input` is always set from the user's message. |
 | `pipeline` | list | Ordered list of nodes executed sequentially. |
 
@@ -117,8 +117,8 @@ Every node in the `pipeline` list supports these fields:
 | `prompt` | string | — | The task given to the node's agent. Supports template syntax. |
 | `skill` | string | — | Activate a named skill inside this node. May reference another pipeline skill (nested, max 1 level). |
 | `tools` | list | — | Tool allowlist for this node. If empty and no skill, all global tools are available. |
-| `complexity` | string | — | `direct` / `atomic` / `workflow`. Selects the LLM model for this node. |
-| `fallback_complexity` | string | — | Fallback model complexity on API failure. Same values as `complexity`. |
+| `tier` | string | — | `base` / `medium` / `strong`. Selects the LLM model for this node. |
+| `fallback_tier` | string | — | Fallback model tier on API failure. Same values as `tier`. |
 | `inject_soul` | bool | `false` | Whether to include `SOUL.md` in this node's system prompt. |
 | `no_context` | bool | `false` | Suppress `.ageage/CONTEXT.md` injection for this node. |
 | `output_context` | bool | `false` | Allow this node to pass a context string to all subsequent nodes via `node_complete`. |
@@ -477,12 +477,12 @@ After all nodes complete, the pipeline determines its final result in this order
 
 ### Model fallback
 
-When a node's primary model is unavailable or returns an API error, you can configure an automatic retry with a different model using `fallback_complexity`:
+When a node's primary model is unavailable or returns an API error, you can configure an automatic retry with a different model using `fallback_tier`:
 
 ```yaml
 - id: synthesize
-  complexity: workflow         # try the strong model first
-  fallback_complexity: direct  # fall back to the base model on API failure
+  tier: strong         # try the strong model first
+  fallback_tier: direct  # fall back to the base model on API failure
   prompt: |
     Synthesize the findings into a final report.
   outputs:
@@ -538,7 +538,7 @@ pipeline:
       - context: a brief summary of the key facts (2–3 sentences)
 
   - id: write_report
-    complexity: workflow # use the strongest model for synthesis
+    tier: strong # use the strongest model for synthesis
     prompt: |
       Write a comprehensive research report based on the findings above.
       Structure it with an executive summary, key findings, and conclusion.
@@ -565,21 +565,21 @@ foreach_concurrency = 4
 
 ### `[pipeline.models]`
 
-Override which LLM model is used for each node complexity level. Takes precedence over the `[router]` model settings.
+Override which LLM model is used for each node tier. Takes precedence over the `[router]` model settings.
 
 ```toml
-[pipeline.models.simple]
+[pipeline.models.base]
 model = "gpt-4o-mini"
 
 [pipeline.models.medium]
 model = "gpt-4o"
 
-[pipeline.models.complex]
+[pipeline.models.strong]
 model = "o3"
 api_key = "sk-..."  # optional: different provider
 ```
 
-If a complexity level is not set here, the corresponding `[router]` model is used as a fallback (e.g. `[router.strong]` for `complex`). If neither is configured, the base `[llm]` model is used.
+If a tier is not set here, the corresponding `[router]` model is used as a fallback (e.g. `[router.strong]` for `strong`). If neither is configured, the base `[llm]` model is used.
 
 ---
 

@@ -12,66 +12,64 @@ import (
 	"ageage/skills"
 )
 
-// TaskComplexity represents the classified complexity of a user request.
-type TaskComplexity string
+// ModelTier selects which LLM model a skill, pipeline step, or router result uses.
+// It is distinct from task complexity (which the router derives from its checklist).
+type ModelTier string
 
 const (
-	TaskDirect   TaskComplexity = "direct"   // pure conversation, no tools
-	TaskAtomic   TaskComplexity = "atomic"   // single tool call, fixed target
-	TaskWorkflow TaskComplexity = "workflow"  // multi-step, planning, skill/pipeline
-
-	// Deprecated aliases kept for backward compatibility with existing skill files.
-	TaskSimple  = TaskDirect
-	TaskMedium  = TaskAtomic
-	TaskComplex = TaskWorkflow
+	TierBase   ModelTier = "base"   // [llm] model — no router override
+	TierMedium ModelTier = "medium" // [router.medium] model
+	TierStrong ModelTier = "strong" // [router.strong] model
 )
 
-// normalizeComplexity maps both the current names ("direct", "atomic", "workflow")
-// and the legacy names ("simple", "medium", "complex") to a canonical TaskComplexity.
+// normalizeTier maps all accepted spellings to a canonical ModelTier.
+// Accepted: base/direct/simple, medium/atomic, strong/workflow/complex.
 // Returns "" for unrecognised values.
-func normalizeComplexity(s string) TaskComplexity {
+func normalizeTier(s string) ModelTier {
 	switch strings.ToLower(s) {
-	case "direct", "simple":
-		return TaskDirect
-	case "atomic", "medium":
-		return TaskAtomic
-	case "workflow", "complex":
-		return TaskWorkflow
+	case "base", "direct", "simple":
+		return TierBase
+	case "medium", "atomic":
+		return TierMedium
+	case "strong", "workflow", "complex":
+		return TierStrong
 	default:
 		return ""
 	}
 }
 
 // RouterChecks is the factual checklist the router answers about the user request.
-// The engine derives TaskComplexity from these fields rather than asking the LLM
+// The engine derives ModelTier from these fields rather than asking the LLM
 // to label it directly (removes semantic bias).
 type RouterChecks struct {
-	NeedsTools         bool `json:"needs_tools"`
-	NeedsMultipleCalls bool `json:"needs_multiple_calls"`
-	NeedsSynthesis     bool `json:"needs_synthesis"`
+	NeedsTools          bool `json:"needs_tools"`
+	NeedsMultipleCalls  bool `json:"needs_multiple_calls"`
+	NeedsSynthesis      bool `json:"needs_synthesis"`
+	IsRecurringWorkflow bool `json:"is_recurring_workflow"`
 }
 
 // RouterResult is the output of the intent router.
 type RouterResult struct {
-	Complexity    TaskComplexity `json:"-"`              // derived by deriveComplexity(), not parsed
-	Checks        RouterChecks   `json:"checks"`
-	Skill         string         `json:"skill"`          // Name of the skill the router selected (empty = none)
-	RequiredTools []string       `json:"required_tools"`
-	Reasoning     string         `json:"reasoning"`
+	Tier          ModelTier    `json:"-"`              // derived by deriveTier(), not parsed
+	Checks        RouterChecks `json:"checks"`
+	Skill         string       `json:"skill"`          // Name of the skill the router selected (empty = none)
+	RequiredTools []string     `json:"required_tools"`
+	Reasoning     string       `json:"reasoning"`
 }
 
-// deriveComplexity computes Complexity from Checks and RequiredTools.
-// Called after JSON parsing; fallback results set Complexity directly.
-func (r *RouterResult) deriveComplexity() {
-	multiTool := len(r.RequiredTools) >= 2
+// deriveTier computes Tier from Checks and RequiredTools.
+// Called after JSON parsing; fallback results set Tier directly.
+func (r *RouterResult) deriveTier() {
 	c := r.Checks
 	switch {
-	case c.NeedsMultipleCalls || c.NeedsSynthesis || multiTool:
-		r.Complexity = TaskWorkflow
-	case c.NeedsTools || len(r.RequiredTools) > 0:
-		r.Complexity = TaskAtomic
+	case c.NeedsSynthesis:
+		// Multi-source reasoning/analysis → strong model.
+		r.Tier = TierStrong
+	case c.NeedsTools || c.NeedsMultipleCalls || len(r.RequiredTools) > 0:
+		// Tool use without complex synthesis → medium model.
+		r.Tier = TierMedium
 	default:
-		r.Complexity = TaskDirect
+		r.Tier = TierBase
 	}
 }
 
@@ -130,7 +128,7 @@ STEP 1 — Skill match (check this first)
   → YES: set skill="<exact name>", continue to STEP 2.
   → NO:  leave skill="" and continue to STEP 2.
 
-STEP 2 — Answer these three factual checks about the request:
+STEP 2 — Answer these four factual checks about the request:
 
   needs_tools: Does answering this completely require ANY external tool call?
     false — answer comes entirely from training data: math, greetings, well-known concepts
@@ -146,15 +144,31 @@ STEP 2 — Answer these three factual checks about the request:
     true  — comparison, research, "explain how our X works" (read files + analyze)
     false — single-source retrieval; run one command and return raw output
 
+  is_recurring_workflow: Would this task benefit from a REUSABLE skill or pipeline for future use?
+    true  — structured, repeatable EXECUTION request that generalises beyond this specific run
+            AND the user is clearly asking to perform it NOW, not just discussing it:
+            "deploy service to prod", "run our weekly PR report", "analyse all issues"
+    false — everything else, including:
+            • one-off or ad-hoc: "search X today", "what is Y", "fix this specific bug"
+            • hypothetical / consultation: "if I wanted X what would I need?",
+              "how would I build Y?", "what technology is needed for Z?",
+              "I'm just asking / 只是咨询 / 只是问问"
+            • capability questions: "can you do X?", "what can you do?"
+            • any topic-specific query baked into the request
+
 Calibration:
-  "hello"                           needs_tools=false, needs_multiple_calls=false, needs_synthesis=false
-  "what is recursion"               needs_tools=false, needs_multiple_calls=false, needs_synthesis=false
-  "read /etc/hosts"                 needs_tools=true,  needs_multiple_calls=false, needs_synthesis=false, tools=[file_read]
-  "run: git status"                 needs_tools=true,  needs_multiple_calls=false, needs_synthesis=false, tools=[bash]
-  "fetch https://api.example.com/x" needs_tools=true,  needs_multiple_calls=false, needs_synthesis=false, tools=[web_fetch]
-  "search for ActivityPub libs"     needs_tools=true,  needs_multiple_calls=true,  needs_synthesis=true,  tools=[web_search]
-  "what's the weather in Tokyo"     needs_tools=true,  needs_multiple_calls=true,  needs_synthesis=true,  tools=[web_search]
-  "explain our auth flow"           needs_tools=true,  needs_multiple_calls=true,  needs_synthesis=true,  tools=[file_read,grep]
+  "hello"                           needs_tools=false, needs_multiple_calls=false, needs_synthesis=false, is_recurring_workflow=false
+  "what is recursion"               needs_tools=false, needs_multiple_calls=false, needs_synthesis=false, is_recurring_workflow=false
+  "read /etc/hosts"                 needs_tools=true,  needs_multiple_calls=false, needs_synthesis=false, is_recurring_workflow=false, tools=[file_read]
+  "run: git status"                 needs_tools=true,  needs_multiple_calls=false, needs_synthesis=false, is_recurring_workflow=false, tools=[bash]
+  "fetch https://api.example.com/x" needs_tools=true,  needs_multiple_calls=false, needs_synthesis=false, is_recurring_workflow=false, tools=[web_fetch]
+  "search for ActivityPub libs"     needs_tools=true,  needs_multiple_calls=true,  needs_synthesis=true,  is_recurring_workflow=false, tools=[web_search]
+  "what's the weather in Tokyo"     needs_tools=true,  needs_multiple_calls=true,  needs_synthesis=false, is_recurring_workflow=false, tools=[web_search]
+  "explain our auth flow"           needs_tools=true,  needs_multiple_calls=true,  needs_synthesis=true,  is_recurring_workflow=false, tools=[file_read,grep]
+  "if I wanted X what tech needed"  needs_tools=false, needs_multiple_calls=false, needs_synthesis=false, is_recurring_workflow=false (consultation/hypothetical, not an execution request)
+  "how would I implement feature Y" needs_tools=false, needs_multiple_calls=false, needs_synthesis=false, is_recurring_workflow=false (technical Q&A, not a task)
+  "run our weekly release report"   needs_tools=true,  needs_multiple_calls=true,  needs_synthesis=true,  is_recurring_workflow=true,  tools=[bash,file_read]
+  "deploy backend to production"    needs_tools=true,  needs_multiple_calls=true,  needs_synthesis=false, is_recurring_workflow=true,  tools=[bash]
 
 `)
 
@@ -189,7 +203,8 @@ Calibration:
   "checks": {
     "needs_tools": false,
     "needs_multiple_calls": false,
-    "needs_synthesis": false
+    "needs_synthesis": false,
+    "is_recurring_workflow": false
   }
 }
 DO NOT wrap in code fences. DO NOT call any tools. DO NOT add any text outside the JSON object.
@@ -241,7 +256,7 @@ func (r *Router) Route(ctx context.Context, userInput string, availableTools []s
 			fmt.Printf("  ◆  %-10s router call failed, falling back to atomic: %v\n", "Router", err)
 		}
 		return &RouterResult{
-			Complexity:    TaskAtomic,
+			Tier:          TierMedium,
 			RequiredTools: availableTools,
 			Reasoning:     "router LLM call failed",
 		}, nil
@@ -249,10 +264,10 @@ func (r *Router) Route(ctx context.Context, userInput string, availableTools []s
 
 	if len(resp.Choices) == 0 || resp.Choices[0].Message.Content == "" {
 		if r.debug {
-			fmt.Printf("  ◆  %-10s router returned empty response, falling back to atomic\n", "Router")
+			fmt.Printf("  ◆  %-10s router returned empty response, falling back to medium\n", "Router")
 		}
 		return &RouterResult{
-			Complexity:    TaskAtomic,
+			Tier:          TierMedium,
 			RequiredTools: availableTools,
 			Reasoning:     "router returned empty response",
 		}, nil
@@ -270,7 +285,7 @@ func (r *Router) Route(ctx context.Context, userInput string, availableTools []s
 			fmt.Printf("  ◆  %-10s parse failed, using all tools\n", "Router")
 		}
 		return &RouterResult{
-			Complexity:    TaskAtomic,
+			Tier:          TierMedium,
 			RequiredTools: availableTools,
 			Reasoning:     "router parse failed",
 		}, nil
@@ -327,8 +342,8 @@ func (r *Router) parseRouterResponse(content string) (*RouterResult, error) {
 		}
 	}
 
-	// Derive complexity from the checklist and required_tools count.
-	result.deriveComplexity()
+	// Derive model tier from the checklist and required_tools count.
+	result.deriveTier()
 
 	return &result, nil
 }

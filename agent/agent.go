@@ -20,18 +20,30 @@ import (
 )
 
 // triggerEvaluator starts a background quality check on an auto-generated skill run.
-func (a *Agent) triggerEvaluator(skill *skills.Skill, userInput, agentOutput string, toolHistory []ToolRecord) {
+// pipelineCtx is optional; pass exec.NodeSummary() for pipeline skills.
+func (a *Agent) triggerEvaluator(skill *skills.Skill, userInput, agentOutput string, toolHistory []ToolRecord, originalErr error, pipelineCtx ...string) {
 	factory, ok := a.deps.(*AgentFactory)
 	if !ok {
 		return
 	}
 	docsDir := filepath.Join(factory.Config.AgeAgeDirPath(), "docs")
 	ev := NewEvaluator(factory, docsDir, a.Callbacks.Notify)
+	errStr := ""
+	if originalErr != nil {
+		errStr = originalErr.Error()
+	}
+	pipelineContext := ""
+	if len(pipelineCtx) > 0 {
+		pipelineContext = pipelineCtx[0]
+	}
 	snap := EvalSnapshot{
-		Skill:       skill,
-		UserInput:   userInput,
-		ToolHistory: toolHistory,
-		AgentOutput: agentOutput,
+		Skill:            skill,
+		UserInput:        userInput,
+		ToolHistory:      toolHistory,
+		AgentOutput:      agentOutput,
+		SkillDescription: skill.Description,
+		OriginalError:    errStr,
+		PipelineContext:  pipelineContext,
 	}
 	go ev.Run(context.Background(), snap)
 }
@@ -189,9 +201,11 @@ func (a *Agent) buildSystemPrompt(matchedSkill *skills.Skill) string {
 		isPipelineAgent = true
 	}
 	fmt.Fprintf(&sb, "2. When you have completed the task or have a FINAL answer, you MUST call the %s tool.\n", finishToolName)
-	fmt.Fprintf(&sb, "   - **Never reply with text alone** without calling %s. "+
-		"If you have a final answer, return it via %s(summary=...). "+
-		"If the task needs tools, use them first.\n", finishToolName, finishToolName)
+	fmt.Fprintf(&sb, "   - **Never reply with text alone** without calling %s.\n", finishToolName)
+	fmt.Fprintf(&sb, "   - The `summary` field IS your message to the user — write the actual reply, not a description of it.\n")
+	fmt.Fprintf(&sb, "     Correct: summary=\"Here is the weather in Tokyo: ...\"\n")
+	fmt.Fprintf(&sb, "     Wrong:   summary=\"Provided weather information to the user.\"\n")
+	fmt.Fprintf(&sb, "   - If the task needs tools, use them first; then call %s with your findings.\n", finishToolName)
 	if !isPipelineAgent {
 		sb.WriteString("   - Set status=\"success\" only when ALL todos are done; use status=\"failure\" to exit early.\n")
 	}
@@ -206,6 +220,21 @@ func (a *Agent) buildSystemPrompt(matchedSkill *skills.Skill) string {
 - If tool results contain the answer, rewrite it in a clear, organized format.
 - Include specific data, names, numbers, and facts from tool results in your final answer.
 - If information is incomplete, state what you found and what is missing.
+
+## What the User Can and Cannot See
+
+The user sees ONLY your final reply (the finish_task summary). Everything else is invisible to them:
+- Tool calls, tool names, arguments, and results — invisible
+- finish_task itself — invisible (the user only sees its summary content)
+- Skill creation, pipeline execution, router decisions — invisible
+- System messages, framework notifications, internal errors — invisible
+
+Rules that follow from this:
+- NEVER mention finish_task, node_complete, 收尾指令, or any internal tool/mechanism in your reply.
+- NEVER apologize for framework-internal actions such as "forgetting to call finish_task".
+- NEVER explain that the framework required you to do something.
+- If something went wrong internally, describe the outcome or ask the user a question — do not expose the framework detail.
+- Respond as a direct assistant. The user has no knowledge of the agent framework running underneath.
 
 ## Security
 
@@ -226,9 +255,7 @@ Never output API keys, passwords, access tokens, credentials, or secrets verbati
 		sb.WriteString("- **Sub-agents** — `delegate` / `escalate` tools spawn isolated agents for heavy subtasks.\n\n")
 		sb.WriteString("**Meta-cognitive checklist** (run before starting any non-trivial task):\n")
 		sb.WriteString("1. Does an existing skill or pipeline already cover this? (Router already checked, but you can also type `/skill-name`.)\n")
-		sb.WriteString("2. Is this a recurring or structured workflow type? If yes, create a skill " +
-			"(read `.ageage/docs/skills.md` first) rather than implementing it ad-hoc.\n")
-		sb.WriteString("3. Would parallel sub-agents or pipeline isolation improve quality or speed?\n\n")
+		sb.WriteString("2. Would parallel sub-agents or pipeline isolation improve quality or speed?\n\n")
 	}
 
 	if agentData, err := os.ReadFile(a.cfg.AgentPath()); err == nil && len(agentData) > 0 {
@@ -405,24 +432,20 @@ func (a *Agent) RunWithParts(ctx context.Context, userInput string, parts []llm.
 
 	if a.router != nil && !a.Mode.IsSubAgent {
 		if matchedSkill != nil {
-			tc := normalizeComplexity(matchedSkill.Complexity)
+			tc := normalizeTier(matchedSkill.Tier)
 			if tc == "" {
 				if matchedSkill.IsPipeline() {
-					tc = TaskWorkflow
+					tc = TierStrong
 				} else {
-					tc = TaskAtomic
+					tc = TierMedium
 				}
 			}
-			if tc == "" {
-				a.debugLog("Skill", "unknown complexity %q in skill %q, falling back to atomic", matchedSkill.Complexity, matchedSkill.Name)
-				tc = TaskAtomic
-			}
 			routerResult = &RouterResult{
-				Complexity:    tc,
+				Tier:          tc,
 				RequiredTools: matchedSkill.RequiredTools,
 				Reasoning:     "explicit skill selection",
 			}
-			a.debugLog("Router", "skipped (explicit skill %q) complexity=%s", matchedSkill.Name, tc)
+			a.debugLog("Router", "skipped (explicit skill %q) tier=%s", matchedSkill.Name, tc)
 		} else {
 			toolsForRouter := a.registry.ListExcept("finish_task", "memory_store")
 			var err error
@@ -430,16 +453,16 @@ func (a *Agent) RunWithParts(ctx context.Context, userInput string, parts []llm.
 			if err != nil {
 				a.debugLog("Router", "failed, using all tools: %s", err)
 			} else {
-				a.debugLog("Router", "complexity=%s skill=%q tools=%v",
-					routerResult.Complexity, routerResult.Skill, routerResult.RequiredTools)
+				a.debugLog("Router", "tier=%s skill=%q tools=%v",
+					routerResult.Tier, routerResult.Skill, routerResult.RequiredTools)
 				if routerResult.Skill != "" {
 					matchedSkill = a.findSkillByName(routerResult.Skill)
 					if matchedSkill != nil {
 						a.debugLog("Skill", "router selected: %s", matchedSkill.Name)
-						if matchedSkill.Complexity != "" {
-							if tc := normalizeComplexity(matchedSkill.Complexity); tc != "" {
-								routerResult.Complexity = tc
-								a.debugLog("Router", "skill complexity override → %s", tc)
+						if matchedSkill.Tier != "" {
+							if tc := normalizeTier(matchedSkill.Tier); tc != "" {
+								routerResult.Tier = tc
+								a.debugLog("Router", "skill tier override → %s", tc)
 							}
 						}
 					}
@@ -448,22 +471,26 @@ func (a *Agent) RunWithParts(ctx context.Context, userInput string, parts []llm.
 		}
 	}
 
-	// --- Planner: create a skill for workflow tasks with no match ---
+	// --- Planner: create a skill only for explicitly recurring workflows with no match ---
 	if a.router != nil && !a.Mode.IsSubAgent &&
-		routerResult != nil && routerResult.Complexity == TaskWorkflow &&
-		routerResult.Skill == "" && matchedSkill == nil {
+		routerResult != nil && routerResult.Tier == TierStrong &&
+		routerResult.Skill == "" && matchedSkill == nil &&
+		routerResult.Checks.IsRecurringWorkflow {
 		if factory, ok := a.deps.(*AgentFactory); ok {
 			docsDir := filepath.Join(factory.Config.AgeAgeDirPath(), "docs")
-			planner := NewPlanner(factory, docsDir)
+			planner := NewPlanner(factory, docsDir, factory.GetStandardToolNames())
 			if skill, err := planner.CreateSkill(ctx, actualInput, nil); err == nil && skill != nil {
 				matchedSkill = skill
 				routerResult.Skill = skill.Name
-				if skill.Complexity != "" {
-					if tc := normalizeComplexity(skill.Complexity); tc != "" {
-						routerResult.Complexity = tc
+				if skill.Tier != "" {
+					if tc := normalizeTier(skill.Tier); tc != "" {
+						routerResult.Tier = tc
 					}
 				}
 				a.debugLog("Planner", "created skill %q", skill.Name)
+				if a.Callbacks.Notify != nil {
+					a.Callbacks.Notify(fmt.Sprintf("🔧 Created reusable skill **%s** for this workflow.", skill.CommandName()))
+				}
 			} else if err != nil {
 				a.debugLog("Planner", "skill creation failed (%s) — proceeding without skill", err)
 			}
@@ -485,13 +512,13 @@ func (a *Agent) RunWithParts(ctx context.Context, userInput string, parts []llm.
 
 	// --- Pipeline skill handling ---
 	if matchedSkill != nil && matchedSkill.IsPipeline() {
-		result, err := a.runPipelineSkill(ctx, matchedSkill, actualInput)
+		result, nodeSummary, err := a.runPipelineSkill(ctx, matchedSkill, actualInput)
 		if err != nil {
 			if ctx.Err() != nil {
 				return "(Task stopped by user)", nil
 			}
 			if matchedSkill.AutoGenerated {
-				a.triggerEvaluator(matchedSkill, actualInput, "Agent error: "+err.Error(), nil)
+				a.triggerEvaluator(matchedSkill, actualInput, "Agent error: "+err.Error(), nil, err)
 			}
 			return "", err
 		}
@@ -502,7 +529,7 @@ func (a *Agent) RunWithParts(ctx context.Context, userInput string, parts []llm.
 			streamCb(result)
 		}
 		if matchedSkill.AutoGenerated {
-			a.triggerEvaluator(matchedSkill, actualInput, result, nil)
+			a.triggerEvaluator(matchedSkill, actualInput, result, nil, nil, nodeSummary)
 		}
 		return result, nil
 	}
@@ -522,7 +549,7 @@ func (a *Agent) RunWithParts(ctx context.Context, userInput string, parts []llm.
 		if err != nil {
 			agentOutput = "Agent error: " + err.Error()
 		}
-		a.triggerEvaluator(matchedSkill, actualInput, agentOutput, a.conv.ToolHistory())
+		a.triggerEvaluator(matchedSkill, actualInput, agentOutput, a.conv.ToolHistory(), err)
 	}
 	return result, err
 }
@@ -563,13 +590,17 @@ func (a *Agent) buildExecPlan(rr *RouterResult, skill *skills.Skill) (toolDefs [
 
 	// Collect the tool list for this run.
 	var neededTools []string
-	if rr != nil && len(rr.RequiredTools) > 0 {
+	switch {
+	case rr != nil && rr.Tier == TierBase && len(rr.RequiredTools) == 0:
+		// Pure knowledge Q&A: only finish_task and optionally memory_recall.
+		if _, ok := a.registry.Get("memory_recall"); ok {
+			neededTools = []string{"memory_recall"}
+		}
+	case rr != nil && len(rr.RequiredTools) > 0:
+		// Router specified tools as a starting set (hint, not hard limit).
 		neededTools = append(neededTools, rr.RequiredTools...)
-	} else if rr != nil && skill == nil {
-		// Router ran but imposed no tool restriction — use all available tools.
-		neededTools = a.registry.List()
-	} else if rr == nil && skill == nil {
-		// No router, no skill: use all available tools.
+	default:
+		// No router, or router ran without restricting tools.
 		neededTools = a.registry.List()
 	}
 
@@ -582,7 +613,7 @@ func (a *Agent) buildExecPlan(rr *RouterResult, skill *skills.Skill) (toolDefs [
 	// Delegation tool injection (main agent only; sub-agents must not recurse).
 	if !a.Mode.IsSubAgent {
 		if a.router != nil {
-			if rr != nil && (rr.Complexity == TaskMedium || rr.Complexity == TaskComplex) {
+			if rr != nil && (rr.Tier == TierMedium || rr.Tier == TierStrong) {
 				neededTools = append(neededTools, "delegate")
 			}
 		} else {
@@ -601,12 +632,12 @@ func (a *Agent) buildExecPlan(rr *RouterResult, skill *skills.Skill) (toolDefs [
 	neededTools = UniqueStrings(neededTools)
 	toolDefs = a.registry.ToOpenAIToolsFiltered(neededTools)
 
-	// Model upgrade based on router complexity.
+	// Model upgrade based on router tier.
 	if rr != nil {
 		var targetModel config.ModelConfig
-		if rr.Complexity == TaskWorkflow && a.cfg.Router.StrongModel.Model != "" {
+		if rr.Tier == TierStrong && a.cfg.Router.StrongModel.Model != "" {
 			targetModel = a.cfg.Router.StrongModel
-		} else if rr.Complexity == TaskAtomic && a.cfg.Router.MediumModel.Model != "" {
+		} else if rr.Tier == TierMedium && a.cfg.Router.MediumModel.Model != "" {
 			targetModel = a.cfg.Router.MediumModel
 		}
 		if targetModel.Model != "" {
@@ -785,7 +816,8 @@ func (a *Agent) runLoop(ctx context.Context, streamCb llm.StreamCallback, toolDe
 				// First bare-text response with no tool calls: nudge the agent.
 				a.hintOnNextCall = "[Framework] You replied with text but did not call " +
 					hintFinishName + " or use any tool. " +
-					"If this is your final answer, call " + hintFinishName + "(summary=<your answer>). " +
+					"If this is your final answer, call " + hintFinishName +
+					" and put your ACTUAL reply text in the summary field (not a description of what you said). " +
 					"If the task requires tool use, invoke the appropriate tools first."
 				continue
 			}
@@ -885,10 +917,11 @@ func (a *Agent) runLoop(ctx context.Context, streamCb llm.StreamCallback, toolDe
 // runPipelineSkill executes a YAML-based pipeline skill.
 // Requires deps to be an *AgentFactory because pipeline nodes need LLM client
 // and debug flag access that are not part of the AgentDeps interface.
-func (a *Agent) runPipelineSkill(ctx context.Context, skill *skills.Skill, input string) (string, error) {
+// Returns the result, node summary (for the evaluator), and any error.
+func (a *Agent) runPipelineSkill(ctx context.Context, skill *skills.Skill, input string) (result, nodeSummary string, err error) {
 	factory, ok := a.deps.(*AgentFactory)
 	if !ok {
-		return "", fmt.Errorf("pipeline skills require an AgentFactory")
+		return "", "", fmt.Errorf("pipeline skills require an AgentFactory")
 	}
 	exec := NewPipelineExecutor(
 		skill.Pipeline,
@@ -905,7 +938,11 @@ func (a *Agent) runPipelineSkill(ctx context.Context, skill *skills.Skill, input
 		a.currentChannelID,
 		a.registry,
 	)
-	return exec.Run(ctx)
+	result, err = exec.Run(ctx)
+	if err != nil {
+		return "", "", err
+	}
+	return result, exec.NodeSummary(), nil
 }
 
 // gcTmp removes managed tmp files no longer referenced in the message history.

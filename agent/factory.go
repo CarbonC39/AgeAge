@@ -48,6 +48,60 @@ func (f *AgentFactory) GetSkills() []skills.Skill {
 	return f.Skills
 }
 
+// GetStandardToolNames returns the list of tool names available to a standard
+// (non-sub) agent under the current config. Used by the planner to avoid
+// generating skills that reference non-existent tools.
+func (f *AgentFactory) GetStandardToolNames() []string {
+	var names []string
+	add := func(n string) {
+		if f.Config.ShouldExcludeTool(n) {
+			return
+		}
+		if len(f.Config.Agent.Tools) > 0 {
+			for _, t := range f.Config.Agent.Tools {
+				if t == n {
+					names = append(names, n)
+					return
+				}
+			}
+			return
+		}
+		names = append(names, n)
+	}
+	add("bash")
+	add("file_read")
+	add("file_write")
+	add("file_edit")
+	add("memory_store")
+	add("memory_recall")
+	add("memory_forget")
+	add("web_fetch")
+	add("web_search")
+	add("delegate")
+	add("cron_add")
+	add("cron_remove")
+	add("cron_list")
+	add("glob")
+	add("grep")
+	add("tree")
+	add("update_todos")
+	add("ask_user")
+	add("escalate")
+	add("browser_navigate")
+	add("browser_action")
+	add("browser_content")
+	for _, s := range f.MCPSessions {
+		resp, err := s.ListTools(context.Background(), nil)
+		if err != nil {
+			continue
+		}
+		for _, t := range resp.Tools {
+			add(t.Name)
+		}
+	}
+	return names
+}
+
 // WatchSkills polls the skills directory every 2 s and hot-reloads when any
 // .md file changes. Run in a goroutine; returns when ctx is cancelled.
 func (f *AgentFactory) WatchSkills(ctx context.Context) {
@@ -123,10 +177,6 @@ func NewFactory(configPath string, debug bool) (*AgentFactory, error) {
 		if cfg.LLM.APIKey == "" {
 			cfg.LLM.APIKey = os.Getenv("OPENAI_API_KEY")
 		}
-	}
-
-	if cfg.LLM.APIKey == "" {
-		return nil, fmt.Errorf("LLM API key not configured. Set it in config.toml or AGEAGE_API_KEY / OPENAI_API_KEY environment variable")
 	}
 
 	// Resolve optional search API keys from environment variables.

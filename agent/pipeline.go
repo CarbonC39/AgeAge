@@ -137,16 +137,11 @@ func (e *PipelineExecutor) Run(ctx context.Context) (string, error) {
 			e.updateTodos()
 		}
 
-		// Each node execution writes outputs into a local map.
-		// Merging into e.vars happens here (after the node completes) so that
-		// node execution functions never write directly to shared state —
-		// this is what makes parallel foreach safe.
 		out := make(map[string]interface{})
 		var err error
 
 		if node.Foreach != "" {
 			err = e.execForeach(ctx, node)
-			// execForeach merges its own outputs directly; out is unused.
 		} else {
 			err = e.execNode(ctx, node, nil, -1, out)
 			if err == nil {
@@ -157,7 +152,6 @@ func (e *PipelineExecutor) Run(ctx context.Context) (string, error) {
 		if err != nil {
 			if e.nestDepth == 0 {
 				e.nodeStatus[node.ID] = nodeStatusFailed
-				// Mark all remaining nodes as skipped.
 				found := false
 				for _, n := range e.ps.Pipeline {
 					if found {
@@ -169,6 +163,10 @@ func (e *PipelineExecutor) Run(ctx context.Context) (string, error) {
 				}
 				e.updateTodos()
 			}
+			if i > 0 {
+				prev := e.ps.Pipeline[i-1]
+				return "", fmt.Errorf("pipeline node %q failed after %q succeeded: %w", node.ID, prev.ID, err)
+			}
 			return "", fmt.Errorf("pipeline node %q failed: %w", node.ID, err)
 		}
 
@@ -178,10 +176,16 @@ func (e *PipelineExecutor) Run(ctx context.Context) (string, error) {
 		}
 	}
 
-	// Return the first common output variable found, or a fallback message.
+	// Return the declared output variable, or fall back to common names, or a default.
+	if e.ps.Returns != "" {
+		if v, ok := e.vars[e.ps.Returns]; ok {
+			return fmtVar(v), nil
+		}
+		return "", fmt.Errorf("pipeline declares returns: %q but variable not produced by any node", e.ps.Returns)
+	}
 	for _, name := range []string{"result", "output", "answer"} {
 		if v, ok := e.vars[name]; ok {
-			return fmt.Sprintf("%v", v), nil
+			return fmtVar(v), nil
 		}
 	}
 	return "Pipeline completed successfully.", nil
@@ -211,7 +215,7 @@ func (e *PipelineExecutor) execForeach(ctx context.Context, node skills.Pipeline
 		return fmt.Errorf("foreach variable %q is nil or not found", node.Foreach)
 	}
 
-	var items []interface{}
+		var items []interface{}
 	switch v := arrayVal.(type) {
 	case []interface{}:
 		items = v
@@ -219,8 +223,32 @@ func (e *PipelineExecutor) execForeach(ctx context.Context, node skills.Pipeline
 		for _, s := range v {
 			items = append(items, s)
 		}
+	case []int:
+		for _, n := range v {
+			items = append(items, float64(n))
+		}
+	case []float64:
+		for _, f := range v {
+			items = append(items, f)
+		}
+	case []bool:
+		for _, b := range v {
+			items = append(items, b)
+		}
+	case []map[string]interface{}:
+		for _, m := range v {
+			items = append(items, m)
+		}
 	default:
-		return fmt.Errorf("foreach variable %q must be an array (got %T)", node.Foreach, arrayVal)
+		rv := reflect.ValueOf(arrayVal)
+		if rv.Kind() == reflect.Slice {
+			items = make([]interface{}, rv.Len())
+			for i := 0; i < rv.Len(); i++ {
+				items[i] = rv.Index(i).Interface()
+			}
+		} else {
+			return fmt.Errorf("foreach variable %q must be an array (got %T)", node.Foreach, arrayVal)
+		}
 	}
 
 	if len(items) == 0 {
@@ -281,19 +309,30 @@ func (e *PipelineExecutor) execForeach(ctx context.Context, node skills.Pipeline
 			}(i, it)
 		}
 
-		// Collect all results; cancel on first error.
+		// Collect all results; cancel on first error but keep draining to avoid goroutine leak.
 		results := make([]iterResult, len(items))
+		var failedIdxs []int
 		var firstErr error
 		for i := 0; i < len(items); i++ {
 			r := <-resCh
-			if r.err != nil && firstErr == nil {
-				firstErr = fmt.Errorf("foreach iteration %d: %w", r.idx, r.err)
-				subCancel() // signal remaining goroutines to stop
+			if r.err != nil {
+				failedIdxs = append(failedIdxs, r.idx)
+				if firstErr == nil {
+					firstErr = r.err
+					subCancel() // signal remaining goroutines to stop
+				}
 			}
 			results[r.idx] = r
 		}
 		if firstErr != nil {
-			return firstErr
+			if len(failedIdxs) == 1 {
+				return fmt.Errorf("foreach iteration %d: %w", failedIdxs[0], firstErr)
+			}
+			var msgs []string
+			for _, idx := range failedIdxs {
+				msgs = append(msgs, fmt.Sprintf("iteration %d: %s", idx, results[idx].err))
+			}
+			return fmt.Errorf("foreach: %d of %d iterations failed:\n%s", len(failedIdxs), len(items), strings.Join(msgs, "\n"))
 		}
 
 		// Merge results in index order for deterministic output.
@@ -438,40 +477,74 @@ func (e *PipelineExecutor) execAgentNode(ctx context.Context, node skills.Pipeli
 		}
 	}
 
-	// Build tool allowlist: skill's required tools ∪ node's explicit tools.
+	// Build tool allowlist for this node's sub-agent.
+	// node.Tools is per-node and takes priority.
+	// skill.RequiredTools is router metadata (what the pipeline as a whole uses) and
+	// must NOT bleed into individual node sub-agents.
 	// A nil allowlist means all global tools are available.
 	var filteredTools []string
-	if nodeSkill != nil && len(nodeSkill.RequiredTools) > 0 || len(node.Tools) > 0 {
-		var toolList []string
-		if nodeSkill != nil {
-			toolList = append(toolList, nodeSkill.RequiredTools...)
-		}
-		toolList = append(toolList, node.Tools...)
-		filteredTools = UniqueStrings(toolList)
+	if len(node.Tools) > 0 {
+		filteredTools = node.Tools
+	} else if nodeSkill != nil && len(nodeSkill.RequiredTools) > 0 {
+		filteredTools = nodeSkill.RequiredTools
 	}
 
 	// Build the task prompt once; it is the same for all attempts.
 	taskPrompt := e.buildNodePrompt(node, foreachItem, foreachIdx)
+
+	// Inject only the pipeline variables referenced by this node.
+	// Injecting everything causes large foreach-accumulated arrays to pollute unrelated nodes.
+	referencedVars := make(map[string]bool)
+	for _, varRef := range node.Inputs {
+		if s, ok := varRef.(string); ok {
+			if key := extractVarsKey(s); key != "" {
+				referencedVars[key] = true
+			}
+		}
+	}
+	for _, m := range varInterpolateRe.FindAllStringSubmatch(node.Prompt, -1) {
+		for _, cap := range m[1:] {
+			if cap != "" {
+				referencedVars[cap] = true
+				break
+			}
+		}
+	}
+	referencedVars["input"] = true // always expose the pipeline entry-point variable
+
+	var injectedVars strings.Builder
+	for k := range referencedVars {
+		if v, ok := e.vars[k]; ok {
+			val := truncateStr(fmtVar(v), 300)
+			fmt.Fprintf(&injectedVars, "- %s = %s\n", k, val)
+		}
+	}
+	if injectedVars.Len() > 0 {
+		taskPrompt += "\n\n---\n**Pipeline variables for this node:**\n" + injectedVars.String()
+	}
+
 	if len(node.Outputs) > 0 {
-		var keys []string
-		for _, k := range node.Outputs {
-			keys = append(keys, k)
+		var pairs []string
+		for pipelineVar, nodeKey := range node.Outputs {
+			pairs = append(pairs, fmt.Sprintf("%q: <your %s>", nodeKey, pipelineVar))
 		}
 		taskPrompt += fmt.Sprintf(
-			"\n\n---\nIMPORTANT: Call node_complete when done. Expected keys in the 'vars' argument: %s.",
-			strings.Join(keys, ", "),
+			"\n\n---\n**When done, call exactly:**\n"+
+				"node_complete(status=\"success\", vars={%s})\n"+
+				"Use these exact key names — do NOT rename them.",
+			strings.Join(pairs, ", "),
 		)
 	}
 
 	// Attempt execution, falling back one tier on transient LLM errors.
-	complexities := e.complexityFallbacks(node.Complexity)
+	tiers := e.tierFallbacks(node.Tier)
 
 	var lastErr error
-	for attempt, complexity := range complexities {
+	for attempt, tier := range tiers {
 		if attempt > 0 {
-			e.debugf("Fallback", "%s  attempt %d failed (%s) → retrying with complexity=%s", node.ID, attempt, lastErr, complexity)
+			e.debugf("Fallback", "%s  attempt %d failed (%s) → retrying with tier=%s", node.ID, attempt, lastErr, tier)
 		}
-		nodeOut, err := e.runAgentNodeAttempt(ctx, node, nodeSkill, filteredTools, taskPrompt, complexity)
+		nodeOut, err := e.runAgentNodeAttempt(ctx, node, nodeSkill, filteredTools, taskPrompt, tier)
 		if err == nil {
 			for k, v := range nodeOut {
 				out[k] = v
@@ -488,14 +561,14 @@ func (e *PipelineExecutor) execAgentNode(ctx context.Context, node skills.Pipeli
 }
 
 // runAgentNodeAttempt performs a single execution attempt for an agent node
-// using the given complexity (which may differ from node.Complexity on retry).
+// using the given tier (which may differ from node.Tier on retry).
 func (e *PipelineExecutor) runAgentNodeAttempt(
 	ctx context.Context,
 	node skills.PipelineNode,
 	nodeSkill *skills.Skill,
 	filteredTools []string,
 	taskPrompt string,
-	complexity string,
+	tier string,
 ) (map[string]interface{}, error) {
 	// Create an isolated sub-agent. Sub-agents in pipelines:
 	//   - Do NOT get pipeline todo callbacks (would conflict with pipeline's own display).
@@ -512,13 +585,23 @@ func (e *PipelineExecutor) runAgentNodeAttempt(
 		subAgent.MaxIterations = e.factory.Config.SubAgent.MaxIterations
 	}
 
-	// Apply model from complexity (node or fallback).
-	e.applyNodeModel(subAgent, complexity)
+	// Apply model from tier (node or fallback).
+	e.applyNodeModel(subAgent, tier)
 
 	// Pre-inject the system prompt. RunWithParts checks len(messages)==0 to
 	// determine the first turn; setting it here tells RunWithParts that the
 	// system prompt is already built and should not be overwritten.
-	sysprompt := subAgent.buildSystemPrompt(nodeSkill)
+	sysprompt := subAgent.buildSystemPrompt(nodeSkill) +
+		"\n\n**CRITICAL — User visibility:** Your internal reasoning, tool calls, and " +
+		"intermediate steps are NOT visible to the end user. The ONLY thing the user " +
+		"sees is the final pipeline result. Therefore you MUST include your COMPLETE " +
+		"findings, analysis, and answer in the node_complete vars. Never call " +
+		"node_complete with a placeholder like 'done' or a one-word result — " +
+		"the vars content IS your only channel to deliver results.\n\n" +
+		"**Pipeline rule:** When calling node_complete, use the EXACT key names " +
+		"specified in the task instruction. The default key is always \"result\" — " +
+		"never substitute \"output\", \"answer\", \"text\", or any other name unless " +
+		"explicitly told to use a different name."
 	subAgent.conv.Reset([]llm.Message{{Role: "system", Content: sysprompt}})
 
 	// Swap finish_task → node_complete.
@@ -540,8 +623,11 @@ func (e *PipelineExecutor) runAgentNodeAttempt(
 	case nodeResult = <-resultCh:
 		// node_complete was called — use structured output.
 	default:
-		// Agent returned without calling node_complete (direct answer or max
-		// iterations reached). Fall back: treat text as "result".
+		// Agent returned without calling node_complete.
+		// Propagate LLM or iteration errors immediately instead of masking them.
+		if runErr != nil {
+			return nil, fmt.Errorf("agent node %q: %w", node.ID, runErr)
+		}
 		e.debugf("Warn", "%s  node_complete not called — falling back to last text output", node.ID)
 		fallback := runResult
 		if fallback == "" {
@@ -568,17 +654,43 @@ func (e *PipelineExecutor) runAgentNodeAttempt(
 		return nil, fmt.Errorf("%s", reason)
 	}
 
-	// Surface LLM errors that node_complete didn't mask.
+	// Surface LLM errors not already handled above (node_complete was called but run also errored).
 	if runErr != nil {
 		return nil, fmt.Errorf("agent node %q: %w", node.ID, runErr)
 	}
 
 	e.debugf("Agent◁", "%s  vars=%v", node.ID, nodeResult.Vars)
 
+	// First pass: collect all outputs that matched by exact key.
 	out := make(map[string]interface{}, len(node.Outputs))
+	var missingPipelineVar string  // pipeline-var name of the one missing entry (if any)
+	var missingNodeKey string      // expected node_complete key that was absent
+	missingCount := 0
 	for pipelineVar, nodeOutputKey := range node.Outputs {
 		if v, ok := nodeResult.Vars[nodeOutputKey]; ok {
 			out[pipelineVar] = v
+		} else {
+			missingPipelineVar = pipelineVar
+			missingNodeKey = nodeOutputKey
+			missingCount++
+		}
+	}
+	// Brute-force recovery: exactly 1 output was missing AND agent returned exactly
+	// 1 var (with the wrong key name). This is the canonical "agent wrote 'answer'
+	// instead of 'result'" pattern. Safe to steal because there is no ambiguity.
+	switch {
+	case missingCount == 1 && len(nodeResult.Vars) == 1:
+		for wrongKey, v := range nodeResult.Vars {
+			out[missingPipelineVar] = v
+			e.debugf("Warn", "node %s: expected key %q, got %q — using fallback value", node.ID, missingNodeKey, wrongKey)
+			if e.notifyFn != nil {
+				e.notifyFn(fmt.Sprintf("⚠️ Node **%s** returned key `%s` instead of `%s` — value recovered but skill may need updating.", node.ID, wrongKey, missingNodeKey))
+			}
+		}
+	case missingCount > 0:
+		e.debugf("Warn", "node %s: missing output key %q (got vars: %v)", node.ID, missingNodeKey, nodeResult.Vars)
+		if e.notifyFn != nil {
+			e.notifyFn(fmt.Sprintf("Warning: node %q did not provide expected output key %q", node.ID, missingNodeKey))
 		}
 	}
 	return out, nil
@@ -596,7 +708,7 @@ func (e *PipelineExecutor) execNestedPipeline(ctx context.Context, node skills.P
 	initialInput := ""
 	extraVars := make(map[string]interface{}, len(node.Inputs))
 	for argName, varRef := range node.Inputs {
-		val := fmt.Sprintf("%v", e.resolveValue(varRef, foreachItem, foreachIdx))
+		val := fmtVar(e.resolveValue(varRef, foreachItem, foreachIdx))
 		if argName == "input" {
 			initialInput = val
 		}
@@ -641,14 +753,14 @@ func (e *PipelineExecutor) execNestedPipeline(ctx context.Context, node skills.P
 	return nil
 }
 
-// complexityFallbacks returns the ordered list of complexity tiers to attempt.
+// tierFallbacks returns the ordered list of model tiers to attempt.
 // On a transient LLM error the engine retries once with the next lower tier.
-func (e *PipelineExecutor) complexityFallbacks(primary string) []string {
+func (e *PipelineExecutor) tierFallbacks(primary string) []string {
 	tiers := []string{primary}
-	switch normalizeComplexity(primary) {
-	case TaskWorkflow:
-		tiers = append(tiers, string(TaskAtomic))
-	case TaskAtomic:
+	switch normalizeTier(primary) {
+	case TierStrong:
+		tiers = append(tiers, string(TierMedium))
+	case TierMedium:
 		tiers = append(tiers, "") // empty = base model (no override)
 	}
 	return tiers
@@ -668,31 +780,31 @@ func (e *PipelineExecutor) lookupSkill(name string) *skills.Skill {
 	return nil
 }
 
-// applyNodeModel sets the sub-agent's LLM client based on node complexity.
+// applyNodeModel sets the sub-agent's LLM client based on node tier.
 // Checks [pipeline.models] first; falls back to [router] model settings.
-// No-ops if complexity is empty or no matching model is configured.
-func (e *PipelineExecutor) applyNodeModel(subAgent *Agent, complexity string) {
-	if complexity == "" {
+// No-ops if tier is empty or no matching model is configured.
+func (e *PipelineExecutor) applyNodeModel(subAgent *Agent, tier string) {
+	if tier == "" {
 		return
 	}
 	pm := e.factory.Config.Pipeline.Models
 	var targetModel config.ModelConfig
-	switch normalizeComplexity(complexity) {
-	case TaskWorkflow:
-		if pm.Complex.Model != "" {
-			targetModel = pm.Complex
+	switch normalizeTier(tier) {
+	case TierStrong:
+		if pm.Strong.Model != "" {
+			targetModel = pm.Strong
 		} else {
 			targetModel = e.factory.Config.Router.StrongModel
 		}
-	case TaskAtomic:
+	case TierMedium:
 		if pm.Medium.Model != "" {
 			targetModel = pm.Medium
 		} else {
 			targetModel = e.factory.Config.Router.MediumModel
 		}
-	case TaskDirect:
-		if pm.Simple.Model != "" {
-			targetModel = pm.Simple
+	case TierBase:
+		if pm.Base.Model != "" {
+			targetModel = pm.Base
 		}
 	}
 	if targetModel.Model == "" {
@@ -704,7 +816,7 @@ func (e *PipelineExecutor) applyNodeModel(subAgent *Agent, complexity string) {
 		e.factory.LLMClient.BaseURL(),
 	)
 	subAgent.SetLLMClient(llm.NewClient(apiKey, baseURL, modelName, e.factory.Debug, e.factory.Config.LLM.MaxTokens))
-	e.debugf("Model", "complexity=%s → %s", complexity, modelName)
+	e.debugf("Model", "tier=%s → %s", tier, modelName)
 }
 
 // buildNodePrompt constructs the task string passed to a node's sub-agent.
@@ -745,10 +857,21 @@ func (e *PipelineExecutor) resolveValue(val interface{}, foreachItem interface{}
 			return foreachIdx
 		case strings.HasPrefix(v, "$foreach.current."):
 			field := strings.TrimPrefix(v, "$foreach.current.")
-			if m, ok := foreachItem.(map[string]interface{}); ok {
+			switch m := foreachItem.(type) {
+			case map[string]interface{}:
 				return m[field]
+			case map[string]string:
+				return m[field]
+			default:
+				rv := reflect.ValueOf(foreachItem)
+				if rv.Kind() == reflect.Map && rv.Type().Key().Kind() == reflect.String {
+					fv := rv.MapIndex(reflect.ValueOf(field))
+					if fv.IsValid() {
+						return fv.Interface()
+					}
+				}
+				return nil
 			}
-			return nil
 		case strings.HasPrefix(v, "$vars."):
 			key := strings.TrimPrefix(v, "$vars.")
 			return e.vars[key]
@@ -788,7 +911,7 @@ func (e *PipelineExecutor) resolveValue(val interface{}, foreachItem interface{}
 func (e *PipelineExecutor) interpolatePrompt(tmpl string, foreachItem interface{}, foreachIdx int) string {
 	result := tmpl
 	if foreachIdx >= 0 {
-		foreachStr := fmt.Sprintf("%v", foreachItem)
+		foreachStr := fmtVar(foreachItem)
 		foreachIdxStr := fmt.Sprintf("%d", foreachIdx)
 		result = strings.ReplaceAll(result, "{{$foreach.current}}", foreachStr)
 		result = strings.ReplaceAll(result, "$foreach.current", foreachStr)
@@ -812,7 +935,7 @@ func (e *PipelineExecutor) interpolatePrompt(tmpl string, foreachItem interface{
 			key = m[3]
 		}
 		if v, ok := e.vars[key]; ok {
-			return fmt.Sprintf("%v", v)
+			return fmtVar(v)
 		}
 		return match
 	})
@@ -820,7 +943,21 @@ func (e *PipelineExecutor) interpolatePrompt(tmpl string, foreachItem interface{
 	return result
 }
 
-// ── Todo display ──────────────────────────────────────────────────────────────
+// NodeSummary returns a brief human-readable summary of all node outputs
+// for inclusion in the main conversation history so the agent can explain
+// how it arrived at a pipeline result.
+func (e *PipelineExecutor) NodeSummary() string {
+	var sb strings.Builder
+	sb.WriteString("Pipeline node outputs:\n")
+	for _, node := range e.ps.Pipeline {
+		for pvar := range node.Outputs {
+			if v, ok := e.vars[pvar]; ok {
+				fmt.Fprintf(&sb, "- %s → %s: %s\n", node.ID, pvar, truncateStr(fmtVar(v), 500))
+			}
+		}
+	}
+	return sb.String()
+}
 
 // formatTodos returns a formatted pipeline status string for display.
 func (e *PipelineExecutor) formatTodos() string {
@@ -857,10 +994,41 @@ func (e *PipelineExecutor) updateTodos() {
 		} else if e.editFn != nil {
 			_ = e.editFn(e.todoMsgID, text)
 		}
-	} else if e.notifyFn != nil && e.todoMsgID == "" {
-		// Plain notify: send once at the start; incremental updates not possible.
-		e.notifyFn(text)
-		e.todoMsgID = "notified"
+	} else if e.notifyFn != nil {
+		// For channels without edit support, send once when the pipeline finishes
+		// (all nodes in a terminal state) so the user sees the actual outcome, not
+		// the all-pending initial state.
+		if e.todoMsgID == "" {
+			allResolved := true
+			for _, s := range e.nodeStatus {
+				if s == nodeStatusPending || s == nodeStatusRunning {
+					allResolved = false
+					break
+				}
+			}
+			if allResolved {
+				e.notifyFn(text)
+				e.todoMsgID = "notified"
+			}
+		}
+	}
+}
+
+// fmtVar converts a pipeline variable value to a string suitable for prompt injection.
+// Strings are returned as-is. Complex values (slices, maps) are JSON-encoded so
+// downstream models can parse them. Nil becomes empty string.
+func fmtVar(v interface{}) string {
+	switch val := v.(type) {
+	case string:
+		return val
+	case nil:
+		return ""
+	default:
+		b, err := json.Marshal(val)
+		if err != nil {
+			return fmt.Sprintf("%v", val)
+		}
+		return string(b)
 	}
 }
 
@@ -869,4 +1037,19 @@ func (e *PipelineExecutor) debugf(category, format string, args ...interface{}) 
 		return
 	}
 	fmt.Printf("  ◈  %-10s %s\n", category, fmt.Sprintf(format, args...))
+}
+
+// extractVarsKey returns the pipeline variable name from a single input reference string.
+// Handles: $vars.name, $name (shorthand for $vars.name).
+// Returns "" for non-variable references ($foreach.*, $config.*, or plain literals).
+func extractVarsKey(ref string) string {
+	if strings.HasPrefix(ref, "$vars.") {
+		return strings.TrimPrefix(ref, "$vars.")
+	}
+	if strings.HasPrefix(ref, "$") &&
+		!strings.HasPrefix(ref, "$foreach.") &&
+		!strings.HasPrefix(ref, "$config.") {
+		return strings.TrimPrefix(ref, "$")
+	}
+	return ""
 }

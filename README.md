@@ -98,7 +98,7 @@ flowchart TD
 
 **Agent** is the conversation engine. It holds the full message history, the tool registry, the router, and the summarizer. One instance persists across turns; history grows with each exchange and is compressed or summarized when it exceeds configurable thresholds.
 
-**Router** is an optional lightweight classifier that runs before each turn. It answers three factual yes/no questions about the request (`needs_tools`, `needs_multiple_calls`, `needs_synthesis`) and lists the required tools. The engine derives the complexity tier from the checklist — eliminating semantic bias from manual labelling. The router also selects the active skill.
+**Router** is an optional lightweight classifier that runs before each turn. It answers three factual yes/no questions about the request (`needs_tools`, `needs_multiple_calls`, `needs_synthesis`) and lists the required tools. The engine derives the model tier (`base`/`medium`/`strong`) from the checklist — eliminating semantic bias from manual labelling. The router also selects the active skill.
 
 **Planner & Evaluator** work together for complex tasks with no existing skill. The Planner runs a sandboxed agent to author a new `.md` or `.yaml` skill file. Afterwards, the Evaluator runs asynchronously in the background to review the execution and potentially patch the generated skill. The `/build` command also triggers the Planner explicitly, passing recent conversation context.
 
@@ -114,12 +114,12 @@ User message
     ▼
 ① Skill matching — word-boundary name match against loaded skills
 ② Skill-only tool injection — add declared tools; remove on turn exit (defer)
-③ Router (optional) — answer 3 checklist questions; derive complexity; select tools & model
-④ Planner (optional) — if task is workflow and no skill exists, auto-generate one
+③ Router (optional) — answer 3 checklist questions; derive model tier; select tools & model
+④ Planner (optional) — if tier=strong and no skill exists, auto-generate one
 ⑤ Model & tool selection
-    direct   → base model, no delegate
-    atomic   → [router.medium] model if configured
-    workflow → [router.strong] model, delegate injected
+    base   → [llm] model, no delegate
+    medium → [router.medium] model if configured
+    strong → [router.strong] model, delegate injected
 ⑥ Execution loop (up to max_iterations)
     LLM call → tool calls → LLM call → …
     <think> blocks stripped from streamed output
@@ -153,7 +153,7 @@ Skills live in `{workspace}/skills/`. Any `.md` file with valid frontmatter is p
 ---
 name: code-review
 description: "Review code for bugs, style, and security."
-complexity: atomic
+tier: medium
 required_tools:
   - file_read
   - grep
@@ -165,19 +165,19 @@ Read the given file(s) and return a structured review with severity ratings.
 | Frontmatter field  | Purpose |
 |--------------------|---------|
 | `name`             | Word-boundary matched against user input (case-insensitive, spaces/underscores/hyphens equivalent). |
-| `description`      | Shown to the router for skill selection and complexity reasoning. |
-| `complexity`       | `direct` / `atomic` / `workflow` — bypasses the router LLM call when set. |
+| `description`      | Shown to the router for skill selection. |
+| `tier`             | `base` / `medium` / `strong` — bypasses the router LLM call when set. |
 | `required_tools`   | Tool allowlist for this turn. |
 
-### Complexity tiers
+### Model tiers
 
-| Value      | Model used             | Delegate tool |
-|------------|------------------------|---------------|
-| `direct`   | Base `[llm]` model     | No            |
-| `atomic`   | `[router.medium]` model (if set) | No  |
-| `workflow` | `[router.strong]` model (if set) | Yes |
+| Value    | Model used             | Delegate tool |
+|----------|------------------------|---------------|
+| `base`   | Base `[llm]` model     | No            |
+| `medium` | `[router.medium]` model (if set) | No  |
+| `strong` | `[router.strong]` model (if set) | Yes |
 
-Multiple skills can match simultaneously. Their tool lists merge and the highest complexity wins. Skills are **hot-reloaded** — the change applies within 2 seconds.
+Multiple skills can match simultaneously. Their tool lists merge and the highest tier wins. Skills are **hot-reloaded** — the change applies within 2 seconds.
 
 ### Pipeline skills
 

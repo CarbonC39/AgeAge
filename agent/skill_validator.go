@@ -89,6 +89,17 @@ func ValidateSkillFile(path string, knownTools []string) []ValidationError {
 
 	pl := skill.Pipeline
 
+	// First node must be type:agent — the user's raw natural-language input
+	// arrives in $vars.input and only an agent node can parse it. An auto
+	// first node would try to feed natural text into a tool's typed schema
+	// and fail at the very first step.
+	if len(pl.Pipeline) > 0 && pl.Pipeline[0].Type == "auto" {
+		errs = append(errs, ValidationError{
+			Field:   "pipeline[0].type",
+			Message: "first node must be type: agent — it receives the user's raw natural-language input via $vars.input, which an auto node cannot interpret",
+		})
+	}
+
 	// Collect vars declared in the top-level vars: block.
 	declared := make(map[string]bool, len(pl.Vars))
 	for k := range pl.Vars {
@@ -144,6 +155,31 @@ func ValidateSkillFile(path string, knownTools []string) []ValidationError {
 		// Register this node's outputs so later nodes can reference them.
 		for outVar := range node.Outputs {
 			producedVars[outVar] = true
+		}
+	}
+
+	// The pipeline must end up able to surface SOMETHING to the user. Either:
+	//   - top-level `returns:` names a variable that some node produces, OR
+	//   - some node produces one of the conventional names (result/output/answer).
+	// Without this, the executor returns a hollow "Pipeline completed
+	// successfully." string and the user receives no content.
+	if len(pl.Pipeline) > 0 {
+		target := pl.Returns
+		ok := false
+		if target != "" {
+			ok = producedVars[target]
+		} else {
+			ok = producedVars["result"] || producedVars["output"] || producedVars["answer"]
+		}
+		if !ok {
+			msg := "pipeline must declare `returns:` matching a node output, OR have at least one node produce `result`/`output`/`answer` — otherwise the user receives no content"
+			if target != "" {
+				msg = fmt.Sprintf("pipeline declares `returns: %s` but no node produces that variable — the user would receive no content", target)
+			}
+			errs = append(errs, ValidationError{
+				Field:   "pipeline.returns",
+				Message: msg,
+			})
 		}
 	}
 

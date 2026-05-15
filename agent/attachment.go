@@ -41,6 +41,23 @@ func processAttachment(path string, cfg *config.Config, tmpMgr *TmpManager) ([]l
 		return nil, fmt.Errorf("%q is a directory", path)
 	}
 
+	// Stage a local copy so the file persists even if the original is removed.
+	stagedPath := path
+	if tmpMgr != nil {
+		stagedDir := tmpMgr.StagingDir()
+		if err := os.MkdirAll(stagedDir, 0o755); err == nil {
+			dest := filepath.Join(stagedDir, filepath.Base(path))
+			if _, statErr := os.Stat(dest); statErr == nil {
+				ext := filepath.Ext(path)
+				base := strings.TrimSuffix(filepath.Base(path), ext)
+				dest = filepath.Join(stagedDir, fmt.Sprintf("%s_%d%s", base, time.Now().UnixNano(), ext))
+			}
+			if cpErr := copyFile(path, dest); cpErr == nil {
+				stagedPath = dest
+			}
+		}
+	}
+
 	ext := strings.ToLower(filepath.Ext(path))
 
 	// ── Image handling ────────────────────────────────────────────────────────
@@ -49,7 +66,7 @@ func processAttachment(path string, cfg *config.Config, tmpMgr *TmpManager) ([]l
 			return nil, fmt.Errorf("image %q is too large (%d bytes, limit %d)", filepath.Base(path), info.Size(), mm.MaxImageBytes)
 		}
 		if mm.Vision {
-			data, err := os.ReadFile(path)
+			data, err := os.ReadFile(stagedPath)
 			if err != nil {
 				return nil, fmt.Errorf("read image %q: %w", path, err)
 			}
@@ -65,7 +82,7 @@ func processAttachment(path string, cfg *config.Config, tmpMgr *TmpManager) ([]l
 		// vision=false: try converter, else placeholder
 		extNoDot := strings.TrimPrefix(ext, ".")
 		if conv := cfg.FindConverter(extNoDot); conv != nil {
-			text, tmpPath, err := runConverter(path, conv, tmpMgr)
+			text, tmpPath, err := runConverter(stagedPath, conv, tmpMgr)
 			if err == nil {
 				return []llm.ContentPart{{Type: "text", Text: fmt.Sprintf("[Image %q converted to text — %d lines]\n\n%s\n[tmp: %s]", filepath.Base(path), countLines(text), text, tmpPath)}}, nil
 			}
@@ -76,7 +93,7 @@ func processAttachment(path string, cfg *config.Config, tmpMgr *TmpManager) ([]l
 	// ── Converter-handled document formats ───────────────────────────────────
 	extNoDot := strings.TrimPrefix(ext, ".")
 	if conv := cfg.FindConverter(extNoDot); conv != nil {
-		text, tmpPath, err := runConverter(path, conv, tmpMgr)
+		text, tmpPath, err := runConverter(stagedPath, conv, tmpMgr)
 		if err != nil {
 			return nil, fmt.Errorf("convert %q: %w", filepath.Base(path), err)
 		}
@@ -85,12 +102,25 @@ func processAttachment(path string, cfg *config.Config, tmpMgr *TmpManager) ([]l
 	}
 
 	// ── Plain text / source code fallback ────────────────────────────────────
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(stagedPath)
 	if err != nil {
 		return nil, fmt.Errorf("read %q: %w", path, err)
 	}
 	total := countLines(string(data))
-	return []llm.ContentPart{{Type: "text", Text: fmt.Sprintf("[File %q — %d lines]\n\n%s", filepath.Base(path), total, string(data))}}, nil
+	note := ""
+	if stagedPath != path {
+		note = fmt.Sprintf(" — staged at: %s", stagedPath)
+	}
+	return []llm.ContentPart{{Type: "text", Text: fmt.Sprintf("[File %q — %d lines%s]\n\n%s", filepath.Base(path), total, note, string(data))}}, nil
+}
+
+// copyFile copies a file from src to dst.
+func copyFile(src, dst string) error {
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(dst, data, 0o644)
 }
 
 // runConverter executes a configured converter on inputPath, writing output to

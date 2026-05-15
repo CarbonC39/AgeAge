@@ -113,6 +113,18 @@ func NewPipelineExecutor(
 
 // Run executes all pipeline nodes in sequence and returns the final result.
 func (e *PipelineExecutor) Run(ctx context.Context) (string, error) {
+	// Runtime sanity check that complements skill_validator: the first node
+	// must be type:agent because $vars.input contains the user's raw
+	// natural-language text. An auto first node would feed that text into a
+	// tool's typed schema and fail.
+	if len(e.ps.Pipeline) > 0 && strings.ToLower(e.ps.Pipeline[0].Type) == "auto" {
+		skillName := ""
+		if e.skill != nil {
+			skillName = e.skill.Name
+		}
+		return "", fmt.Errorf("pipeline %q: first node must be type:agent (auto cannot parse the user's natural-language input)", skillName)
+	}
+
 	// Only the top-level executor manages todo display.
 	if e.nestDepth == 0 {
 		e.updateTodos()
@@ -188,7 +200,7 @@ func (e *PipelineExecutor) Run(ctx context.Context) (string, error) {
 			return fmtVar(v), nil
 		}
 	}
-	return "Pipeline completed successfully.", nil
+	return "", fmt.Errorf("pipeline produced no returnable output — declare `returns:` or have a node output `result`/`output`/`answer` (skill defect)")
 }
 
 // mergeOutputs writes a node's out map into e.vars.
@@ -995,22 +1007,7 @@ func (e *PipelineExecutor) updateTodos() {
 			_ = e.editFn(e.todoMsgID, text)
 		}
 	} else if e.notifyFn != nil {
-		// For channels without edit support, send once when the pipeline finishes
-		// (all nodes in a terminal state) so the user sees the actual outcome, not
-		// the all-pending initial state.
-		if e.todoMsgID == "" {
-			allResolved := true
-			for _, s := range e.nodeStatus {
-				if s == nodeStatusPending || s == nodeStatusRunning {
-					allResolved = false
-					break
-				}
-			}
-			if allResolved {
-				e.notifyFn(text)
-				e.todoMsgID = "notified"
-			}
-		}
+		e.notifyFn(text)
 	}
 }
 

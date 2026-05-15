@@ -268,6 +268,78 @@ func (p *Planner) buildSystemPrompt(guide, pipeline string) string {
 		"multi-node pipeline. Two-step flows like 'search then summarize' or 'read file then process'\n" +
 		"→ use .md, not a pipeline.\n\n")
 
+	sb.WriteString("## Pipeline Hard Rules (apply when writing .yaml)\n\n" +
+		"1. The FIRST pipeline node MUST be `type: agent`. The user's raw natural-language\n" +
+		"   message arrives in `{{input}}` / `$vars.input` — a `type: auto` first node would\n" +
+		"   feed natural language into a tool's typed schema and crash. Use the first agent\n" +
+		"   node to parse/extract structured values for later auto nodes.\n" +
+		"2. The LAST pipeline node MUST produce the variable named in top-level `returns:`\n" +
+		"   (or one of `result`/`output`/`answer`). Its prompt MUST explicitly instruct the\n" +
+		"   sub-agent: \"the user sees ONLY this value — put the COMPLETE final answer here.\"\n" +
+		"   A pipeline that ends without producing a returnable var shows the user nothing.\n" +
+		"3. Every agent node's `prompt:` MUST include:\n" +
+		"   (a) one-sentence goal;\n" +
+		"   (b) brief meaning of each `{{var}}` referenced;\n" +
+		"   (c) the required output format (prose / JSON / markdown);\n" +
+		"   (d) explicit note: \"the user cannot see intermediate steps — put the complete\n" +
+		"       result into node_complete vars.\"\n" +
+		"4. Every agent node's prompt MUST tell the agent what to do on partial failure\n" +
+		"   (empty/error/missing data from previous step) — never assume happy path only.\n\n")
+
+	sb.WriteString("## Tier Selection (the skill's `tier:` field — NOT the current router rating)\n\n" +
+		"`tier:` reflects how complex this skill will be on FUTURE calls, not how the router\n" +
+		"rated the request that prompted creation.\n\n" +
+		"- `base`   — single step, ≤1 tool call, no synthesis (e.g. fetch+summarize, read+reply)\n" +
+		"- `medium` — multiple tools / 2+ sources / moderate reasoning\n" +
+		"- `strong` — cross-system workflows, decision trees, parallel sub-tasks\n\n" +
+		"Examples:\n" +
+		"  Analyze one URL (fetch + summarize) → `tier: base`\n" +
+		"  Compare 3 sources & write report     → `tier: medium`\n" +
+		"  Multi-file refactor across services  → `tier: strong`\n\n" +
+		"Never copy the router's tier; pick based on the skill's intrinsic complexity.\n\n")
+
+	sb.WriteString("## Worked Pipeline Example (study the structure)\n\n" +
+		"```yaml\n" +
+		"name: analyze-link\n" +
+		"description: \"Fetch a URL and summarize it for the user.\"\n" +
+		"tier: base\n" +
+		"auto_generated: true\n" +
+		"success_count: 0\n" +
+		"vars:\n" +
+		"  url: \"\"\n" +
+		"  page: \"\"\n" +
+		"returns: answer\n" +
+		"pipeline:\n" +
+		"  - id: extract\n" +
+		"    type: agent          # rule 1: first node is agent\n" +
+		"    tier: base\n" +
+		"    prompt: |\n" +
+		"      Goal: extract the URL the user wants analyzed.\n" +
+		"      {{input}} is the user's raw message.\n" +
+		"      Output format: call node_complete with vars={\"result\":\"<url>\"}.\n" +
+		"      The user cannot see this node — put the URL string into vars.result.\n" +
+		"      If no URL is present, set vars.result to an empty string.\n" +
+		"    outputs: url\n" +
+		"  - id: fetch\n" +
+		"    type: auto\n" +
+		"    tool: web_fetch\n" +
+		"    inputs: { url: $vars.url }\n" +
+		"    outputs: page\n" +
+		"  - id: report\n" +
+		"    type: agent          # rule 2: last node produces the returnable var\n" +
+		"    tier: base\n" +
+		"    prompt: |\n" +
+		"      Goal: write the user-facing summary.\n" +
+		"      {{page}} is the fetched page text (may be empty if fetch failed).\n" +
+		"      If {{page}} is empty or contains an error message, explain the failure\n" +
+		"      and suggest the user check the URL.\n" +
+		"      Otherwise produce a 3-paragraph summary: topic, key claims, credibility.\n" +
+		"      Output format: prose markdown.\n" +
+		"      IMPORTANT: the user sees ONLY node_complete vars.result — put the\n" +
+		"      COMPLETE summary there.\n" +
+		"    outputs: { answer: result }\n" +
+		"```\n\n")
+
 	sb.WriteString(pipelineSchemaHint)
 	return sb.String()
 }

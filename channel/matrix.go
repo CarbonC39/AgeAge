@@ -423,8 +423,17 @@ func (m *MatrixChannel) sendRaw(roomID, text string) (string, error) {
 
 // SendInThread sends text inside a Matrix thread, splitting if necessary.
 func (m *MatrixChannel) SendInThread(roomID, threadRootID, latestEventID, text string) error {
+	_, err := m.SendMessageInThread(roomID, threadRootID, latestEventID, text)
+	return err
+}
+
+// SendMessageInThread sends text inside a Matrix thread and returns the event
+// ID of the last chunk. Implements the ThreadEditable interface — the returned
+// ID can be passed to EditMessage to update the message in place.
+func (m *MatrixChannel) SendMessageInThread(roomID, threadRootID, latestEventID, text string) (string, error) {
 	chunks := splitMessages(text, 4000)
 	replyTo := latestEventID
+	var lastID string
 	for i, chunk := range chunks {
 		if i > 0 {
 			time.Sleep(300 * time.Millisecond)
@@ -445,14 +454,14 @@ func (m *MatrixChannel) SendInThread(roomID, threadRootID, latestEventID, text s
 		}
 		eventID, err := m.sendEvent(roomID, "m.room.message", content)
 		if err != nil {
-			return err
+			return lastID, err
 		}
-		// Each subsequent chunk replies to the previous one to maintain order.
 		if eventID != "" {
 			replyTo = eventID
+			lastID = eventID
 		}
 	}
-	return nil
+	return lastID, nil
 }
 
 // EditMessage replaces the content of a previously sent Matrix event using m.replace.

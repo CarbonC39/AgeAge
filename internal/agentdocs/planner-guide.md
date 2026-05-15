@@ -11,6 +11,47 @@ can infer the intended workflow from what was already discussed.
 
 ---
 
+## Hard Rules (apply to pipelines)
+
+1. **First node MUST be `type: agent`.** The user's raw natural-language message arrives
+   in `{{input}}` / `$vars.input`. A `type: auto` first node feeds that text into a tool's
+   typed schema and crashes immediately. Use the first agent node to parse/extract the
+   structured fields downstream auto nodes need.
+
+2. **Last node MUST produce the returnable variable.** Either the variable named in
+   top-level `returns:`, or one of `result` / `output` / `answer`. Its prompt MUST tell
+   the sub-agent explicitly: "the user sees ONLY this value — put the COMPLETE final
+   answer here." A pipeline that ends without producing a returnable variable shows the
+   user nothing.
+
+3. **Every agent node's `prompt:` must include:**
+   - one-sentence goal
+   - brief description of each `{{var}}` referenced
+   - required output format (prose / JSON / markdown)
+   - explicit note: "the user cannot see intermediate steps — put the complete result
+     into node_complete vars."
+
+4. **Every agent node's prompt must specify fallback behavior** when an upstream step
+   produced empty / error / missing data — do not assume the happy path.
+
+---
+
+## Tier Selection (the skill's `tier:` field)
+
+This reflects how complex the skill will be on FUTURE calls — NOT the router's tier
+rating for the current request. Never copy the router's tier into the new skill.
+
+- `base`   — single step, ≤1 tool call, no synthesis (fetch+summarize, read+reply)
+- `medium` — multiple tools / 2+ sources / moderate reasoning
+- `strong` — cross-system workflows, decision trees, parallel sub-tasks
+
+Examples:
+- Analyze one URL (fetch + summarize) → `tier: base`
+- Compare 3 sources, write report      → `tier: medium`
+- Multi-file refactor across services  → `tier: strong`
+
+---
+
 ## Agent Skill (.md)
 
 ```markdown
@@ -40,6 +81,8 @@ When done, call finish_task(status="success", summary=<absolute path of the file
 
 ## Pipeline Skill (.yaml)
 
+Minimal shape:
+
 ```yaml
 name: My Pipeline
 description: What this pipeline does.
@@ -53,6 +96,7 @@ vars:
 
 pipeline:
   - id: step1
+    type: agent      # first node MUST be agent (see Hard Rule 1)
     tier: medium
     prompt: |
       Do something with {{input}}.
@@ -60,10 +104,61 @@ pipeline:
     outputs: result        # shorthand: stores node key "result" → $vars.result
 
   - id: step2
+    type: agent
     tier: medium
     prompt: |
-      Now process: {{result}}
+      Now process: {{result}}.
+      IMPORTANT: the user sees ONLY node_complete vars.result — put the complete
+      final answer there.
     outputs: answer
+```
+
+### Worked Example — fetch + summarize
+
+Study how it complies with the Hard Rules: first node is `agent` (parses the URL out
+of natural language); last node produces the returnable variable; every prompt names
+its variables, output format, fallback behavior, and the "user can't see intermediate"
+note.
+
+```yaml
+name: analyze-link
+description: "Fetch a URL and summarize it for the user."
+tier: base
+auto_generated: true
+success_count: 0
+vars:
+  url: ""
+  page: ""
+returns: answer
+pipeline:
+  - id: extract
+    type: agent
+    tier: base
+    prompt: |
+      Goal: extract the URL the user wants analyzed.
+      {{input}} is the user's raw message (natural language).
+      Output: call node_complete with vars={"result": "<url-string>"}.
+      The user cannot see this node — put the URL into vars.result.
+      If no URL is present, set vars.result to an empty string.
+    outputs: url
+  - id: fetch
+    type: auto
+    tool: web_fetch
+    inputs: { url: $vars.url }
+    outputs: page
+  - id: report
+    type: agent
+    tier: base
+    prompt: |
+      Goal: write the user-facing summary.
+      {{page}} is the fetched page text (may be empty if fetch failed).
+      If {{page}} is empty or contains an error message, explain the failure and
+      suggest the user verify the URL. Otherwise produce a 3-paragraph summary:
+      topic, key claims, source credibility.
+      Output format: prose markdown.
+      IMPORTANT: the user sees ONLY node_complete vars.result — put the COMPLETE
+      summary there.
+    outputs: { answer: result }
 ```
 
 **Rules:**

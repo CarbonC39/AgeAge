@@ -5,6 +5,27 @@ sub-agents; data flows only through a shared `vars` map.
 
 ---
 
+## Hard Rules (enforced by the validator)
+
+1. **First node must be `type: agent`.** The user's raw natural-language input arrives
+   in `$vars.input` / `{{input}}`. A first node of `type: auto` would feed natural text
+   into a tool's typed schema and fail at the first step. Use the first agent node to
+   extract structured fields for downstream auto nodes.
+
+2. **The pipeline must produce a returnable variable.** Either declare top-level
+   `returns: <name>` where some node outputs `<name>`, OR have at least one node output
+   `result` / `output` / `answer`. Otherwise the user receives no content.
+
+3. **Each agent node's prompt should state:** goal, meaning of each `{{var}}`, output
+   format, fallback behavior on empty/error upstream, and "the user cannot see
+   intermediate steps."
+
+4. **`tier:` reflects the skill's intrinsic complexity**, not the current router rating.
+   Single fetch+summarize → `base`. Multi-source synthesis → `medium`. Cross-system
+   workflows → `strong`.
+
+---
+
 ## File Format
 
 Pipeline skills are **standalone `.yaml` files** in `{ageage-dir}/skills/`.

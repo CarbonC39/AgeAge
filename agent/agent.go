@@ -220,6 +220,7 @@ func (a *Agent) buildSystemPrompt(matchedSkill *skills.Skill) string {
 - If tool results contain the answer, rewrite it in a clear, organized format.
 - Include specific data, names, numbers, and facts from tool results in your final answer.
 - If information is incomplete, state what you found and what is missing.
+- The finish_task summary IS the user's entire view of your response. It must be a complete, self-contained reply — not a status message, not a description of what you did.
 
 ## What the User Can and Cannot See
 
@@ -489,10 +490,20 @@ func (a *Agent) RunWithParts(ctx context.Context, userInput string, parts []llm.
 				}
 				a.debugLog("Planner", "created skill %q", skill.Name)
 				if a.Callbacks.Notify != nil {
-					a.Callbacks.Notify(fmt.Sprintf("🔧 Created reusable skill **%s** for this workflow.", skill.CommandName()))
+					desc := skill.Description
+					if desc == "" {
+						desc = "(no description)"
+					}
+					a.Callbacks.Notify(fmt.Sprintf(
+						"🔧 Created skill **%s** — %s\nInvoke later with `/%s` or describe a matching task.",
+						skill.CommandName(), desc, skill.CommandName()))
 				}
 			} else if err != nil {
 				a.debugLog("Planner", "skill creation failed (%s) — proceeding without skill", err)
+				if a.Callbacks.Notify != nil {
+					a.Callbacks.Notify(fmt.Sprintf(
+						"⚠️ Could not create a reusable skill for this task: %s — running it as a one-off.", err))
+				}
 			}
 		}
 	}
@@ -817,7 +828,10 @@ func (a *Agent) runLoop(ctx context.Context, streamCb llm.StreamCallback, toolDe
 				a.hintOnNextCall = "[Framework] You replied with text but did not call " +
 					hintFinishName + " or use any tool. " +
 					"If this is your final answer, call " + hintFinishName +
-					" and put your ACTUAL reply text in the summary field (not a description of what you said). " +
+					" and put your ACTUAL reply text in the summary field. " +
+					"The summary MUST contain the COMPLETE answer with all data and content. " +
+					"A summary saying only 'completed' / 'task done' is NOT acceptable " +
+					"— the user needs the actual information. " +
 					"If the task requires tool use, invoke the appropriate tools first."
 				continue
 			}

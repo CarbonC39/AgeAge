@@ -336,6 +336,7 @@ func runInit(cmd *cobra.Command, args []string) error {
 
 - Use tools to gather information and perform actions.
 - Call finish_task(status="success", summary=...) when done with a complete answer.
+- The summary field IS your only message to the user. It must contain the COMPLETE answer with all relevant data, files, and details. Never use status-only phrases like "completed", "已 完成", or "task done" as the summary. If the user asked for data, put the data in the summary.
 - Use status="failure" for early exit (missing information, unrecoverable error).
 - If you used update_todos, all todos must be done before calling status="success".
 - Think step by step for complex tasks; use delegate or escalate for heavy subtasks.
@@ -830,6 +831,12 @@ func startChannels(factory *agent.AgentFactory) (*channel.Manager, int) {
 		if len(parts) == 2 {
 			channelType, channelID = parts[0], parts[1]
 		}
+		// Extract threadID (if any) so TodoSend / Notify can post inside the
+		// originating thread instead of at the room's top level.
+		threadID := ""
+		if idx := strings.LastIndex(chatKey, ":t:"); idx >= 0 {
+			threadID = chatKey[idx+3:]
+		}
 
 		ag := factory.CreateAgent(confirmMgr, "")
 		ag.SessionDir = sm.SessionDir(sessionID)
@@ -837,8 +844,18 @@ func startChannels(factory *agent.AgentFactory) (*channel.Manager, int) {
 		if ch, ok := channelsByType[channelType]; ok {
 			if editable, ok := ch.(channel.Editable); ok {
 				cID := channelID
+				tID := threadID
+				threadEditable, hasThreadEditable := ch.(channel.ThreadEditable)
 				ag.Callbacks.TodoSend = func(text string) string {
-					msgID, err := editable.SendMessage(cID, text)
+					var (
+						msgID string
+						err   error
+					)
+					if tID != "" && hasThreadEditable {
+						msgID, err = threadEditable.SendMessageInThread(cID, tID, tID, text)
+					} else {
+						msgID, err = editable.SendMessage(cID, text)
+					}
 					if err != nil {
 						fmt.Printf("[todo] send error: %s\n", err)
 					}
@@ -850,9 +867,19 @@ func startChannels(factory *agent.AgentFactory) (*channel.Manager, int) {
 			}
 		}
 		ag.Callbacks.Notify = func(message string) {
-			if managerPtr != nil && channelType != "" {
-				managerPtr.Send(channelType, channelID, message)
+			if managerPtr == nil || channelType == "" {
+				return
 			}
+			// Inside a thread, keep notifications anchored to the thread.
+			if threadID != "" {
+				if ch, ok := channelsByType[channelType]; ok {
+					if te, ok := ch.(channel.ThreadEditable); ok {
+						_, _ = te.SendMessageInThread(channelID, threadID, threadID, message)
+						return
+					}
+				}
+			}
+			managerPtr.Send(channelType, channelID, message)
 		}
 		ag.Callbacks.AskUser = func(question string, options []string) {
 			if managerPtr != nil && channelType != "" {
@@ -1378,6 +1405,8 @@ func startChannels(factory *agent.AgentFactory) (*channel.Manager, int) {
 		if msg.Respond != nil {
 			savedNotify := ag.Callbacks.Notify
 			savedAskUser := ag.Callbacks.AskUser
+			savedTodoSend := ag.Callbacks.TodoSend
+			savedTodoEdit := ag.Callbacks.TodoEdit
 			respondFn := msg.Respond
 			ag.Callbacks.Notify = func(message string) { _ = respondFn(message) }
 			ag.Callbacks.AskUser = func(question string, options []string) {
@@ -1389,9 +1418,13 @@ func startChannels(factory *agent.AgentFactory) (*channel.Manager, int) {
 				}
 				_ = respondFn(sb.String())
 			}
+			ag.Callbacks.TodoSend = nil
+			ag.Callbacks.TodoEdit = nil
 			defer func() {
 				ag.Callbacks.Notify = savedNotify
 				ag.Callbacks.AskUser = savedAskUser
+				ag.Callbacks.TodoSend = savedTodoSend
+				ag.Callbacks.TodoEdit = savedTodoEdit
 			}()
 		}
 
@@ -2201,9 +2234,6 @@ func runCLI(cmd *cobra.Command, args []string) error {
 					result, err := ag.RunWithParts(context.Background(), text, ps, thinkFilter.Wrap())
 					thinkFilter.Flush()
 					spinner.Stop()
-					if buf.Len() > 0 {
-						result = buf.String()
-					}
 					ch <- agentResult{result, err}
 				}(cleanText, parts, agentCh)
 			}

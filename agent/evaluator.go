@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"ageage/config"
@@ -73,7 +74,14 @@ func (e *Evaluator) Run(ctx context.Context, snap EvalSnapshot) {
 
 	userMsg := e.buildUserMessage(snap)
 	result, err := ag.Run(ctx, userMsg, nil)
-	if err != nil || ctx.Err() != nil {
+	if ctx.Err() != nil {
+		return
+	}
+	if err != nil {
+		fmt.Printf("[Evaluator] run failed for skill %s: %s\n", snap.Skill.Name, err)
+		if e.notifyFn != nil {
+			e.notifyFn(fmt.Sprintf("⚠️ Skill **%s** evaluation crashed: %s", snap.Skill.CommandName(), err))
+		}
 		return
 	}
 
@@ -96,6 +104,15 @@ func formatEvalMessage(verdict string, fixed bool, summary, report string) strin
 	switch {
 	case verdict == "fail" && report != "":
 		return "❌ **Evaluator:** " + report
+	case verdict == "unknown":
+		preview := report
+		if preview == "" {
+			preview = summary
+		}
+		if preview == "" {
+			preview = "(no parseable verdict)"
+		}
+		return "⚠️ **Evaluator returned malformed verdict:** " + preview
 	case fixed:
 		return "🔧 **Evaluator improved skill:** " + summary
 	}
@@ -145,12 +162,7 @@ func (e *Evaluator) systemPrompt(skillFilePath string) string {
 		fileTypeHint = "This is an AGENT (.md) skill. It must remain an agent skill with YAML frontmatter."
 	}
 
-	return fmt.Sprintf(`You are a skill quality evaluator AND optimizer. Your goals, in order:
-
-0. PRESERVE the skill's original scope and generality. The skill description tells you its intended purpose — the skill must remain usable for ALL future tasks matching that description. Never rewrite it to solve only the specific request that triggered this evaluation. If the user asked to search for a particular topic and the pipeline failed, fix the SEARCH MECHANISM — do NOT hardcode the pipeline to always search that topic.
-1. Fix deficiencies: wrong/missing tools in required_tools, broken prompt instructions, bad output handling.
-2. Optimize workflow: reduce unnecessary agent turns, tighten tool lists, clarify node_complete expectations, simplify over-complex pipelines.
-3. Report blockers the user must fix themselves (missing binary, missing API key, etc.).
+	return fmt.Sprintf(`You are a skill quality evaluator AND optimizer.
 
 Skill file: %s
 
@@ -158,16 +170,73 @@ Skill file: %s
 
 Use file_read to inspect the skill file. Use skill_patch to rewrite the file when fixing or optimizing.
 
-When done, call finish_task with a JSON summary:
-  {"verdict":"pass","fixed":false,"summary":"One sentence describing what was found.","report_to_user":""}
-  {"verdict":"pass","fixed":true,"summary":"One sentence describing what was improved.","report_to_user":""}
-  {"verdict":"fail","fixed":false,"summary":"One sentence.","report_to_user":"<explanation for the user>"}
+## Priority 0 — PRESERVE GENERALITY (highest)
 
-Rules:
+The skill's description is its general contract. It must keep working for ALL future
+inputs that match the description, not just the one input that triggered this review.
+
+NEVER bake the specific user input, URL, topic, file path, or example into the skill's
+prompts, tools, or instructions. The execution you are reviewing is ONE data point —
+treat it like a test case, not like a specification.
+
+❌ BAD (narrowing — do not do this):
+   Original prompt:  "Read {{input}} and summarize its main topic"
+   Bad patched:      "Read the Wikipedia article about Go and summarize it for the user.
+                      The user wants Go's history and syntax."
+
+✅ GOOD (generalizing — fix the mechanism, not the example):
+   Original prompt:  "Read {{input}} and summarize its main topic"
+   Good patched:     "Read the URL given in {{input}}. If the page returns an error or
+                      is empty, explain the failure and suggest a retry or alternative.
+                      Otherwise write a 3-paragraph summary covering: main topic,
+                      key claims, source credibility."
+
+Self-check before patching: substitute {{input}} with a completely different but
+description-matching value. Does the patched prompt still make sense? If not, you are
+over-specializing — revert.
+
+## Priority 1 — DIAGNOSTIC CHECKLIST
+
+Walk through these in order. Most evaluations need to fix item (a) or (b); do not jump
+to cosmetic tweaks before checking these:
+
+  (a) Output quality. Did the last node produce a complete, user-useful result?
+      If output was empty / just "done" / wrong format (JSON when prose was needed) /
+      missing key content — this is the #1 thing to fix. Look at the LAST agent node's
+      prompt: does it explicitly say "put the COMPLETE final answer into node_complete
+      vars.<key>" and "the user sees ONLY this"? If not, add it.
+  (b) Fault tolerance. When a step fails (network error, empty content, refusal, missing
+      data) does the downstream prompt know how to handle it, or does the pipeline just
+      crash / produce garbage? Add explicit "if X is empty/missing, do Y" instructions.
+  (c) Prompt clarity. Each agent node's prompt MUST state: goal, meaning of each {{var}},
+      output format, and "user cannot see intermediate work."
+  (d) Tool fit. Is required_tools (or node-level tools:) minimal and sufficient?
+  (e) Variable plumbing. Every referenced {{var}} produced by a prior node? outputs
+      key names correct?
+  (f) Tier appropriateness. Single fetch+summarize → base. Multi-tool reasoning →
+      medium. Cross-system workflows → strong. Don't inflate.
+  (g) Structural sanity. First node type:agent? Last node produces returns: target
+      (or result/output/answer)?
+
+## Priority 2 — DECIDE
+
+After the checklist:
+- Issues exist AND fixable in the skill → call skill_patch with the corrected file,
+  then finish_task with verdict="pass", fixed=true, summary="<what you changed and why>".
+- Issues exist but they are environment problems (missing API key, broken external
+  service, missing binary, user permission) → finish_task with verdict="fail",
+  fixed=false, report_to_user="<plain-language explanation for the user>".
+- No real issues → finish_task with verdict="pass", fixed=false, summary="<one sentence>".
+
+## finish_task format
+
+  {"verdict":"pass","fixed":false,"summary":"One sentence.","report_to_user":""}
+  {"verdict":"pass","fixed":true,"summary":"One sentence about the fix.","report_to_user":""}
+  {"verdict":"fail","fixed":false,"summary":"One sentence.","report_to_user":"<for user>"}
+
+Other rules:
 - Always populate "summary" with one sentence describing what you found or did.
 - Do NOT patch for style preferences or correct behavior the user disliked.
-- Do NOT patch for environment-specific problems beyond the skill's control.
-- NEVER narrow the skill's scope or purpose to match only the task that triggered this evaluation. A general-purpose search pipeline must remain general-purpose.
 - Preserve auto_generated: true and reset success_count: 0 when patching.
 
 %s`, skillFilePath, fileTypeHint, pipelineSchemaHint)
@@ -175,8 +244,13 @@ Rules:
 
 func (e *Evaluator) buildUserMessage(snap EvalSnapshot) string {
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "Skill description: %s\n\n", snap.SkillDescription)
-	fmt.Fprintf(&sb, "User request: %s\n\nAgent output:\n%s\n", snap.UserInput, snap.AgentOutput)
+	sb.WriteString("# Skill Under Review — the GENERAL contract (preserve this)\n\n")
+	fmt.Fprintf(&sb, "Description: %s\n\n", snap.SkillDescription)
+	sb.WriteString("# This Specific Execution — ONE data point (do NOT bake into the skill)\n\n")
+	sb.WriteString("Treat the inputs below as a test case. Fix the mechanism so any\n")
+	sb.WriteString("description-matching input would work — never hardcode this example.\n\n")
+	fmt.Fprintf(&sb, "User input (single example): %s\n\n", snap.UserInput)
+	fmt.Fprintf(&sb, "Agent output:\n%s\n", snap.AgentOutput)
 	if snap.OriginalError != "" {
 		fmt.Fprintf(&sb, "\nOriginal error: %s\n", snap.OriginalError)
 	}
@@ -184,7 +258,7 @@ func (e *Evaluator) buildUserMessage(snap EvalSnapshot) string {
 		fmt.Fprintf(&sb, "\n%s\n", snap.PipelineContext)
 	}
 	if len(snap.ToolHistory) > 0 {
-		sb.WriteString("\nTool calls:\n")
+		sb.WriteString("\nTool calls (this run only):\n")
 		for i, tr := range snap.ToolHistory {
 			args := tr.Args
 			if len(args) > 1000 {
@@ -197,14 +271,24 @@ func (e *Evaluator) buildUserMessage(snap EvalSnapshot) string {
 			fmt.Fprintf(&sb, "%d. %s(%s) → %s\n", i+1, tr.Name, args, result)
 		}
 	}
-	sb.WriteString("\nEvaluate this execution and call finish_task with your verdict.")
+	sb.WriteString("\n# Your Task\n\n")
+	sb.WriteString("Walk the diagnostic checklist in the system prompt. If you patch, patch\n")
+	sb.WriteString("for ALL future inputs matching the description — not for this one.\n")
+	sb.WriteString("Then call finish_task with the JSON verdict.")
 	return sb.String()
 }
 
+// evalFieldRE extracts a string-valued field from a possibly-malformed JSON
+// blob. Captures only single-line content (no escaped quote handling) which is
+// the common case for evaluator output.
+var evalFieldRE = regexp.MustCompile(`"(verdict|report_to_user|summary)"\s*:\s*"([^"]*)"`)
+
 // parseEvalVerdict extracts verdict fields from the evaluator agent's summary.
-// The summary is expected to be a JSON object. Falls back to text-pattern detection
-// when JSON parsing fails (LLMs frequently emit slightly malformed JSON with embedded
-// control characters or stray markdown).
+// The summary is expected to be a JSON object. Falls back to regex extraction
+// when JSON parsing fails (LLMs frequently emit slightly malformed JSON with
+// embedded control characters or stray markdown). When even the regex finds
+// nothing, returns verdict="unknown" with the raw summary as report so the
+// user is notified instead of silently swallowing the result.
 func parseEvalVerdict(summary string) (verdict string, fixed bool, reportToUser string, evalSummary string) {
 	// Try to extract JSON from the summary (agent may include surrounding text).
 	jsonText := summary
@@ -220,22 +304,27 @@ func parseEvalVerdict(summary string) (verdict string, fixed bool, reportToUser 
 		ReportToUser string `json:"report_to_user"`
 		Summary      string `json:"summary"`
 	}
-	if err := jsonutil.ParseToolArgs(jsonText, &v); err == nil {
+	if err := jsonutil.ParseToolArgs(jsonText, &v); err == nil && v.Verdict != "" {
 		return v.Verdict, v.Fixed, v.ReportToUser, v.Summary
 	}
 
-	// JSON parsing failed. Fall back to keyword detection so the user is not pestered
-	// with "format invalid" messages and the success counter still progresses sensibly.
-	low := strings.ToLower(summary)
-	switch {
-	case strings.Contains(low, `"verdict":"fail"`) || strings.Contains(low, `"verdict": "fail"`):
-		return "fail", false, "", ""
-	case strings.Contains(low, `"verdict":"pass"`) || strings.Contains(low, `"verdict": "pass"`):
-		return "pass", false, "", ""
+	// JSON parsing failed or yielded no verdict. Try to pull the named fields
+	// out with a regex so the user still gets the substance of the message.
+	fields := map[string]string{}
+	for _, m := range evalFieldRE.FindAllStringSubmatch(summary, -1) {
+		fields[m[1]] = m[2]
 	}
-	// Unrecognised — return empty values; Run() will skip both the count update
-	// and the user notification.
-	return "", false, "", ""
+	if fields["verdict"] != "" {
+		return fields["verdict"], false, fields["report_to_user"], fields["summary"]
+	}
+
+	// Last resort: surface the raw text under verdict="unknown" so the user
+	// learns the evaluator returned a malformed verdict instead of nothing.
+	preview := strings.TrimSpace(summary)
+	if len(preview) > 300 {
+		preview = preview[:300] + "…"
+	}
+	return "unknown", false, preview, ""
 }
 
 // ── skillPatchTool ─────────────────────────────────────────────────────────────

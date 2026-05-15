@@ -59,6 +59,20 @@ type Editable interface {
 	EditMessage(channelID, messageID, text string) error
 }
 
+// ThreadEditable is an optional interface for channels that support sending
+// editable messages inside a thread. Channels that implement this allow todo
+// notifications triggered inside a thread to remain anchored to that thread
+// (instead of being posted at the room's top level) while still being edited
+// in place on subsequent updates.
+type ThreadEditable interface {
+	// SendMessageInThread sends a message inside a thread and returns the
+	// platform-native message ID so the caller can edit it later via
+	// Editable.EditMessage. threadRootID is the thread's root event;
+	// latestEventID may be used by the channel implementation as the
+	// in-reply-to anchor for ordering.
+	SendMessageInThread(channelID, threadRootID, latestEventID, text string) (messageID string, err error)
+}
+
 // InteractiveChannel is an optional interface for channels that support
 // rendering multiple-choice options as interactive elements (e.g. Telegram
 // inline keyboard buttons). Channels that don't implement this receive a

@@ -85,3 +85,9 @@ func (t *TmpManager) ClearAll() {
 	}
 	t.files = nil
 }
+
+// StagingDir returns the directory where copy-on-attach file copies are stored.
+// Callers must ensure the directory exists before writing to it.
+func (t *TmpManager) StagingDir() string {
+	return filepath.Join(t.dir, "staged")
+}

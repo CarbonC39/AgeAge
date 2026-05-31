@@ -17,13 +17,20 @@ jobs:
         with:
           go-version: stable
 
-      - name: Build binary
-        run: go build -o ageage .
-
-      - name: Stage release artifacts
+      - name: Build binaries (cross-platform)
+        env:
+          CGO_ENABLED: "0"
         run: |
           mkdir -p dist
-          mv ageage dist/
+          targets="linux/amd64 linux/arm64 windows/amd64 darwin/amd64 darwin/arm64"
+          for t in $targets; do
+            export GOOS=${t%/*} GOARCH=${t#*/}
+            out="dist/ageage-${GOOS}-${GOARCH}"
+            [ "$GOOS" = "windows" ] && out="${out}.exe"
+            echo "Building $out"
+            go build -trimpath -ldflags "-s -w" -o "$out" .
+          done
+          ls -lh dist
 
       - name: Publish to "latest" release
         uses: actions/forgejo-release@v2

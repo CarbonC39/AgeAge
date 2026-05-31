@@ -1,0 +1,39 @@
+name: Build and Release
+
+on:
+  push:
+    branches:
+      - public
+
+jobs:
+  release:
+    runs-on: codeberg-small
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Build binary
+        run: go build -o ageage .
+
+      - name: Stage release artifacts
+        run: |
+          mkdir -p dist
+          mv ageage dist/
+
+      - name: Publish to "latest" release
+        uses: actions/forgejo-release@v2
+        with:
+          direction: upload
+          url: https://codeberg.org
+          repo: ${{ github.repository }}
+          tag: latest
+          sha: ${{ github.sha }}
+          release-dir: dist
+          release-notes: "Rolling build from ${{ github.sha }}"
+          override: true
+          token: ${{ github.token }}

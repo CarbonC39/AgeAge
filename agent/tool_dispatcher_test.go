@@ -4,12 +4,17 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"ageage/config"
 	"ageage/creds"
+	"ageage/llm"
 	"ageage/tools"
 )
 
@@ -127,5 +132,57 @@ func TestCredentialManagerTestIsolation(t *testing.T) {
 	manager := newDispatcherCredManager(t, map[string]string{"x": "y"})
 	if _, err := os.Stat(manager.Path()); err != nil {
 		t.Fatalf("test credential store not created: %v", err)
+	}
+}
+
+func TestAgentRedactsCredentialSubstitutedIntoFinishSummary(t *testing.T) {
+	secret := "final-response-secret"
+	manager := newDispatcherCredManager(t, map[string]string{"token": secret})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{
+			"choices":[{
+				"index":0,
+				"message":{
+					"role":"assistant",
+					"tool_calls":[{
+						"id":"call-finish",
+						"type":"function",
+						"function":{
+							"name":"finish_task",
+							"arguments":"{\"status\":\"success\",\"summary\":\"answer {{cred:token}}\"}"
+						}
+					}]
+				},
+				"finish_reason":"tool_calls"
+			}]
+		}`)
+	}))
+	defer upstream.Close()
+
+	cfg := config.DefaultConfig()
+	cfg.Workspace = t.TempDir()
+	cfg.WorkDir = cfg.Workspace
+	client := llm.NewClient("", upstream.URL, "test-model", false, 0)
+	registry := tools.NewRegistry()
+	finishTool := &tools.FinishTool{}
+	registry.Register(finishTool)
+	ag := NewAgent(cfg, client, registry, finishTool, nil, false)
+	ag.CredMgr = manager
+	ag.Mode.InjectContext = false
+
+	result, err := ag.Run(context.Background(), "hello", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(result, secret) || !strings.Contains(result, "[REDACTED]") {
+		t.Fatalf("final result was not redacted: %q", result)
+	}
+	if strings.Contains(finishTool.Summary, secret) {
+		t.Fatalf("finish tool retained secret: %q", finishTool.Summary)
+	}
+	messages := ag.Messages()
+	if strings.Contains(fmt.Sprint(messages), secret) {
+		t.Fatalf("conversation retained secret: %#v", messages)
 	}
 }

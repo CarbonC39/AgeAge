@@ -882,15 +882,20 @@ func (a *Agent) runLoop(ctx context.Context, streamCb llm.StreamCallback, toolDe
 		}
 
 		if a.finishTool.Finished {
+			finalSummary := a.finishTool.Summary
+			if a.CredMgr != nil {
+				finalSummary = a.CredMgr.Scrub(finalSummary)
+			}
+			a.finishTool.Summary = finalSummary
 			a.conv.Append(llm.Message{
 				Role:    "assistant",
-				Content: a.finishTool.Summary,
+				Content: finalSummary,
 			})
 			a.trySummarize(ctx)
 			if a.todoStore != nil && a.todoStore.IsComplete() {
 				a.todoStore.Clear()
 			}
-			return a.finishTool.Summary, nil
+			return finalSummary, nil
 		}
 
 		if ctx.Err() != nil {

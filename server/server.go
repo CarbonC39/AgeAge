@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"ageage/agent"
@@ -262,11 +263,13 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request, ag *agent.
 	// chunks carry content, final chunk carries finish_reason.
 	sendChunk(map[string]any{"role": "assistant", "content": ""}, nil)
 
+	var streamedContent strings.Builder
 	callback := func(token string) {
+		streamedContent.WriteString(token)
 		sendChunk(map[string]any{"content": token}, nil)
 	}
 
-	_, err := ag.RunWithParts(r.Context(), userInput, userParts, callback)
+	result, err := ag.RunWithParts(r.Context(), userInput, userParts, callback)
 
 	if err != nil {
 		// Send error as a final data chunk before DONE.
@@ -282,6 +285,13 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request, ag *agent.
 		fmt.Fprintf(w, "data: %s\n\n", data)
 		flusher.Flush()
 	} else {
+		// finish_task returns the user-facing answer as the Run result, but tool
+		// arguments are not content tokens and therefore never reach callback.
+		// Pipeline runs and bare-text fallbacks do stream their result, so only
+		// append it when it is not already the suffix of streamed content.
+		if result != "" && !strings.HasSuffix(streamedContent.String(), result) {
+			sendChunk(map[string]any{"content": result}, nil)
+		}
 		// Final chunk: empty delta + finish_reason.
 		sendChunk(map[string]any{}, "stop")
 	}

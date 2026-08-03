@@ -1,6 +1,7 @@
 package skills
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -253,7 +254,9 @@ func parsePipelineFile(path string) (*Skill, error) {
 		Vars          map[string]interface{} `yaml:"vars"`
 		Pipeline      []PipelineNode         `yaml:"pipeline"`
 	}
-	if err := yaml.Unmarshal(data, &raw); err != nil {
+	decoder := yaml.NewDecoder(bytes.NewReader(data))
+	decoder.KnownFields(true)
+	if err := decoder.Decode(&raw); err != nil {
 		return nil, fmt.Errorf("invalid pipeline YAML: %w", err)
 	}
 
@@ -278,18 +281,6 @@ func parsePipelineFile(path string) (*Skill, error) {
 
 	if raw.Vars == nil {
 		raw.Vars = make(map[string]interface{})
-	}
-	// Normalize primitive scalars to strings so downstream interpolation is type-safe.
-	// Maps and slices are left as-is for JSON encoding by fmtVar.
-	for k, v := range raw.Vars {
-		switch val := v.(type) {
-		case nil:
-			raw.Vars[k] = ""
-		case string:
-			// already correct
-		case int, int64, float64, bool:
-			raw.Vars[k] = fmt.Sprintf("%v", val)
-		}
 	}
 	// Ensure $vars.input always exists (populated from the user's message).
 	if _, ok := raw.Vars["input"]; !ok {

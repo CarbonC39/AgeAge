@@ -79,8 +79,7 @@ func NewPipelineExecutor(
 	sharedReg *tools.Registry,
 ) *PipelineExecutor {
 	// Initialise vars from declared defaults, then overlay with the user's input.
-	// Explicit loop instead of maps.Copy because ps.Vars is map[string]string
-	// while vars is map[string]interface{} — the value types differ.
+	// Copy defaults so each run gets an independent top-level variable map.
 	vars := make(map[string]interface{}, len(ps.Vars)+1)
 	for k, v := range ps.Vars {
 		vars[k] = v

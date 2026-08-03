@@ -23,7 +23,7 @@ No node can see another node's internal reasoning or history. They can only see 
 
 ## File format
 
-Pipeline skills are standalone `.yaml` files in the `skills/` directory. They are **not** Markdown files with frontmatter — the entire file is YAML.
+Pipeline skills are standalone `.yaml` files in the `skills/` directory. They are **not** Markdown files with frontmatter — the entire file is YAML. Unknown top-level or node fields are rejected, so misspellings fail at load time instead of being silently ignored.
 
 > **Hot reload**: changes to `.yaml` (and `.yml`) pipeline files are detected automatically alongside `.md` skill changes. No restart required.
 
@@ -79,16 +79,17 @@ Declare variables and their defaults in the top-level `vars` block:
 
 ```yaml
 vars:
-  urls: []       # an empty list
-  topic: ""      # an empty string
-  max_results: "5" # primitive defaults are currently normalized to strings
+  urls: []         # list
+  topic: ""        # string
+  max_results: 5   # number
+  enabled: true    # boolean
 ```
 
 If omitted from `vars`, a variable is `nil` until written by a node.
 
-Top-level primitive defaults (`number` and `boolean`) are currently normalized
-to strings when the pipeline is loaded. Maps and lists retain their structure.
-Literal values written directly in a node's `inputs` retain their YAML type.
+Variable defaults and literal values in `inputs` retain their YAML types. Exact
+references such as `$vars.max_results` therefore pass a number to an `auto`
+tool. Prompt interpolation converts values to text; maps and lists use JSON.
 
 ### Reference syntax
 

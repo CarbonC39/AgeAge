@@ -29,6 +29,7 @@ sub-agents; data flows only through a shared `vars` map.
 ## File Format
 
 Pipeline skills are **standalone `.yaml` files** in `{ageage-dir}/skills/`.
+Unknown top-level or node fields are rejected at load time.
 
 ```yaml
 name: my-pipeline
@@ -64,6 +65,10 @@ pipeline:
 
 All old forms (`$vars.name`, `{{$vars.name}}`) still work — the new shorthands
 are optional but recommended for readability.
+
+Defaults in `vars` and literals in `inputs` retain their YAML types. Exact
+variable references pass those typed values to `auto` tools; interpolation in
+an agent prompt converts them to text (maps and lists are rendered as JSON).
 
 ---
 

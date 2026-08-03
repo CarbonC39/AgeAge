@@ -42,7 +42,7 @@ func TestOutputsMapAcceptsMapListAndScalar(t *testing.T) {
 	}
 }
 
-func TestLoadPipelineNormalizesDefaultsAndPreservesInputLiterals(t *testing.T) {
+func TestLoadPipelinePreservesDefaultsAndInputLiterals(t *testing.T) {
 	path := writeSkillTestFile(t, "pipeline.yaml", `
 name: sample
 description: sample pipeline
@@ -67,7 +67,7 @@ pipeline:
 	if !skill.IsPipeline() || skill.Pipeline.Returns != "answer" {
 		t.Fatalf("pipeline metadata = %#v", skill.Pipeline)
 	}
-	if skill.Pipeline.Vars["count"] != "5" || skill.Pipeline.Vars["enabled"] != "true" {
+	if skill.Pipeline.Vars["count"] != 5 || skill.Pipeline.Vars["enabled"] != true {
 		t.Fatalf("primitive defaults = %#v", skill.Pipeline.Vars)
 	}
 	if _, ok := skill.Pipeline.Vars["items"].([]interface{}); !ok {
@@ -79,6 +79,51 @@ pipeline:
 	}
 	if node.Outputs["answer"] != "result" {
 		t.Fatalf("scalar output = %#v", node.Outputs)
+	}
+}
+
+func TestLoadPipelineRejectsUnknownFields(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			name: "top level",
+			body: `
+name: typo
+description: typo
+tier: base
+retuns: answer
+pipeline:
+  - id: prepare
+    prompt: prepare
+    outputs: answer
+`,
+			want: "field retuns not found",
+		},
+		{
+			name: "node",
+			body: `
+name: typo
+description: typo
+tier: base
+pipeline:
+  - id: prepare
+    promtp: prepare
+    outputs: answer
+`,
+			want: "field promtp not found",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := writeSkillTestFile(t, "unknown.yaml", tt.body)
+			_, err := LoadSkillByPath(path)
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("unknown field error = %v", err)
+			}
+		})
 	}
 }
 

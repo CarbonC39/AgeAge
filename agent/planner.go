@@ -26,7 +26,7 @@ name: my-skill
 description: "..."
 tier: base|medium|strong      # optional; skips router when set
 returns: answer               # which pipeline var to return to user; defaults to result/output/answer
-vars:                         # default values; primitives auto-coerced to string
+vars:                         # typed YAML defaults (string/number/bool/list/map)
   my_var: ""
 
 pipeline:

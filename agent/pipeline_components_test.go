@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 
+	"ageage/config"
+	"ageage/skills"
 	"ageage/tools"
 )
 
@@ -91,6 +93,61 @@ func TestNodeCompletePublishesOneStructuredResult(t *testing.T) {
 	}
 	if _, err := tool.Execute(context.Background(), json.RawMessage(`{"status":"success"}`)); err == nil {
 		t.Fatal("second node_complete call should fail")
+	}
+}
+
+func TestAutoNodePassesTypedVariableInputsToTool(t *testing.T) {
+	capture := &loopCaptureTool{result: "ok"}
+	registry := tools.NewRegistry()
+	registry.Register(capture)
+	cfg := config.DefaultConfig()
+	cfg.Workspace = t.TempDir()
+	cfg.WorkDir = cfg.Workspace
+	executor := NewPipelineExecutor(
+		&skills.PipelineSkill{Vars: map[string]interface{}{
+			"count":   5,
+			"enabled": true,
+			"label":   "5",
+		}},
+		nil,
+		&AgentFactory{Config: cfg},
+		"input",
+		"",
+		0,
+		nil,
+		nil,
+		nil,
+		nil,
+		nil,
+		"",
+		registry,
+	)
+	node := skills.PipelineNode{
+		ID:   "typed",
+		Type: "auto",
+		Tool: "capture",
+		Inputs: map[string]interface{}{
+			"count":   "$vars.count",
+			"enabled": "$vars.enabled",
+			"label":   "$vars.label",
+		},
+	}
+	if err := executor.execAutoNode(context.Background(), node, nil, -1, map[string]interface{}{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(capture.args) != 1 {
+		t.Fatalf("tool calls = %d", len(capture.args))
+	}
+	var got struct {
+		Count   int    `json:"count"`
+		Enabled bool   `json:"enabled"`
+		Label   string `json:"label"`
+	}
+	if err := json.Unmarshal(capture.args[0], &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Count != 5 || !got.Enabled || got.Label != "5" {
+		t.Fatalf("typed inputs = %#v (raw %s)", got, capture.args[0])
 	}
 }
 

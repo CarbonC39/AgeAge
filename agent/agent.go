@@ -588,7 +588,6 @@ func (a *Agent) injectSkillTools(skill *skills.Skill) func() {
 		}
 		if a.browserSess != nil {
 			a.browserSess.Close()
-			a.browserSess = nil
 		}
 	}
 }
@@ -604,8 +603,11 @@ func (a *Agent) buildExecPlan(rr *RouterResult, skill *skills.Skill) (toolDefs [
 	switch {
 	case rr != nil && rr.Tier == TierBase && len(rr.RequiredTools) == 0:
 		// Pure knowledge Q&A: only finish_task and optionally memory_recall.
-		if _, ok := a.registry.Get("memory_recall"); ok {
-			neededTools = []string{"memory_recall"}
+		if t, ok := a.registry.Get("memory_recall"); ok {
+			recall, isRecall := t.(*tools.MemoryRecallTool)
+			if !isRecall || recall.HasMemories() {
+				neededTools = []string{"memory_recall"}
+			}
 		}
 	case rr != nil && len(rr.RequiredTools) > 0:
 		// Router specified tools as a starting set (hint, not hard limit).
@@ -704,29 +706,12 @@ func (a *Agent) runLoop(ctx context.Context, streamCb llm.StreamCallback, toolDe
 				rawArgs = json.RawMessage(tc.Function.Arguments)
 			}
 
-			if a.CredMgr != nil {
-				argsStr := string(rawArgs)
-				if a.CredMgr.ContainsCredPath(argsStr) {
-					return "error: direct access to the credentials file is system-protected and not permitted", nil
-				}
-				if substituted := a.CredMgr.Substitute(argsStr); substituted != argsStr {
-					rawArgs = json.RawMessage(substituted)
-				}
-			}
-
 			a.debugLog("Tool▷", "%s  %s", tc.Function.Name, briefActionSummary(tc.Function.Name, tc.Function.Arguments))
-			if a.Callbacks.ToolStart != nil {
-				a.Callbacks.ToolStart(tc.Function.Name, string(rawArgs))
-			}
-			res, execErr := a.registry.Execute(ctx, tc.Function.Name, rawArgs)
-
-			if a.CredMgr != nil {
-				res = a.CredMgr.Scrub(res)
-			}
-
-			if a.Callbacks.ToolEnd != nil {
-				a.Callbacks.ToolEnd(tc.Function.Name)
-			}
+			dispatcher := NewToolDispatcher(a.registry, a.CredMgr)
+			res, execErr := dispatcher.Execute(ctx, tc.Function.Name, rawArgs, ToolDispatchHooks{
+				Start: a.Callbacks.ToolStart,
+				End:   a.Callbacks.ToolEnd,
+			})
 			if a.Callbacks.ToolResult != nil {
 				a.Callbacks.ToolResult(tc.Function.Name, res)
 			}
@@ -785,10 +770,9 @@ func (a *Agent) runLoop(ctx context.Context, streamCb llm.StreamCallback, toolDe
 			if ctx.Err() != nil {
 				return "(Task stopped by user)", nil
 			}
-			if upgradeUsed && !fallbackUsed && a.cfg.Router.ClassifierModel.Model != "" {
-				modelName, apiKey, baseURL := a.cfg.Router.ClassifierModel.Resolve(a.cfg.LLM.Model, a.client.APIKey(), a.client.BaseURL())
-				a.debugLog("Router", "fallback → %s", modelName)
-				activeClient = llm.NewClient(apiKey, baseURL, modelName, a.debug, a.cfg.LLM.MaxTokens)
+			if upgradeUsed && !fallbackUsed {
+				a.debugLog("Router", "fallback → %s", a.cfg.LLM.Model)
+				activeClient = a.client
 				upgradeUsed = false
 				fallbackUsed = true
 				i--
@@ -913,15 +897,20 @@ func (a *Agent) runLoop(ctx context.Context, streamCb llm.StreamCallback, toolDe
 			return "(Task stopped by user)", nil
 		}
 
-		a.pendingTurns = append(a.pendingTurns, turnRecord{
-			assistantMsg: cleanedMsg,
-			toolResults:  currentTurnResults,
-			msgStart:     turnStart,
-			msgCount:     1 + len(cleanedMsg.ToolCalls),
-		})
-		const keepRecentTurns = 2
-		for len(a.pendingTurns) > keepRecentTurns {
-			a.compressOldestTurn()
+		if a.cfg.History.CompressToolTurns {
+			a.pendingTurns = append(a.pendingTurns, turnRecord{
+				assistantMsg: cleanedMsg,
+				toolResults:  currentTurnResults,
+				msgStart:     turnStart,
+				msgCount:     1 + len(cleanedMsg.ToolCalls),
+			})
+			keepRecentTurns := a.cfg.History.KeepRecentTurns
+			if keepRecentTurns <= 0 {
+				keepRecentTurns = 2
+			}
+			for len(a.pendingTurns) > keepRecentTurns {
+				a.compressOldestTurn()
+			}
 		}
 	}
 

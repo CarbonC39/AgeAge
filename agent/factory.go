@@ -13,7 +13,6 @@ import (
 
 	"ageage/config"
 	"ageage/creds"
-	"ageage/internal/agentdocs"
 	"ageage/llm"
 	"ageage/security"
 	"ageage/skills"
@@ -30,11 +29,13 @@ type AgentFactory struct {
 	Debug           bool
 	CronStore       *tools.CronStore
 	UserInputMgr    *tools.UserInputManager       // Shared ask_user pending-input state
-	HasMemories     bool
 	MCPSessions     map[string]*mcp.ClientSession // Active MCP sessions
 	InjectSoul      bool                          // Passed to each created agent; true in serve/connect, false in CLI
 	OnAlwaysAllow   func(operation string)        // Optional: called when user selects "a" (always-allow) in CLI confirm
 	CredMgr         *creds.Manager                // Optional: nil when credentials feature is unavailable
+	// DocsDir is a virtual path: framework docs are served from the embedded FS
+	// (internal/agentdocs) via FileReadTool.DocsDir, never written to disk.
+	DocsDir string
 
 	mcpMu    sync.RWMutex
 	skillsMu sync.RWMutex
@@ -103,20 +104,20 @@ func (f *AgentFactory) GetStandardToolNames() []string {
 }
 
 // WatchSkills polls the skills directory every 2 s and hot-reloads when any
-// .md file changes. Run in a goroutine; returns when ctx is cancelled.
+// .md, .yaml, or .yml skill changes. Run in a goroutine; returns when ctx is cancelled.
 func (f *AgentFactory) WatchSkills(ctx context.Context) {
 	dir := f.Config.SkillsDir()
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
-	lastMod := f.latestSkillMod(dir)
+	lastFingerprint := f.skillFingerprint(dir)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			mod := f.latestSkillMod(dir)
-			if mod.After(lastMod) {
-				lastMod = mod
+			fingerprint := f.skillFingerprint(dir)
+			if fingerprint != lastFingerprint {
+				lastFingerprint = fingerprint
 				newSkills, err := skills.LoadSkills(dir)
 				if err != nil {
 					fmt.Printf("⚠️  Warning: skill reload failed: %s\n", err)
@@ -131,14 +132,14 @@ func (f *AgentFactory) WatchSkills(ctx context.Context) {
 	}
 }
 
-// latestSkillMod returns the most recent modification time of any skill file
-// (.md, .yaml, .yml) in dir.
-func (f *AgentFactory) latestSkillMod(dir string) time.Time {
+// skillFingerprint captures the names, sizes and modification times of all
+// skill files so edits, additions and deletions all trigger a reload.
+func (f *AgentFactory) skillFingerprint(dir string) string {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return time.Time{}
+		return ""
 	}
-	var latest time.Time
+	var fingerprint strings.Builder
 	for _, e := range entries {
 		ext := strings.ToLower(filepath.Ext(e.Name()))
 		if e.IsDir() || (ext != ".md" && ext != ".yaml" && ext != ".yml") {
@@ -148,11 +149,9 @@ func (f *AgentFactory) latestSkillMod(dir string) time.Time {
 		if err != nil {
 			continue
 		}
-		if info.ModTime().After(latest) {
-			latest = info.ModTime()
-		}
+		fmt.Fprintf(&fingerprint, "%s\x00%d\x00%d\n", e.Name(), info.Size(), info.ModTime().UnixNano())
 	}
-	return latest
+	return fingerprint.String()
 }
 
 // NewFactory initializes a new AgentFactory.
@@ -165,12 +164,9 @@ func NewFactory(configPath string, debug bool) (*AgentFactory, error) {
 		return nil, err
 	}
 
-	// Extract embedded framework docs to .ageage/docs/ so the agent can read them
-	// with the standard file_read tool. Always overwrite to reflect binary version.
+	// docsDir is a virtual path: framework docs are served from the embedded FS
+	// (internal/agentdocs) via FileReadTool.DocsDir, never written to disk.
 	docsDir := filepath.Join(cfg.AgeAgeDirPath(), "docs")
-	if err := agentdocs.ExtractTo(docsDir); err != nil {
-		fmt.Printf("⚠️  Warning: could not extract framework docs: %s\n", err)
-	}
 
 	if cfg.LLM.APIKey == "" {
 		cfg.LLM.APIKey = os.Getenv("AGEAGE_API_KEY")
@@ -201,13 +197,6 @@ func NewFactory(configPath string, debug bool) (*AgentFactory, error) {
 	// Initialize cron store.
 	cronPath := filepath.Join(cfg.ConfigDir(), "data", "cron.json")
 	cronStore := tools.NewCronStore(cronPath)
-
-	// Check if memories exist (once at startup).
-	hasMemories := false
-	if data, err := os.ReadFile(cfg.MemoryPath()); err == nil {
-		trimmed := strings.TrimSpace(string(data))
-		hasMemories = len(trimmed) > 0
-	}
 
 	// Initialize MCP Sessions.
 	mcpSessions := make(map[string]*mcp.ClientSession)
@@ -263,9 +252,9 @@ func NewFactory(configPath string, debug bool) (*AgentFactory, error) {
 		Debug:           debug,
 		CronStore:       cronStore,
 		UserInputMgr:    tools.NewUserInputManager(),
-		HasMemories:     hasMemories,
 		MCPSessions:     mcpSessions,
 		CredMgr:         credMgr,
+		DocsDir:         docsDir,
 	}, nil
 }
 
@@ -401,7 +390,6 @@ func (f *AgentFactory) CreateAgentFiltered(confirmMgr *tools.ConfirmationManager
 		}
 	}
 
-
 	// shouldRegisterTool reports whether toolName should be registered for this agent.
 	// Priority order:
 	//   1. non_include_tools blocklist — always excluded.
@@ -439,13 +427,19 @@ func (f *AgentFactory) CreateAgentFiltered(confirmMgr *tools.ConfirmationManager
 		WorkDir:            f.Config.EffectiveWorkDir(),
 		PassthroughEnvVars: f.Config.Bash.PassthroughEnvVars,
 		ConfirmFunc:        confirmFunc,
+		RedactFunc: func(text string) string {
+			if f.CredMgr == nil {
+				return text
+			}
+			return f.CredMgr.Scrub(text)
+		},
 	}
 	if shouldRegisterTool("bash") {
 		registry.Register(bashTool)
 	}
 
 	if shouldRegisterTool("file_read") {
-		registry.Register(&tools.FileReadTool{Security: f.SecurityChecker})
+		registry.Register(&tools.FileReadTool{Security: f.SecurityChecker, DocsDir: f.DocsDir})
 	}
 
 	// fileConfirmFunc auto-approves writes/edits targeting any session's CONTEXT.md.
@@ -489,17 +483,15 @@ func (f *AgentFactory) CreateAgentFiltered(confirmMgr *tools.ConfirmationManager
 		})
 	}
 
-	if f.HasMemories {
-		if shouldRegisterTool("memory_recall") {
-			registry.Register(&tools.MemoryRecallTool{MemoryPath: memoryPath})
-		}
-		if shouldRegisterTool("memory_forget") {
-			registry.Register(&tools.MemoryForgetTool{
-				MemoryPath:  memoryPath,
-				Supervised:  isSupervised,
-				ConfirmFunc: confirmFunc,
-			})
-		}
+	if shouldRegisterTool("memory_recall") {
+		registry.Register(&tools.MemoryRecallTool{MemoryPath: memoryPath})
+	}
+	if shouldRegisterTool("memory_forget") {
+		registry.Register(&tools.MemoryForgetTool{
+			MemoryPath:  memoryPath,
+			Supervised:  isSupervised,
+			ConfirmFunc: confirmFunc,
+		})
 	}
 
 	// Web tools.

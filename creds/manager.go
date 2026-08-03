@@ -12,7 +12,9 @@ package creds
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -155,6 +157,51 @@ func (m *Manager) Substitute(text string) string {
 	return r.Replace(text)
 }
 
+// SubstituteJSON replaces credential placeholders only inside JSON string
+// values, then re-encodes the document. This preserves valid JSON when a secret
+// contains quotes, backslashes, newlines, or other escaped characters.
+func (m *Manager) SubstituteJSON(data []byte) ([]byte, error) {
+	if !bytes.Contains(data, []byte("{{cred:")) {
+		return data, nil
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+
+	var value any
+	if err := decoder.Decode(&value); err != nil {
+		return nil, err
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return nil, fmt.Errorf("multiple JSON values")
+		}
+		return nil, err
+	}
+
+	value = m.substituteJSONValue(value)
+	return json.Marshal(value)
+}
+
+func (m *Manager) substituteJSONValue(value any) any {
+	switch v := value.(type) {
+	case string:
+		return m.Substitute(v)
+	case []any:
+		for i := range v {
+			v[i] = m.substituteJSONValue(v[i])
+		}
+		return v
+	case map[string]any:
+		for key, item := range v {
+			v[key] = m.substituteJSONValue(item)
+		}
+		return v
+	default:
+		return value
+	}
+}
+
 // Scrub replaces any known credential values in text with [REDACTED].
 // Replacements are applied longest-value-first to avoid partial shadowing
 // (e.g. a prefix value accidentally masking a longer one).
@@ -177,7 +224,8 @@ func (m *Manager) ContainsCredPath(text string) bool {
 		return false
 	}
 	return strings.Contains(text, m.credPath) ||
-		strings.Contains(text, filepath.ToSlash(m.credPath))
+		strings.Contains(text, filepath.ToSlash(m.credPath)) ||
+		strings.Contains(text, filepath.Base(m.credPath))
 }
 
 // Path returns the credentials file path.

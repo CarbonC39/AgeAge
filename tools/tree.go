@@ -8,12 +8,15 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"ageage/security"
 )
 
 // TreeTool lists directory contents in a tree format, similar to `tree -L <depth>`.
 // It is a skill-only tool (not registered globally).
 type TreeTool struct {
-	WorkDir string // default root when no path is provided
+	WorkDir  string // default root when no path is provided
+	Security *security.Checker
 }
 
 func (t *TreeTool) Name() string { return "tree" }
@@ -61,13 +64,21 @@ func (t *TreeTool) Execute(_ context.Context, args json.RawMessage) (string, err
 	if root == "" {
 		root = "."
 	}
-	if !filepath.IsAbs(root) {
-		root = filepath.Join(t.WorkDir, root)
-	}
-
-	abs, err := filepath.Abs(root)
-	if err != nil {
-		abs = root
+	var abs string
+	var err error
+	if t.Security != nil {
+		abs, err = t.Security.CheckPath(root)
+		if err != nil {
+			return "", fmt.Errorf("access denied: %s", err)
+		}
+	} else {
+		if !filepath.IsAbs(root) {
+			root = filepath.Join(t.WorkDir, root)
+		}
+		abs, err = filepath.Abs(root)
+		if err != nil {
+			abs = root
+		}
 	}
 
 	info, err := os.Stat(abs)

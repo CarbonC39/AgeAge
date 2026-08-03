@@ -142,7 +142,7 @@ func (e *Evaluator) makeAgent(skillFilePath string, modelCfg config.ModelConfig)
 	registry := tools.NewRegistry()
 	finishTool := &tools.FinishTool{}
 	registry.Register(finishTool)
-	registry.Register(&tools.FileReadTool{Security: sec})
+	registry.Register(&tools.FileReadTool{Security: sec, DocsDir: e.docsDir})
 	registry.Register(&skillPatchTool{skillFilePath: skillFilePath})
 
 	ag := NewAgent(cfg, client, registry, finishTool, nil, e.factory.Debug)
@@ -362,15 +362,35 @@ func (t *skillPatchTool) Execute(_ context.Context, args json.RawMessage) (strin
 	if err := json.Unmarshal(args, &params); err != nil {
 		return "", fmt.Errorf("invalid arguments: %w", err)
 	}
-	if err := os.WriteFile(t.skillFilePath, []byte(params.Content), 0o644); err != nil {
-		return "", fmt.Errorf("write skill file: %w", err)
+	ext := filepath.Ext(t.skillFilePath)
+	tmp, err := os.CreateTemp(filepath.Dir(t.skillFilePath), ".skill-patch-*"+ext)
+	if err != nil {
+		return "", fmt.Errorf("create temporary skill file: %w", err)
 	}
-	if errs := ValidateSkillFile(t.skillFilePath, nil); len(errs) > 0 {
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+
+	if _, err := tmp.WriteString(params.Content); err != nil {
+		tmp.Close()
+		return "", fmt.Errorf("write temporary skill file: %w", err)
+	}
+	if err := tmp.Chmod(0o644); err != nil {
+		tmp.Close()
+		return "", fmt.Errorf("set temporary skill permissions: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return "", fmt.Errorf("close temporary skill file: %w", err)
+	}
+
+	if errs := ValidateSkillFile(tmpPath, nil); len(errs) > 0 {
 		var msgs []string
 		for _, e := range errs {
 			msgs = append(msgs, e.Error())
 		}
 		return "", fmt.Errorf("patched file failed validation: %s", strings.Join(msgs, "; "))
+	}
+	if err := os.Rename(tmpPath, t.skillFilePath); err != nil {
+		return "", fmt.Errorf("replace skill file: %w", err)
 	}
 	return "Skill file updated and validated.", nil
 }

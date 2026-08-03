@@ -95,6 +95,14 @@ type MemoryRecallTool struct {
 	MemoryPath string
 }
 
+// HasMemories reports whether the backing store currently contains data. It is
+// checked per turn so memory_recall becomes available immediately after the
+// first memory_store call without advertising an empty tool beforehand.
+func (t *MemoryRecallTool) HasMemories() bool {
+	info, err := os.Stat(t.MemoryPath)
+	return err == nil && info.Size() > 0
+}
+
 func (t *MemoryRecallTool) Name() string { return "memory_recall" }
 
 func (t *MemoryRecallTool) Description() string {

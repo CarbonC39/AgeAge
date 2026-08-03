@@ -29,10 +29,10 @@ type SessionManager struct {
 
 // SessionInfo describes a single session for listing.
 type SessionInfo struct {
-	ID         string    // full session ID (directory name)
-	TurnCount  int       // number of completed user→assistant turns
-	ModTime    time.Time // last-modified time of the session directory
-	Preview    string    // first 50 chars of the last user message (best-effort)
+	ID        string    // full session ID (directory name)
+	TurnCount int       // number of completed user→assistant turns
+	ModTime   time.Time // last-modified time of the session directory
+	Preview   string    // first 50 chars of the last user message (best-effort)
 }
 
 // historyRecord is the on-disk representation of a single llm.Message.

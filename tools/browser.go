@@ -74,7 +74,9 @@ func (s *BrowserSession) open() error {
 	return s.openErr
 }
 
-// Close shuts down the browser. Safe to call multiple times.
+// Close shuts down the browser and resets the session so registered tools can
+// lazily open a fresh backend on a later Agent.Run call. Safe to call multiple
+// times.
 func (s *BrowserSession) Close() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -82,6 +84,8 @@ func (s *BrowserSession) Close() {
 		s.backend.Close()
 		s.backend = nil
 	}
+	s.openErr = nil
+	s.once = sync.Once{}
 }
 
 func (s *BrowserSession) navigate(url, waitUntil string, timeout time.Duration) (string, string, error) {

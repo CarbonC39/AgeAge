@@ -22,10 +22,10 @@ type DiscordChannel struct {
 	baseURL       string
 	client        *http.Client
 	stopCh        chan struct{}
-	lastMsgIDs    map[string]string            // Track last seen message per channel
-	botUserID     string                       // Bot's own user ID (set in Start)
-	groupChannels map[string]bool              // channelID → true if guild channel, false if DM
-	threadParent  map[string]string            // thread channel ID → parent channel ID
+	lastMsgIDs    map[string]string // Track last seen message per channel
+	botUserID     string            // Bot's own user ID (set in Start)
+	groupChannels map[string]bool   // channelID → true if guild channel, false if DM
+	threadParent  map[string]string // thread channel ID → parent channel ID
 	mu            sync.Mutex
 	typingStop    map[string]context.CancelFunc // channelID → cancel func for keep-alive typing
 	typingMu      sync.Mutex

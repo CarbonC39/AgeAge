@@ -157,6 +157,26 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	lastMsg := req.Messages[lastUserIdx]
+	if lastMsg.TextContent() == "" && len(lastMsg.Parts) == 0 {
+		writeJSONError(w, "empty user message", http.StatusBadRequest)
+		return
+	}
+	// Strip image parts if vision is disabled in config.
+	if !s.factory.Config.Multimodal.Vision {
+		lastMsg = lastMsg.StripImageParts()
+	}
+	userInput := lastMsg.TextContent()
+	var userParts []llm.ContentPart
+	if len(lastMsg.Parts) > 0 {
+		userParts = lastMsg.Parts
+	}
+
+	if userInput == "" {
+		writeJSONError(w, "empty user message", http.StatusBadRequest)
+		return
+	}
+
 	ag := s.factory.CreateAgent(nil, "")
 
 	// Seed agent with previous history, omitting the very last user message and
@@ -172,22 +192,6 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		ag.SetMessages(filtered)
-	}
-
-	lastMsg := req.Messages[lastUserIdx]
-	// Strip image parts if vision is disabled in config.
-	if !s.factory.Config.Multimodal.Vision {
-		lastMsg = lastMsg.StripImageParts()
-	}
-	userInput := lastMsg.TextContent()
-	var userParts []llm.ContentPart
-	if len(lastMsg.Parts) > 0 {
-		userParts = lastMsg.Parts
-	}
-
-	if userInput == "" {
-		writeJSONError(w, "empty user message", http.StatusBadRequest)
-		return
 	}
 
 	if req.Stream {

@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"ageage/internal/agentdocs"
 	"ageage/llm"
 	"ageage/security"
 	"ageage/skills"
@@ -65,10 +66,10 @@ pipeline:
 // It runs an isolated strong-model agent, validates the generated file with
 // ValidateSkillFile, and retries up to maxPlannerRetries times on failure.
 type Planner struct {
-	factory      *AgentFactory
-	docsDir      string
-	skillsDir    string
-	toolNames    []string
+	factory   *AgentFactory
+	docsDir   string
+	skillsDir string
+	toolNames []string
 }
 
 // NewPlanner returns a Planner scoped to the given docs directory.
@@ -186,7 +187,7 @@ func (p *Planner) makeAgent() *Agent {
 	registry := tools.NewRegistry()
 	finishTool := &tools.FinishTool{}
 	registry.Register(finishTool)
-	registry.Register(&tools.FileReadTool{Security: sec})
+	registry.Register(&tools.FileReadTool{Security: sec, DocsDir: p.docsDir})
 	registry.Register(&tools.FileWriteTool{
 		Security:    sec,
 		Supervised:  false,
@@ -198,20 +199,11 @@ func (p *Planner) makeAgent() *Agent {
 	ag.MaxIterations = 15
 
 	// Embed doc content directly so models that skip file_read still get the schema.
-	guide := readDoc(filepath.Join(p.docsDir, "planner-guide.md"))
-	pipeline := readDoc(filepath.Join(p.docsDir, "pipeline.md"))
+	guide, _ := agentdocs.Read("planner-guide.md")
+	pipeline, _ := agentdocs.Read("pipeline.md")
 	ag.conv.Reset([]llm.Message{{Role: "system", Content: p.buildSystemPrompt(guide, pipeline)}})
 
 	return ag
-}
-
-// readDoc reads a file and returns its content, or empty string on error.
-func readDoc(path string) string {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return ""
-	}
-	return string(b)
 }
 
 func (p *Planner) buildSystemPrompt(guide, pipeline string) string {

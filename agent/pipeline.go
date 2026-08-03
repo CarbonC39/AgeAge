@@ -33,7 +33,7 @@ const (
 // shared vars map.
 type PipelineExecutor struct {
 	ps        *skills.PipelineSkill
-	skill     *skills.Skill   // wrapping Skill metadata (name, description)
+	skill     *skills.Skill // wrapping Skill metadata (name, description)
 	factory   *AgentFactory
 	sharedReg *tools.Registry // parent registry; used by auto nodes for direct tool calls
 
@@ -227,7 +227,7 @@ func (e *PipelineExecutor) execForeach(ctx context.Context, node skills.Pipeline
 		return fmt.Errorf("foreach variable %q is nil or not found", node.Foreach)
 	}
 
-		var items []interface{}
+	var items []interface{}
 	switch v := arrayVal.(type) {
 	case []interface{}:
 		items = v
@@ -431,7 +431,9 @@ func (e *PipelineExecutor) execAutoNode(ctx context.Context, node skills.Pipelin
 
 	e.debugf("Auto▷", "%s  tool=%s", node.ID, node.Tool)
 
-	result, err := e.sharedReg.Execute(ctx, node.Tool, argsJSON)
+	result, err := NewToolDispatcher(e.sharedReg, e.factory.CredMgr).Execute(
+		ctx, node.Tool, argsJSON, ToolDispatchHooks{},
+	)
 	if err != nil {
 		return fmt.Errorf("auto node %q: tool %q failed: %w", node.ID, node.Tool, err)
 	}
@@ -675,8 +677,8 @@ func (e *PipelineExecutor) runAgentNodeAttempt(
 
 	// First pass: collect all outputs that matched by exact key.
 	out := make(map[string]interface{}, len(node.Outputs))
-	var missingPipelineVar string  // pipeline-var name of the one missing entry (if any)
-	var missingNodeKey string      // expected node_complete key that was absent
+	var missingPipelineVar string // pipeline-var name of the one missing entry (if any)
+	var missingNodeKey string     // expected node_complete key that was absent
 	missingCount := 0
 	for pipelineVar, nodeOutputKey := range node.Outputs {
 		if v, ok := nodeResult.Vars[nodeOutputKey]; ok {

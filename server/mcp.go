@@ -57,9 +57,9 @@ func (s *MCPServer) Start() error {
 		mcp.AddTool(server, mcpTool, func(ctx context.Context, req *mcp.CallToolRequest, args map[string]any) (*mcp.CallToolResult, any, error) {
 			// Create a fresh agent for each tool call (stateless server).
 			callAg := s.factory.CreateAgent(nil, "")
-			
+
 			argBytes, _ := json.Marshal(args)
-			result, err := callAg.GetRegistry().Execute(ctx, tool.Name(), argBytes)
+			result, err := callAg.ExecuteTool(ctx, tool.Name(), argBytes)
 
 			if err != nil {
 				return &mcp.CallToolResult{

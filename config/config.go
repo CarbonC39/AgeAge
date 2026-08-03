@@ -11,25 +11,26 @@ import (
 
 // Config is the top-level configuration for AgeAge.
 type Config struct {
-	Workspace string          `toml:"workspace"` // Working content directory (where the agent reads/writes files)
-	WorkDir   string          `toml:"-"`          // Effective working dir for file ops; defaults to Workspace, overridden in CLI mode
-	configDir string          // Dir containing config.toml; AgeAge data (AGENT.md, memories, skills) lives here
-	LLM       LLMConfig       `toml:"llm"`
-	Agent     AgentConfig     `toml:"agent"`
-	SubAgent  SubAgentConfig  `toml:"subagent"`
-	Pipeline  PipelineConfig  `toml:"pipeline"`
-	Router    RouterConfig    `toml:"router"`
-	Summarize SummarizeConfig `toml:"summarize"`
-	Security  SecurityConfig  `toml:"security"`
-	Bash      BashConfig      `toml:"bash"`
-	WebSearch WebSearchConfig `toml:"web_search"`
-	WebFetch  WebFetchConfig  `toml:"web_fetch"`
-	Browser     BrowserConfig     `toml:"browser"`
-	Multimodal  MultimodalConfig  `toml:"multimodal"`
-	MCP         MCPConfig         `toml:"mcp"`
-	Channels  ChannelConfig   `toml:"channels"`
-	Server    ServerConfig    `toml:"server"`
-	Eval      EvalConfig      `toml:"eval"`
+	Workspace  string           `toml:"workspace"` // Working content directory (where the agent reads/writes files)
+	WorkDir    string           `toml:"-"`         // Effective working dir for file ops; defaults to Workspace, overridden in CLI mode
+	configDir  string           // Dir containing config.toml; AgeAge data (AGENT.md, memories, skills) lives here
+	LLM        LLMConfig        `toml:"llm"`
+	Agent      AgentConfig      `toml:"agent"`
+	SubAgent   SubAgentConfig   `toml:"subagent"`
+	Pipeline   PipelineConfig   `toml:"pipeline"`
+	Router     RouterConfig     `toml:"router"`
+	Summarize  SummarizeConfig  `toml:"summarize"`
+	History    HistoryConfig    `toml:"history"`
+	Security   SecurityConfig   `toml:"security"`
+	Bash       BashConfig       `toml:"bash"`
+	WebSearch  WebSearchConfig  `toml:"web_search"`
+	WebFetch   WebFetchConfig   `toml:"web_fetch"`
+	Browser    BrowserConfig    `toml:"browser"`
+	Multimodal MultimodalConfig `toml:"multimodal"`
+	MCP        MCPConfig        `toml:"mcp"`
+	Channels   ChannelConfig    `toml:"channels"`
+	Server     ServerConfig     `toml:"server"`
+	Eval       EvalConfig       `toml:"eval"`
 }
 
 // PipelineModels maps pipeline node model tiers to specific model configs.
@@ -57,15 +58,15 @@ type SubAgentConfig struct {
 type EvalConfig struct {
 	// SuccessThreshold is the number of consecutive evaluator passes before an
 	// auto-generated skill graduates and evaluation stops. 0 means always evaluate.
-	SuccessThreshold int         `toml:"success_threshold"`
+	SuccessThreshold int `toml:"success_threshold"`
 	// Model is used for evaluation when success_count >= 1 (cheaper tier).
 	// Defaults to [router.medium] when empty.
-	Model            ModelConfig `toml:"model"`
+	Model ModelConfig `toml:"model"`
 }
 
 // MCPConfig holds MCP client/server settings.
 type MCPConfig struct {
-	Enabled bool               `toml:"enabled"`
+	Enabled bool                 `toml:"enabled"`
 	Servers map[string]MCPServer `toml:"servers"` // External MCP servers to connect to
 }
 
@@ -103,11 +104,11 @@ type ModelConfig struct {
 
 // RouterConfig holds settings for the intent router.
 type RouterConfig struct {
-	Enabled          bool        `toml:"enabled"`
-	ClassifierModel  ModelConfig `toml:"classifier"` // Lightweight model for intent classification
-	MediumModel      ModelConfig `toml:"medium"`      // Medium model for linear tasks
-	StrongModel      ModelConfig `toml:"strong"`      // Strong model for complex tasks
-	MaxHistory       int         `toml:"max_history"`
+	Enabled         bool        `toml:"enabled"`
+	ClassifierModel ModelConfig `toml:"classifier"` // Lightweight model for intent classification
+	MediumModel     ModelConfig `toml:"medium"`     // Medium model for linear tasks
+	StrongModel     ModelConfig `toml:"strong"`     // Strong model for complex tasks
+	MaxHistory      int         `toml:"max_history"`
 }
 
 // Resolve returns the model, API key and BaseURL, falling back to defaults if empty.
@@ -135,6 +136,17 @@ type SummarizeConfig struct {
 	KeepRecent int    `toml:"keep_recent"` // Number of recent messages to keep intact
 }
 
+// HistoryConfig holds settings for in-place tool-turn compression (separate
+// from and more aggressive than the LLM-based SummarizeConfig).
+type HistoryConfig struct {
+	// CompressToolTurns enables replacing old tool-call turns with a single
+	// narrative assistant message once more than KeepRecentTurns have accumulated.
+	CompressToolTurns bool `toml:"compress_tool_turns"`
+	// KeepRecentTurns is how many of the most recent tool-call turns stay
+	// uncompressed (raw JSON tool calls/results) in history.
+	KeepRecentTurns int `toml:"keep_recent_turns"`
+}
+
 // SecurityConfig holds security-related settings.
 type SecurityConfig struct {
 	BlockedCommands []string `toml:"blocked_commands"`
@@ -144,9 +156,9 @@ type SecurityConfig struct {
 
 // BashConfig holds bash tool settings.
 type BashConfig struct {
-	AutoAllowCommands    []string `toml:"auto_allow_commands"`     // Commands that skip supervised confirmation
-	MaxOutputBytes       int      `toml:"max_output_bytes"`        // Cap on stdout+stderr combined (default 4 MB); prevents OOM on large outputs
-	PassthroughEnvVars   []string `toml:"passthrough_env_vars"`    // Additional env var names/prefixes forwarded to subprocesses
+	AutoAllowCommands  []string `toml:"auto_allow_commands"`  // Commands that skip supervised confirmation
+	MaxOutputBytes     int      `toml:"max_output_bytes"`     // Cap on stdout+stderr combined (default 4 MB); prevents OOM on large outputs
+	PassthroughEnvVars []string `toml:"passthrough_env_vars"` // Additional env var names/prefixes forwarded to subprocesses
 }
 
 // WebSearchConfig holds web search tool settings.
@@ -181,7 +193,7 @@ type WebFetchConfig struct {
 // ConverterConfig defines a command-line tool that converts a file format to plain text.
 type ConverterConfig struct {
 	Extensions []string `toml:"extensions"` // file extensions this converter handles, e.g. ["pdf","docx"]
-	Command    string   `toml:"command"`     // command template: {input} → input file, {output} → output .md file
+	Command    string   `toml:"command"`    // command template: {input} → input file, {output} → output .md file
 }
 
 // MultimodalConfig holds settings for file attachment processing.
@@ -240,8 +252,8 @@ type DiscordConfig struct {
 // MatrixConfig holds Matrix client settings.
 type MatrixConfig struct {
 	Enabled      bool     `toml:"enabled"`
-	Homeserver   string   `toml:"homeserver"`    // e.g., "https://matrix.org"
-	UserID       string   `toml:"user_id"`       // e.g., "@bot:matrix.org"
+	Homeserver   string   `toml:"homeserver"` // e.g., "https://matrix.org"
+	UserID       string   `toml:"user_id"`    // e.g., "@bot:matrix.org"
 	AccessToken  string   `toml:"access_token"`
 	RoomIDs      []string `toml:"room_ids"`      // Rooms to monitor; empty = all joined rooms
 	AllowedUsers []string `toml:"allowed_users"` // Matrix user IDs (e.g. "@alice:matrix.org"); empty = allow all
@@ -295,6 +307,10 @@ func DefaultConfig() *Config {
 			Model:      "", // inherits base LLM model
 			Threshold:  10,
 			KeepRecent: 4,
+		},
+		History: HistoryConfig{
+			CompressToolTurns: true,
+			KeepRecentTurns:   2,
 		},
 		Bash: BashConfig{
 			AutoAllowCommands: []string{},

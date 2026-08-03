@@ -43,7 +43,9 @@ type BashTool struct {
 	// allowed through the safe-env filter (case-insensitive prefix match).
 	PassthroughEnvVars []string
 	// ConfirmFunc is called in supervised mode. Returns true to allow execution.
-	ConfirmFunc     func(cmd string) bool
+	ConfirmFunc func(cmd string) bool
+	// RedactFunc removes secrets from commands before they reach confirmation UI.
+	RedactFunc      func(text string) string
 	ConfirmationMgr *ConfirmationManager
 	ChannelID       string
 }
@@ -92,15 +94,19 @@ func (t *BashTool) Execute(ctx context.Context, args json.RawMessage) (string, e
 
 	// Supervised mode confirmation.
 	if t.Supervised && !t.isAutoAllowed(cmd) {
+		displayCmd := cmd
+		if t.RedactFunc != nil {
+			displayCmd = t.RedactFunc(displayCmd)
+		}
 		if t.ConfirmationMgr != nil && t.ChannelID != "" {
 			confirmID, _ := t.ConfirmationMgr.RequestConfirmation(
-				fmt.Sprintf("Execute: %s", cmd),
+				fmt.Sprintf("Execute: %s", displayCmd),
 				t.ChannelID,
 				5*time.Minute,
 			)
 			return fmt.Sprintf("[CONFIRMATION_REQUIRED:%s]", confirmID), nil
 		}
-		if t.ConfirmFunc != nil && !t.ConfirmFunc(cmd) {
+		if t.ConfirmFunc != nil && !t.ConfirmFunc(displayCmd) {
 			return "Command execution denied by user.", nil
 		}
 	}
@@ -174,6 +180,12 @@ func (t *BashTool) buildCmd(ctx context.Context, cmd string) *exec.Cmd {
 // isAutoAllowed checks if a command matches any auto-allow pattern (prefix match).
 func (t *BashTool) isAutoAllowed(cmd string) bool {
 	cmdLower := strings.ToLower(strings.TrimSpace(cmd))
+	// Auto-allow applies to one simple command only. Shell control syntax can
+	// append an unrelated command or redirect data while retaining an allowed
+	// prefix. Such commands still work, but require normal confirmation.
+	if strings.ContainsAny(cmdLower, ";\n\r|&<>`") || strings.Contains(cmdLower, "$(") {
+		return false
+	}
 	for _, pattern := range t.AutoAllowCommands {
 		pl := strings.ToLower(strings.TrimSpace(pattern))
 		if pl == "" {
@@ -200,15 +212,16 @@ var windowsShell = sync.OnceValue(func() string {
 // Writes beyond the limit are discarded; the truncated flag is set.
 // A mutex guards concurrent writes from stdout and stderr goroutines.
 type limitedWriter struct {
-	mu       sync.Mutex
-	buf      bytes.Buffer
-	limit    int
+	mu        sync.Mutex
+	buf       bytes.Buffer
+	limit     int
 	truncated bool
 }
 
 func (lw *limitedWriter) Write(p []byte) (int, error) {
 	lw.mu.Lock()
 	defer lw.mu.Unlock()
+	originalLen := len(p)
 	cur := lw.buf.Len()
 	if cur >= lw.limit {
 		lw.truncated = true
@@ -219,8 +232,10 @@ func (lw *limitedWriter) Write(p []byte) (int, error) {
 		p = p[:rem]
 		lw.truncated = true
 	}
-	n, err := lw.buf.Write(p)
-	return n, err
+	_, err := lw.buf.Write(p)
+	// Bytes beyond the cap were deliberately consumed and discarded, so report
+	// the full input length as required by the io.Writer contract.
+	return originalLen, err
 }
 
 func (lw *limitedWriter) string() string {

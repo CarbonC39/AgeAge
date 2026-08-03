@@ -2,6 +2,7 @@ package security
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 )
@@ -105,20 +106,14 @@ func (c *Checker) CheckPath(path string) (string, error) {
 	// Step 1: resolve relative paths against workspace.
 	absPath := c.resolvePath(path)
 
-	// Step 2: resolve all symlinks to obtain the canonical path.
-	// If the file does not exist yet (e.g., a new file to be written), EvalSymlinks
-	// fails; in that case we resolve as many components as possible by evaluating
-	// the parent directory and appending the filename.
-	resolved, err := filepath.EvalSymlinks(absPath)
+	// Step 2: resolve all symlinks to obtain the canonical path. For a path
+	// containing components that do not exist yet, resolve the nearest existing
+	// ancestor and append the missing suffix. Never fall back to the unresolved
+	// path: MkdirAll would otherwise follow an earlier symlink outside the
+	// workspace when creating the missing directories.
+	resolved, err := resolveFromExistingAncestor(absPath)
 	if err != nil {
-		// File doesn't exist yet — resolve the parent directory instead.
-		parent, err2 := filepath.EvalSymlinks(filepath.Dir(absPath))
-		if err2 != nil {
-			// Parent also doesn't exist; use the cleaned absolute path.
-			resolved = absPath
-		} else {
-			resolved = filepath.Join(parent, filepath.Base(absPath))
-		}
+		return "", fmt.Errorf("cannot resolve path %q: %w", path, err)
 	}
 
 	// Step 3a: check hardcoded blocked files (highest priority, not configurable).
@@ -149,6 +144,36 @@ func (c *Checker) CheckPath(path string) (string, error) {
 	}
 
 	return "", fmt.Errorf("path %q is outside workspace %q and not in any allowed root", resolved, c.workspace)
+}
+
+// resolveFromExistingAncestor canonicalises path even when one or more trailing
+// components do not exist. Existing symlinks are always resolved before the
+// missing suffix is appended.
+func resolveFromExistingAncestor(path string) (string, error) {
+	current := filepath.Clean(path)
+	var missing []string
+
+	for {
+		if _, err := os.Lstat(current); err == nil {
+			resolved, err := filepath.EvalSymlinks(current)
+			if err != nil {
+				return "", err
+			}
+			for i := len(missing) - 1; i >= 0; i-- {
+				resolved = filepath.Join(resolved, missing[i])
+			}
+			return filepath.Clean(resolved), nil
+		} else if !os.IsNotExist(err) {
+			return "", err
+		}
+
+		parent := filepath.Dir(current)
+		if parent == current {
+			return "", fmt.Errorf("no existing ancestor")
+		}
+		missing = append(missing, filepath.Base(current))
+		current = parent
+	}
 }
 
 // isSubPath checks if child is inside (or equal to) parent directory.

@@ -97,4 +97,3 @@ func (cm *ConfirmationManager) GetAllPending(channelID string) []*PendingConfirm
 	}
 	return result
 }
-

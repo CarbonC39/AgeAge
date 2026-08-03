@@ -50,9 +50,9 @@ type RouterChecks struct {
 
 // RouterResult is the output of the intent router.
 type RouterResult struct {
-	Tier          ModelTier    `json:"-"`              // derived by deriveTier(), not parsed
+	Tier          ModelTier    `json:"-"` // derived by deriveTier(), not parsed
 	Checks        RouterChecks `json:"checks"`
-	Skill         string       `json:"skill"`          // Name of the skill the router selected (empty = none)
+	Skill         string       `json:"skill"` // Name of the skill the router selected (empty = none)
 	RequiredTools []string     `json:"required_tools"`
 	Reasoning     string       `json:"reasoning"`
 }
@@ -111,10 +111,10 @@ func NewRouter(cfg *config.Config, client *llm.Client, loadedSkills []skills.Ski
 // buildRouterPrompt constructs the router system prompt.
 //
 // Cache layout (ordered from most-stable to least-stable):
-//   1. Fixed: checklist questions, rules, calibration examples — never changes
-//   2. Skill catalog (all skills, name+desc)                   — changes on hot-reload
-//   3. Tool list                                               — changes per turn
-//   4. Fixed: JSON schema                                      — never changes
+//  1. Fixed: checklist questions, rules, calibration examples — never changes
+//  2. Skill catalog (all skills, name+desc)                   — changes on hot-reload
+//  3. Tool list                                               — changes per turn
+//  4. Fixed: JSON schema                                      — never changes
 func (r *Router) buildRouterPrompt(availableTools []string) string {
 	var sb strings.Builder
 

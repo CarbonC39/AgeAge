@@ -159,7 +159,16 @@ version: "1.0"
 description: "Fetch and summarize multiple articles."
 vars:
   urls: []
+returns: final_output
 pipeline:
+  - id: prepare_urls
+    type: agent
+    prompt: |
+      Extract all URLs from the user's message and return them as vars.urls.
+      Input: {{input}}
+    outputs:
+      urls: urls
+
   - id: get_content
     type: auto
     tool: web_fetch
@@ -190,11 +199,11 @@ pipeline:
 - **Nodes**: Executed sequentially. If a node fails, subsequent nodes are marked as `skipped` (⏭️).
 - **Isolation**: Every `agent` node gets a completely fresh sub-agent. They do not share conversation history, preventing context bloat and hallucination bleed-over.
 - **Node Types**:
-  - `agent` (default): Spawns an LLM sub-agent. The agent's `finish_task` tool is replaced with `node_complete` to return structured data (`status`, `vars`, `reason`, `context`).
+  - `agent` (default): Spawns an LLM sub-agent. The agent's `finish_task` tool is replaced with `node_complete` to return structured data (`status`, `vars`, `reason`).
   - `auto`: Calls a tool directly without LLM reasoning. Extremely fast and deterministic.
 - **Iteration (`foreach`)**: Runs the node for every item in an array. Outputs are automatically collected into arrays matching the input length.
-- **Context Accumulation (`output_context: true`)**: `agent` nodes can return a `context` string via `node_complete` which is automatically prepended to the prompt of all subsequent nodes.
-- **Workspace Context (`no_context: true`)**: By default, every pipeline `agent` node has `.ageage/CONTEXT.md` injected into its system prompt (the same workspace context the main agent sees). Set `no_context: true` on a node to suppress this — useful for pure generation tasks that don't need project context.
+- **First node**: Must be `agent`; use it to validate and structure the user's raw input before downstream `auto` nodes.
+- **Context injection**: Every pipeline agent node receives `.ageage/CONTEXT.md`. `SOUL.md` is injected only into the last agent node when enabled for the parent mode.
 
 **Routing:** When the router selects a pipeline skill (or it is triggered via `/skill-name`), it is automatically treated as `strong` tier — ensuring the strong model and full tool set are available to orchestrate multiple sub-tasks. This can be overridden with a top-level `tier:` field in the YAML file.
 
@@ -298,7 +307,7 @@ Use clear formatting when helpful. Keep responses focused.
 
 **Sub-agents** spawned by `delegate` and `escalate` inherit neither file and do not receive `.ageage/CONTEXT.md` — they operate with a minimal system prompt focused on their specific subtask.
 
-**Pipeline nodes** receive `.ageage/CONTEXT.md` by default (the same workspace context visible to the main agent). Suppress it on a per-node basis with `no_context: true`.
+**Pipeline nodes** receive `.ageage/CONTEXT.md`. The last agent node also receives `SOUL.md` when SOUL is enabled for the parent mode.
 
 ---
 

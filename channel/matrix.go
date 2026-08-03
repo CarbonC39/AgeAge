@@ -13,14 +13,14 @@ import (
 
 // MatrixChannel connects to a Matrix homeserver via Client-Server API.
 type MatrixChannel struct {
-	Homeserver   string   // e.g., "https://matrix.org"
-	UserID       string   // e.g., "@bot:matrix.org"
-	Token        string   // Access token
-	RoomIDs      []string // Rooms to monitor; empty = all joined rooms
-	AllowedUsers []string // Matrix user IDs allowed to interact; empty = allow all
-	Options      ChannelOptions
-	client       *http.Client
-	stopCh       chan struct{}
+	Homeserver    string   // e.g., "https://matrix.org"
+	UserID        string   // e.g., "@bot:matrix.org"
+	Token         string   // Access token
+	RoomIDs       []string // Rooms to monitor; empty = all joined rooms
+	AllowedUsers  []string // Matrix user IDs allowed to interact; empty = allow all
+	Options       ChannelOptions
+	client        *http.Client
+	stopCh        chan struct{}
 	since         string              // Sync token for /sync
 	groupRooms    map[string]bool     // roomID → true if multi-user (group), false if DM
 	directMap     map[string][]string // peerID → []roomID

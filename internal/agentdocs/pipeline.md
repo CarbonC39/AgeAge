@@ -132,9 +132,10 @@ Agent nodes use `node_complete` instead of `finish_task`:
 }
 ```
 
-Set `"status": "failure"` with `"reason": "..."` to terminate the pipeline early.
-If an agent hits `max_iterations` without calling `node_complete`, its last message
-becomes `vars.result`.
+Set `"status": "failure"` with `"reason": "..."` to fail the current node attempt.
+The engine may retry an agent node once at the next lower model tier. If an agent
+returns normally without calling `node_complete`, its last message becomes
+`vars.result`; execution and iteration-limit errors are propagated.
 
 ---
 
@@ -144,10 +145,14 @@ becomes `vars.result`.
 
 ```yaml
 pipeline:
+  - id: parse_input
+    prompt: "Validate {{input}} as a URL and return it as vars.url."
+    outputs: {url: url}
+
   - id: fetch
     type: auto
     tool: web_fetch
-    inputs: { url: $input }
+    inputs: { url: $url }
     outputs: raw
 
   - id: summarize
@@ -159,6 +164,10 @@ pipeline:
 
 ```yaml
 pipeline:
+  - id: prepare_urls
+    prompt: "Extract URLs from {{input}} and return them as vars.urls."
+    outputs: {urls: urls}
+
   - id: process_each
     foreach: urls           # bare name resolves to $vars.urls
     type: auto

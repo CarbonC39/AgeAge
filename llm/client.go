@@ -17,8 +17,8 @@ import (
 
 // ContentPart is a single element of a multimodal content array.
 type ContentPart struct {
-	Type     string        `json:"type"`               // "text" or "image_url"
-	Text     string        `json:"text,omitempty"`     // populated when Type == "text"
+	Type     string        `json:"type"`                // "text" or "image_url"
+	Text     string        `json:"text,omitempty"`      // populated when Type == "text"
 	ImageURL *ImageURLPart `json:"image_url,omitempty"` // populated when Type == "image_url"
 }
 
@@ -33,11 +33,11 @@ type ImageURLPart struct {
 // Parts holds structured content parts for multimodal messages; when set,
 // it takes precedence over Content during JSON serialization.
 type Message struct {
-	Role             string        // message role: "system" | "user" | "assistant" | "tool"
-	Content          string        // plain-text content (always valid as a fallback)
-	Parts            []ContentPart // multimodal content parts; non-nil overrides Content in JSON
-	ToolCalls        []ToolCall
-	ToolCallID       string
+	Role       string        // message role: "system" | "user" | "assistant" | "tool"
+	Content    string        // plain-text content (always valid as a fallback)
+	Parts      []ContentPart // multimodal content parts; non-nil overrides Content in JSON
+	ToolCalls  []ToolCall
+	ToolCallID string
 	// ReasoningContent captures thinking-model output (e.g. Gemini's reasoning_content).
 	// Always stripped before any outbound request.
 	ReasoningContent string
@@ -160,9 +160,9 @@ type ToolCallExtraContent struct {
 
 // ToolCall represents a function call in the model response.
 type ToolCall struct {
-	ID           string                `json:"id"`
-	Type         string                `json:"type"`
-	Function     FunctionCall          `json:"function"`
+	ID       string       `json:"id"`
+	Type     string       `json:"type"`
+	Function FunctionCall `json:"function"`
 	// ExtraContent carries Gemini thought signatures (extra_content.google.thought_signature).
 	// It is preserved verbatim when the message is echoed back in history.
 	ExtraContent *ToolCallExtraContent `json:"extra_content,omitempty"`
@@ -267,9 +267,9 @@ type Client struct {
 // NewClient creates a new LLM client.
 func NewClient(apiKey, baseURL, model string, debug bool, maxTokens int) *Client {
 	return &Client{
-		apiKey:    apiKey,
-		baseURL:   strings.TrimRight(baseURL, "/"),
-		model:     model,
+		apiKey:  apiKey,
+		baseURL: strings.TrimRight(baseURL, "/"),
+		model:   model,
 		http: &http.Client{
 			Timeout: 5 * time.Minute,
 		},
@@ -725,6 +725,9 @@ func (c *Client) ChatCompletionStream(ctx context.Context, messages []Message, t
 				}
 			}
 		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, lastUsage, fmt.Errorf("read streaming response: %w", err)
 	}
 
 	result.Content = contentBuf.String()

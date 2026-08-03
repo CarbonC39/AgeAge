@@ -10,12 +10,17 @@ import (
 	"path/filepath"
 	"strings"
 
+	"ageage/internal/agentdocs"
 	"ageage/security"
 )
 
 // FileReadTool reads file content.
 type FileReadTool struct {
 	Security *security.Checker
+	// DocsDir, if set, is the virtual directory framework docs are served from.
+	// Files under it are read from the embedded agentdocs FS when no real file
+	// exists on disk, so the docs never need to be extracted to disk.
+	DocsDir string
 }
 
 func (t *FileReadTool) Name() string { return "file_read" }
@@ -65,7 +70,7 @@ func (t *FileReadTool) Execute(_ context.Context, args json.RawMessage) (string,
 		return "", fmt.Errorf("access denied: %s", err)
 	}
 
-	data, err := os.ReadFile(path)
+	data, err := t.readFile(path)
 	if err != nil {
 		return "", fmt.Errorf("failed to read file: %w", err)
 	}
@@ -111,6 +116,22 @@ func (t *FileReadTool) Execute(_ context.Context, args json.RawMessage) (string,
 		result += fmt.Sprintf("\n... (%d-%d of %d lines shown)", start, end, totalLines)
 	}
 	return result, nil
+}
+
+// readFile reads path from disk, falling back to the embedded framework docs
+// FS when path is a file under DocsDir that doesn't exist on disk. This lets
+// users override a doc by dropping a real file at the same path.
+func (t *FileReadTool) readFile(path string) ([]byte, error) {
+	data, err := os.ReadFile(path)
+	if err == nil {
+		return data, nil
+	}
+	if t.DocsDir != "" && filepath.Clean(filepath.Dir(path)) == filepath.Clean(t.DocsDir) {
+		if content, ok := agentdocs.Read(filepath.Base(path)); ok {
+			return []byte(content), nil
+		}
+	}
+	return nil, err
 }
 
 // splitLines splits file content into lines, preserving the original text but

@@ -137,7 +137,7 @@ The router is a lightweight LLM call that runs before each user turn. It classif
 enabled     = false
 max_history = 8
 
-[router.router]   # The lightweight classification model
+[router.classifier]   # The lightweight classification model
 model    = "gemini-2.0-flash"
 api_key  = "..."
 base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
@@ -166,7 +166,7 @@ model = ""
 
 | Section          | Used for |
 |------------------|----------|
-| `[router.router]`| Router's own classification calls. Use a fast, cheap model. |
+| `[router.classifier]`| Router's own classification calls. Use a fast, cheap model. |
 | `[router.medium]`| Agent execution on medium tasks. |
 | `[router.strong]`| Agent execution on complex tasks; also used by the `escalate` skill-only tool. |
 

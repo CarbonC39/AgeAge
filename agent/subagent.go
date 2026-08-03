@@ -103,7 +103,9 @@ func (t *DelegateTool) Execute(ctx context.Context, args json.RawMessage) (strin
 			fmt.Printf("  ⤷  %-10s pre-tool: %s\n", "Delegate", a.PreTool)
 		}
 
-		preResult, err := t.registry.Execute(ctx, a.PreTool, a.PreToolArgs)
+		preResult, err := NewToolDispatcher(t.registry, t.factory.CredMgr).Execute(
+			ctx, a.PreTool, a.PreToolArgs, ToolDispatchHooks{},
+		)
 		if err != nil {
 			// If pre-tool fails, we report it back to the main agent.
 			// The main agent can then decide to retry or skip.

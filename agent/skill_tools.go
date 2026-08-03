@@ -32,7 +32,10 @@ var skillOnlyToolFactories = map[string]func(AgentDeps, *tools.Registry, *Agent)
 		return &tools.GlobTool{Security: f.GetSecurity(), Workspace: f.GetConfig().EffectiveWorkDir()}
 	},
 	"tree": func(f AgentDeps, _ *tools.Registry, _ *Agent) tools.Tool {
-		return &tools.TreeTool{WorkDir: f.GetConfig().EffectiveWorkDir()}
+		return &tools.TreeTool{
+			WorkDir:  f.GetConfig().EffectiveWorkDir(),
+			Security: f.GetSecurity(),
+		}
 	},
 	"update_todos": func(_ AgentDeps, _ *tools.Registry, a *Agent) tools.Tool {
 		store := &tools.TodoStore{}
@@ -157,7 +160,9 @@ func runSkillDelegate(
 		if factory.Debug {
 			fmt.Printf("  ⤷  %-10s pre-tool: %s\n", label, a.PreTool)
 		}
-		preResult, err := registry.Execute(ctx, a.PreTool, a.PreToolArgs)
+		preResult, err := NewToolDispatcher(registry, factory.CredMgr).Execute(
+			ctx, a.PreTool, a.PreToolArgs, ToolDispatchHooks{},
+		)
 		if err != nil {
 			return "", fmt.Errorf("pre_tool %q failed: %w", a.PreTool, err)
 		}

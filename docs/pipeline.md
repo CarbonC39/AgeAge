@@ -15,6 +15,10 @@ Think of a pipeline as a small factory floor:
 
 No node can see another node's internal reasoning or history. They can only see what is explicitly passed through `vars`.
 
+> **Current execution rule:** the first node must be `agent`. `$vars.input` contains
+> the user's raw message, so the first agent is responsible for validating or
+> structuring it before downstream `auto` nodes call typed tools.
+
 ---
 
 ## File format
@@ -55,6 +59,7 @@ pipeline:
 | `tier` | string | `base` / `medium` / `strong`. Pipelines default to `strong`. |
 | `vars` | map | Initial variable values. `$vars.input` is always set from the user's message. |
 | `pipeline` | list | Ordered list of nodes executed sequentially. |
+| `returns` | string | Name of the pipeline variable returned to the user. Strongly recommended. |
 
 ---
 
@@ -76,10 +81,14 @@ Declare variables and their defaults in the top-level `vars` block:
 vars:
   urls: []       # an empty list
   topic: ""      # an empty string
-  max_results: 5 # a number
+  max_results: "5" # primitive defaults are currently normalized to strings
 ```
 
 If omitted from `vars`, a variable is `nil` until written by a node.
+
+Top-level primitive defaults (`number` and `boolean`) are currently normalized
+to strings when the pipeline is loaded. Maps and lists retain their structure.
+Literal values written directly in a node's `inputs` retain their YAML type.
 
 ### Reference syntax
 
@@ -118,10 +127,6 @@ Every node in the `pipeline` list supports these fields:
 | `skill` | string | — | Activate a named skill inside this node. May reference another pipeline skill (nested, max 1 level). |
 | `tools` | list | — | Tool allowlist for this node. If empty and no skill, all global tools are available. |
 | `tier` | string | — | `base` / `medium` / `strong`. Selects the LLM model for this node. |
-| `fallback_tier` | string | — | Fallback model tier on API failure. Same values as `tier`. |
-| `inject_soul` | bool | `false` | Whether to include `SOUL.md` in this node's system prompt. |
-| `no_context` | bool | `false` | Suppress `.ageage/CONTEXT.md` injection for this node. |
-| `output_context` | bool | `false` | Allow this node to pass a context string to all subsequent nodes via `node_complete`. |
 
 ### Auto-only fields
 
@@ -138,7 +143,8 @@ Every node in the `pipeline` list supports these fields:
 Spawns an isolated sub-agent. The agent:
 
 - Gets a fresh conversation with no shared history
-- Receives `.ageage/CONTEXT.md` by default (suppress with `no_context: true`)
+- Receives `.ageage/CONTEXT.md`
+- Receives `SOUL.md` only when it is the last agent node and SOUL is enabled for the parent mode
 - Has `finish_task` replaced by `node_complete` (see below)
 - Writes outputs back to the pipeline via `node_complete`
 
@@ -156,6 +162,8 @@ Spawns an isolated sub-agent. The agent:
 ### `auto`
 
 Calls a tool directly — no LLM, no agent, just the tool. Extremely fast and deterministic. Use for mechanical steps like reading a file, running a command, or fetching a URL.
+
+An `auto` node cannot currently be the first node in a pipeline.
 
 ```yaml
 - id: fetch_page
@@ -185,8 +193,7 @@ Agent nodes use `node_complete` instead of `finish_task`. It is the primary way 
 |----------|------|----------|-------------|
 | `status` | string | yes | `"success"` or `"failure"` |
 | `vars` | object | no | Output variables. Keys should match the node's declared `outputs`. |
-| `reason` | string | when failing | Human-readable explanation. Terminates the whole pipeline. |
-| `context` | string | no | Key findings for subsequent nodes (only used when `output_context: true`). |
+| `reason` | string | when failing | Human-readable explanation for the failed node attempt. |
 
 ```
 node_complete({
@@ -197,25 +204,36 @@ node_complete({
 })
 ```
 
-If an agent returns without calling `node_complete` (e.g., hits max iterations), the pipeline falls back to using the last assistant message as `vars.result`.
+If an agent returns normally without calling `node_complete`, the pipeline uses its
+last assistant text as `vars.result`. LLM errors and iteration-limit errors are
+propagated to the node fallback/error path instead of being masked.
 
 ---
 
 ## Patterns
 
-### Basic two-node pipeline
+### Basic pipeline
 
 ```yaml
 name: research-and-summarize
 description: "Fetch a URL and summarize it."
 vars:
   url: ""
+returns: answer
 pipeline:
+  - id: parse_input
+    prompt: |
+      The user's message is expected to be a URL. Validate it and return it as
+      vars.url. If it is not a URL, call node_complete with status="failure".
+      Input: {{$vars.input}}
+    outputs:
+      url: url
+
   - id: fetch
     type: auto
     tool: web_fetch
     inputs:
-      url: $vars.input # user's message is the URL
+      url: $vars.url
     outputs:
       raw_content: result
 
@@ -235,7 +253,15 @@ name: batch-summarize
 description: "Summarize multiple URLs one by one."
 vars:
   urls: []
+returns: summaries
 pipeline:
+  - id: prepare_urls
+    prompt: |
+      Extract all URLs from the user's message and return them as vars.urls.
+      Input: {{$vars.input}}
+    outputs:
+      urls: urls
+
   - id: fetch_pages
     type: auto
     tool: web_fetch
@@ -293,6 +319,13 @@ vars:
       end_line: 80
 
 pipeline:
+  - id: confirm_sections
+    prompt: |
+      Return the declared file-section list unchanged as vars.files:
+      {{$vars.files}}
+    outputs:
+      files: files
+
   - id: read_sections
     type: auto
     tool: file_read
@@ -303,45 +336,6 @@ pipeline:
       end_line: $foreach.current.end_line
     outputs:
       sections: result
-```
-
-### `output_context` — passing findings forward
-
-When a node discovers important facts that all subsequent nodes should know, use `output_context: true`. The node calls `node_complete` with a `context` string, which gets prepended to every subsequent node's prompt automatically.
-
-```yaml
-pipeline:
-  - id: gather_facts
-    output_context: true
-    tools:
-      - bash
-      - file_read
-    prompt: |
-      Explore the repository and find: the main entry point, the config file format,
-      and how tests are run. Report your findings concisely.
-    # No outputs needed — context string carries the information forward
-
-  - id: write_readme
-    prompt: |
-      Write a README.md for this project.
-      # The gather_facts findings are automatically prepended to this prompt
-```
-
-The pipeline's final result is the joined text of all accumulated context strings (if any exist).
-
-### `no_context` — suppress workspace context
-
-For nodes doing pure generation or processing external data, the workspace `CONTEXT.md` is irrelevant. Suppress it to reduce noise:
-
-```yaml
-- id: translate
-  no_context: true # don't inject .ageage/CONTEXT.md
-  prompt: |
-    Translate the following text to French:
-
-    {{$vars.original_text}}
-  outputs:
-    translated: result
 ```
 
 ### Nested pipeline skills
@@ -463,35 +457,27 @@ outputs:
 
 After all nodes complete, the pipeline determines its final result in this order:
 
-1. **Accumulated context**: If any `output_context` nodes wrote context strings, they are joined and returned.
-2. **Common output variables**: Checks `$vars.result`, then `$vars.output`, then `$vars.answer`.
-3. **Fallback**: `"Pipeline completed successfully."`
+1. If top-level `returns` is set, return that variable; missing output is an error.
+2. Otherwise check `$vars.result`, then `$vars.output`, then `$vars.answer`.
+3. If none exists, the pipeline returns an error asking the author to declare `returns`.
 
 ---
 
 ## Error handling
 
-- If a node fails (tool error, `node_complete` with `status: "failure"`, or validation error), the pipeline stops immediately.
+- If a node ultimately fails (tool error, `node_complete` with `status: "failure"`, or validation error), the pipeline stops.
 - All remaining nodes are marked as **skipped** in the progress display.
 - The error message is surfaced to the user.
 
 ### Model fallback
 
-When a node's primary model is unavailable or returns an API error, you can configure an automatic retry with a different model using `fallback_tier`:
+Agent nodes automatically retry once at the next lower model tier after an execution error. The current implementation applies this to any agent-node error, including `node_complete(status="failure")`:
 
-```yaml
-- id: synthesize
-  tier: strong         # try the strong model first
-  fallback_tier: direct  # fall back to the base model on API failure
-  prompt: |
-    Synthesize the findings into a final report.
-  outputs:
-    report: result
-```
+- `strong` retries with `medium`
+- `medium` retries with the base model
+- `base` has no lower-tier retry
 
-The fallback only triggers on **LLM API errors** (model unavailable, rate limit, network failure). It does not retry if:
-- The agent deliberately called `node_complete` with `status: "failure"`
-- The pipeline context was cancelled (e.g. user sent `/stop`)
+Cancellation does not retry. There is currently no per-node fallback override.
 
 Design pipelines so that each node is robust enough to succeed on its own, or use `validate: not_empty` to surface missing data early.
 
@@ -505,7 +491,16 @@ name: research-report
 description: "Search multiple queries in parallel, then synthesize a report."
 vars:
   queries: []
+returns: report
 pipeline:
+  - id: prepare_queries
+    prompt: |
+      Turn the user's request into a JSON-compatible list of focused search
+      queries and return it as vars.queries.
+      Request: {{$vars.input}}
+    outputs:
+      queries: queries
+
   - id: search_all
     type: auto
     tool: web_search
@@ -526,8 +521,6 @@ pipeline:
 
   - id: extract_facts
     foreach: $vars.articles
-    no_context: true # pure extraction, no workspace context needed
-    output_context: true # findings flow forward automatically
     prompt: |
       Extract the 3 most important facts from this article:
 
@@ -535,12 +528,15 @@ pipeline:
 
       Call node_complete with:
       - status: "success"
-      - context: a brief summary of the key facts (2–3 sentences)
+      - vars.result: a brief summary of the key facts (2–3 sentences)
+    outputs:
+      facts: result
 
   - id: write_report
     tier: strong # use the strongest model for synthesis
     prompt: |
-      Write a comprehensive research report based on the findings above.
+      Write a comprehensive research report based on these findings:
+      {{$vars.facts}}
       Structure it with an executive summary, key findings, and conclusion.
     outputs:
       report: result
@@ -588,6 +584,5 @@ If a tier is not set here, the corresponding `[router]` model is used as a fallb
 - **Keep nodes small.** A node that does one thing is easier to debug than one that does five.
 - **Name output keys clearly.** `search_results`, `article_content`, `final_summary` — not `data`, `out`, `result` everywhere.
 - **Use `auto` for mechanical steps.** File reads, web fetches, and shell commands don't need an LLM.
-- **Use `no_context` for pure generation.** Nodes translating, formatting, or generating from scratch don't benefit from workspace context.
-- **Use `output_context` sparingly.** It's powerful for multi-node research, but clutters the prompt for simple sequential pipelines.
 - **Declare all variables in `vars`.** Even as empty strings. It documents the pipeline's data contract at a glance.
+- **Declare `returns`.** It makes the user-visible output explicit and avoids relying on common variable names.

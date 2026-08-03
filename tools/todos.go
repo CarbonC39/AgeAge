@@ -17,9 +17,9 @@ type TodoItem struct {
 // TodoStore is a thread-safe, per-run task list shared between the agent and
 // the UpdateTodosTool. The agent holds a pointer to clear it after finish_task.
 type TodoStore struct {
-	mu         sync.Mutex
-	items      []TodoItem
-	todoMsgID  string // platform message ID of the first todo notification sent this session
+	mu        sync.Mutex
+	items     []TodoItem
+	todoMsgID string // platform message ID of the first todo notification sent this session
 
 	// NotifyFunc is a simple fire-and-forget notifier (for non-editable channels).
 	NotifyFunc func(string)

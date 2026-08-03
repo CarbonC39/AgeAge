@@ -136,21 +136,24 @@ func (m *Manager) StartAll() error {
 		m.mu.Unlock()
 		return fmt.Errorf("channel manager already running")
 	}
-	m.running = true
-	m.mu.Unlock()
-
 	if len(m.channels) == 0 {
+		m.mu.Unlock()
 		return fmt.Errorf("no channels registered")
 	}
+	m.running = true
+	channels := append([]Channel(nil), m.channels...)
+	m.mu.Unlock()
 
-	errCh := make(chan error, len(m.channels))
+	errCh := make(chan error, len(channels))
 
-	for _, ch := range m.channels {
+	for _, ch := range channels {
 		go func(c Channel) {
 			fmt.Printf("Starting channel: %s\n", c.Name())
 			if err := c.Start(m.handler); err != nil {
 				errCh <- fmt.Errorf("channel %s failed: %w", c.Name(), err)
+				return
 			}
+			errCh <- nil
 		}(ch)
 	}
 

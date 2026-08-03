@@ -35,7 +35,7 @@ type ThinkStreamFilter struct {
 	OnThinkEnd   func()
 
 	// streaming state
-	buf         string          // accumulates tokens until a safe flush point
+	buf         string // accumulates tokens until a safe flush point
 	inThink     bool
 	closeTag    string          // closing tag matching the open tag we entered with
 	thinkBuf    strings.Builder // content inside the current think block

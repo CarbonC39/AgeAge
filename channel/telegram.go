@@ -354,7 +354,7 @@ type tgInlineButton struct {
 type tgMessage struct {
 	MessageID       int        `json:"message_id"`
 	Text            string     `json:"text"`
-	Caption         string     `json:"caption"`          // Text for photo/document/voice messages
+	Caption         string     `json:"caption"` // Text for photo/document/voice messages
 	Chat            tgChat     `json:"chat"`
 	From            tgUser     `json:"from"`
 	MessageThreadID int        `json:"message_thread_id"` // Supergroup topic ID; 0 if none

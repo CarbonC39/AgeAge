@@ -15,9 +15,9 @@ Think of a pipeline as a small factory floor:
 
 No node can see another node's internal reasoning or history. They can only see what is explicitly passed through `vars`.
 
-> **Current execution rule:** the first node must be `agent`. `$vars.input` contains
-> the user's raw message, so the first agent is responsible for validating or
-> structuring it before downstream `auto` nodes call typed tools.
+The first node may be `auto` when its arguments are already deterministic. Keep
+in mind that `$vars.input` is the user's raw string: use an initial `agent` node
+when structured fields must be extracted or validated before calling a typed tool.
 
 ---
 
@@ -164,7 +164,9 @@ Spawns an isolated sub-agent. The agent:
 
 Calls a tool directly — no LLM, no agent, just the tool. Extremely fast and deterministic. Use for mechanical steps like reading a file, running a command, or fetching a URL.
 
-An `auto` node cannot currently be the first node in a pipeline.
+An `auto` node may be first when all required arguments are explicit or the tool
+accepts the raw `$vars.input` string. Use an `agent` first when natural language
+must be converted into typed fields.
 
 ```yaml
 - id: fetch_page
@@ -472,13 +474,16 @@ After all nodes complete, the pipeline determines its final result in this order
 
 ### Model fallback
 
-Agent nodes automatically retry once at the next lower model tier after an execution error. The current implementation applies this to any agent-node error, including `node_complete(status="failure")`:
+Agent nodes automatically retry once at the next lower model tier after a model
+or execution error:
 
 - `strong` retries with `medium`
 - `medium` retries with the base model
 - `base` has no lower-tier retry
 
-Cancellation does not retry. There is currently no per-node fallback override.
+Cancellation and deliberate `node_complete(status="failure")` decisions do not
+retry. This avoids repeating side effects after a node has explicitly decided
+the workflow cannot continue. There is currently no per-node fallback override.
 
 Design pipelines so that each node is robust enough to succeed on its own, or use `validate: not_empty` to surface missing data early.
 

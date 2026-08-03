@@ -7,10 +7,9 @@ sub-agents; data flows only through a shared `vars` map.
 
 ## Hard Rules (enforced by the validator)
 
-1. **First node must be `type: agent`.** The user's raw natural-language input arrives
-   in `$vars.input` / `{{input}}`. A first node of `type: auto` would feed natural text
-   into a tool's typed schema and fail at the first step. Use the first agent node to
-   extract structured fields for downstream auto nodes.
+1. **Choose the first node from its input contract.** A first `auto` node is valid
+   when its arguments are explicit or its tool accepts the raw `$vars.input` string.
+   Use an `agent` first when natural language must be parsed into structured fields.
 
 2. **The pipeline must produce a returnable variable.** Either declare top-level
    `returns: <name>` where some node outputs `<name>`, OR have at least one node output

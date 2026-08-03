@@ -3,13 +3,18 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"ageage/config"
+	"ageage/llm"
 	"ageage/skills"
 	"ageage/tools"
 )
@@ -71,10 +76,30 @@ pipeline:
       value: result
 `)
 	messages := validationMessages(ValidateSkillFile(path, nil))
-	for _, want := range []string{"first node must be type: agent", `unknown tool "not_a_tool"`, "no node produces"} {
+	for _, want := range []string{`unknown tool "not_a_tool"`, "no node produces"} {
 		if !strings.Contains(messages, want) {
 			t.Errorf("missing %q in:\n%s", want, messages)
 		}
+	}
+}
+
+func TestValidatePipelineAllowsDeterministicFirstAutoNode(t *testing.T) {
+	path := writeAgentTestFile(t, "auto-first.yaml", `
+name: auto-first
+description: direct deterministic call
+tier: base
+returns: answer
+pipeline:
+  - id: read
+    type: auto
+    tool: file_read
+    inputs:
+      path: $vars.input
+    outputs:
+      answer: result
+`)
+	if errs := ValidateSkillFile(path, nil); len(errs) != 0 {
+		t.Fatalf("valid auto-first pipeline errors:\n%s", validationMessages(errs))
 	}
 }
 
@@ -148,6 +173,166 @@ func TestAutoNodePassesTypedVariableInputsToTool(t *testing.T) {
 	}
 	if got.Count != 5 || !got.Enabled || got.Label != "5" {
 		t.Fatalf("typed inputs = %#v (raw %s)", got, capture.args[0])
+	}
+}
+
+func TestPipelineRunsAutoNodeFirst(t *testing.T) {
+	capture := &loopCaptureTool{result: "direct result"}
+	registry := tools.NewRegistry()
+	registry.Register(capture)
+	cfg := config.DefaultConfig()
+	cfg.Workspace = t.TempDir()
+	cfg.WorkDir = cfg.Workspace
+	pipeline := &skills.PipelineSkill{
+		Returns: "answer",
+		Vars:    map[string]interface{}{},
+		Pipeline: []skills.PipelineNode{{
+			ID:   "direct",
+			Type: "auto",
+			Tool: "capture",
+			Inputs: map[string]interface{}{
+				"value": "$vars.input",
+			},
+			Outputs: skills.OutputsMap{"answer": "result"},
+		}},
+	}
+	executor := NewPipelineExecutor(
+		pipeline, nil, &AgentFactory{Config: cfg}, "raw input", "", 0,
+		nil, nil, nil, nil, nil, "", registry,
+	)
+
+	result, err := executor.Run(context.Background())
+	if err != nil || result != "direct result" {
+		t.Fatalf("Run = (%q, %v)", result, err)
+	}
+	if len(capture.args) != 1 || !strings.Contains(string(capture.args[0]), `"value":"raw input"`) {
+		t.Fatalf("tool args = %q", capture.args)
+	}
+}
+
+func TestPipelineDoesNotRetryDeliberateNodeFailure(t *testing.T) {
+	var calls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{
+			"choices":[{
+				"index":0,
+				"message":{
+					"role":"assistant",
+					"tool_calls":[{
+						"id":"call-failure",
+						"type":"function",
+						"function":{
+							"name":"node_complete",
+							"arguments":"{\"status\":\"failure\",\"reason\":\"source is invalid\"}"
+						}
+					}]
+				},
+				"finish_reason":"tool_calls"
+			}]
+		}`)
+	}))
+	defer upstream.Close()
+
+	cfg := config.DefaultConfig()
+	cfg.Workspace = t.TempDir()
+	cfg.WorkDir = cfg.Workspace
+	cfg.Agent.Mode = "full"
+	cfg.LLM.BaseURL = upstream.URL
+	cfg.LLM.Model = "test-model"
+	factory := &AgentFactory{
+		Config:    cfg,
+		LLMClient: llm.NewClient("", upstream.URL, "test-model", false, 0),
+	}
+	pipeline := &skills.PipelineSkill{
+		Returns: "answer",
+		Vars:    map[string]interface{}{},
+		Pipeline: []skills.PipelineNode{{
+			ID:      "decide",
+			Type:    "agent",
+			Tier:    "medium",
+			Tools:   []string{"node_complete"},
+			Prompt:  "Validate the source.",
+			Outputs: skills.OutputsMap{"answer": "result"},
+		}},
+	}
+	executor := NewPipelineExecutor(
+		pipeline, nil, factory, "input", "", 0,
+		nil, nil, nil, nil, nil, "", nil,
+	)
+
+	result, err := executor.Run(context.Background())
+	if err == nil || result != "" || !strings.Contains(err.Error(), "source is invalid") {
+		t.Fatalf("Run = (%q, %v)", result, err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("deliberate failure made %d model calls, want 1", got)
+	}
+}
+
+func TestPipelineRetriesOrdinaryAgentFailureAtFallbackTier(t *testing.T) {
+	var calls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		call := calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		if call == 1 {
+			fmt.Fprint(w, `{"choices":[]}`)
+			return
+		}
+		fmt.Fprint(w, `{
+			"choices":[{
+				"index":0,
+				"message":{
+					"role":"assistant",
+					"tool_calls":[{
+						"id":"call-success",
+						"type":"function",
+						"function":{
+							"name":"node_complete",
+							"arguments":"{\"status\":\"success\",\"vars\":{\"result\":\"fallback result\"}}"
+						}
+					}]
+				},
+				"finish_reason":"tool_calls"
+			}]
+		}`)
+	}))
+	defer upstream.Close()
+
+	cfg := config.DefaultConfig()
+	cfg.Workspace = t.TempDir()
+	cfg.WorkDir = cfg.Workspace
+	cfg.Agent.Mode = "full"
+	cfg.LLM.BaseURL = upstream.URL
+	cfg.LLM.Model = "test-model"
+	factory := &AgentFactory{
+		Config:    cfg,
+		LLMClient: llm.NewClient("", upstream.URL, "test-model", false, 0),
+	}
+	pipeline := &skills.PipelineSkill{
+		Returns: "answer",
+		Vars:    map[string]interface{}{},
+		Pipeline: []skills.PipelineNode{{
+			ID:      "recover",
+			Type:    "agent",
+			Tier:    "medium",
+			Tools:   []string{"node_complete"},
+			Prompt:  "Produce a result.",
+			Outputs: skills.OutputsMap{"answer": "result"},
+		}},
+	}
+	executor := NewPipelineExecutor(
+		pipeline, nil, factory, "input", "", 0,
+		nil, nil, nil, nil, nil, "", nil,
+	)
+
+	result, err := executor.Run(context.Background())
+	if err != nil || result != "fallback result" {
+		t.Fatalf("Run = (%q, %v)", result, err)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("ordinary failure made %d model calls, want 2", got)
 	}
 }
 

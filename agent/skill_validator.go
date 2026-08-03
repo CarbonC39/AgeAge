@@ -89,17 +89,6 @@ func ValidateSkillFile(path string, knownTools []string) []ValidationError {
 
 	pl := skill.Pipeline
 
-	// First node must be type:agent — the user's raw natural-language input
-	// arrives in $vars.input and only an agent node can parse it. An auto
-	// first node would try to feed natural text into a tool's typed schema
-	// and fail at the very first step.
-	if len(pl.Pipeline) > 0 && pl.Pipeline[0].Type == "auto" {
-		errs = append(errs, ValidationError{
-			Field:   "pipeline[0].type",
-			Message: "first node must be type: agent — it receives the user's raw natural-language input via $vars.input, which an auto node cannot interpret",
-		})
-	}
-
 	// Collect vars declared in the top-level vars: block.
 	declared := make(map[string]bool, len(pl.Vars))
 	for k := range pl.Vars {

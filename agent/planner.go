@@ -261,10 +261,9 @@ func (p *Planner) buildSystemPrompt(guide, pipeline string) string {
 		"→ use .md, not a pipeline.\n\n")
 
 	sb.WriteString("## Pipeline Hard Rules (apply when writing .yaml)\n\n" +
-		"1. The FIRST pipeline node MUST be `type: agent`. The user's raw natural-language\n" +
-		"   message arrives in `{{input}}` / `$vars.input` — a `type: auto` first node would\n" +
-		"   feed natural language into a tool's typed schema and crash. Use the first agent\n" +
-		"   node to parse/extract structured values for later auto nodes.\n" +
+		"1. A first `type: auto` node is valid only when all required arguments are explicit\n" +
+		"   or its tool accepts the raw `{{input}}` / `$vars.input` string. If natural language\n" +
+		"   must be parsed into structured fields, use a first `type: agent` node instead.\n" +
 		"2. The LAST pipeline node MUST produce the variable named in top-level `returns:`\n" +
 		"   (or one of `result`/`output`/`answer`). Its prompt MUST explicitly instruct the\n" +
 		"   sub-agent: \"the user sees ONLY this value — put the COMPLETE final answer here.\"\n" +
@@ -303,7 +302,7 @@ func (p *Planner) buildSystemPrompt(guide, pipeline string) string {
 		"returns: answer\n" +
 		"pipeline:\n" +
 		"  - id: extract\n" +
-		"    type: agent          # rule 1: first node is agent\n" +
+		"    type: agent          # parses the user's request for this workflow\n" +
 		"    tier: base\n" +
 		"    prompt: |\n" +
 		"      Goal: extract the URL the user wants analyzed.\n" +

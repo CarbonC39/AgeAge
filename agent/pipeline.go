@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
 	"regexp"
@@ -25,6 +26,15 @@ const (
 	nodeStatusFailed  = "failed"
 	nodeStatusSkipped = "skipped"
 )
+
+// nodeReportedFailureError marks a deliberate node_complete(status="failure")
+// decision. Unlike model or execution errors, retrying it at another tier can
+// repeat side effects and cannot turn the declared failure into success.
+type nodeReportedFailureError struct {
+	reason string
+}
+
+func (e *nodeReportedFailureError) Error() string { return e.reason }
 
 // PipelineExecutor orchestrates execution of a YAML pipeline skill.
 //
@@ -112,18 +122,6 @@ func NewPipelineExecutor(
 
 // Run executes all pipeline nodes in sequence and returns the final result.
 func (e *PipelineExecutor) Run(ctx context.Context) (string, error) {
-	// Runtime sanity check that complements skill_validator: the first node
-	// must be type:agent because $vars.input contains the user's raw
-	// natural-language text. An auto first node would feed that text into a
-	// tool's typed schema and fail.
-	if len(e.ps.Pipeline) > 0 && strings.ToLower(e.ps.Pipeline[0].Type) == "auto" {
-		skillName := ""
-		if e.skill != nil {
-			skillName = e.skill.Name
-		}
-		return "", fmt.Errorf("pipeline %q: first node must be type:agent (auto cannot parse the user's natural-language input)", skillName)
-	}
-
 	// Only the top-level executor manages todo display.
 	if e.nestDepth == 0 {
 		e.updateTodos()
@@ -568,6 +566,10 @@ func (e *PipelineExecutor) execAgentNode(ctx context.Context, node skills.Pipeli
 		if ctx.Err() != nil {
 			return err
 		}
+		var reportedFailure *nodeReportedFailureError
+		if errors.As(err, &reportedFailure) {
+			return err
+		}
 		lastErr = err
 	}
 	return lastErr
@@ -664,7 +666,7 @@ func (e *PipelineExecutor) runAgentNodeAttempt(
 			reason = "node reported failure without a reason"
 		}
 		// node_complete(failure) is a deliberate agent decision — do not retry.
-		return nil, fmt.Errorf("%s", reason)
+		return nil, &nodeReportedFailureError{reason: reason}
 	}
 
 	// Surface LLM errors not already handled above (node_complete was called but run also errored).

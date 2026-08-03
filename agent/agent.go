@@ -59,7 +59,7 @@ type turnRecord struct {
 // Agent is the core agent that drives the conversation and tool execution loop.
 type Agent struct {
 	cfg          *config.Config
-	client       *llm.Client
+	client       ChatClient
 	registry     *tools.Registry
 	finishTool   *tools.FinishTool
 	router       *Router
@@ -92,7 +92,7 @@ type Agent struct {
 }
 
 // NewAgent creates a new agent instance.
-func NewAgent(cfg *config.Config, client *llm.Client, registry *tools.Registry, finishTool *tools.FinishTool, loadedSkills []skills.Skill, debug bool) *Agent {
+func NewAgent(cfg *config.Config, client ChatClient, registry *tools.Registry, finishTool *tools.FinishTool, loadedSkills []skills.Skill, debug bool) *Agent {
 	ag := &Agent{
 		cfg:           cfg,
 		client:        client,
@@ -595,7 +595,7 @@ func (a *Agent) injectSkillTools(skill *skills.Skill) func() {
 // buildExecPlan selects the tool set and LLM client for a run based on the
 // router result and active skill.
 // Returns toolDefs, the initial LLM client, and whether an upgraded model was used.
-func (a *Agent) buildExecPlan(rr *RouterResult, skill *skills.Skill) (toolDefs []llm.ToolDef, activeClient *llm.Client, upgradeUsed bool) {
+func (a *Agent) buildExecPlan(rr *RouterResult, skill *skills.Skill) (toolDefs []llm.ToolDef, activeClient ChatClient, upgradeUsed bool) {
 	activeClient = a.client
 
 	// Collect the tool list for this run.
@@ -665,7 +665,7 @@ func (a *Agent) buildExecPlan(rr *RouterResult, skill *skills.Skill) (toolDefs [
 }
 
 // runLoop executes the main LLM ↔ tool iteration loop.
-func (a *Agent) runLoop(ctx context.Context, streamCb llm.StreamCallback, toolDefs []llm.ToolDef, activeClient *llm.Client, upgradeUsed bool) (string, error) {
+func (a *Agent) runLoop(ctx context.Context, streamCb llm.StreamCallback, toolDefs []llm.ToolDef, activeClient ChatClient, upgradeUsed bool) (string, error) {
 	fallbackUsed := false
 	textOnlyStreak := 0 // consecutive responses with no tool calls and no finish_task
 
@@ -1365,7 +1365,7 @@ func (a *Agent) SetChannelID(channelID string) {
 }
 
 // SetLLMClient overrides the LLM client for this agent.
-func (a *Agent) SetLLMClient(client *llm.Client) {
+func (a *Agent) SetLLMClient(client ChatClient) {
 	a.client = client
 	if a.summarizer != nil {
 		a.summarizer.SetClient(client)

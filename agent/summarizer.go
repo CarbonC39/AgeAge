@@ -12,12 +12,12 @@ import (
 // Summarizer compresses conversation history to save tokens.
 type Summarizer struct {
 	cfg    *config.Config
-	client *llm.Client
+	client ChatClient
 	debug  bool
 }
 
 // NewSummarizer creates a new Summarizer.
-func NewSummarizer(cfg *config.Config, client *llm.Client, debug bool) *Summarizer {
+func NewSummarizer(cfg *config.Config, client ChatClient, debug bool) *Summarizer {
 	return &Summarizer{
 		cfg:    cfg,
 		client: client,
@@ -47,7 +47,7 @@ func (s *Summarizer) ShouldSummarize(messages []llm.Message) bool {
 
 // SetClient replaces the LLM client used to build the summarization client.
 // Called by Agent.SetLLMClient so the summarizer tracks credential changes.
-func (s *Summarizer) SetClient(client *llm.Client) {
+func (s *Summarizer) SetClient(client ChatClient) {
 	s.client = client
 }
 

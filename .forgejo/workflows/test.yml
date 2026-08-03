@@ -1,0 +1,34 @@
+name: Test
+
+on:
+  push:
+    branches:
+      - public
+  pull_request:
+
+jobs:
+  test:
+    runs-on: codeberg-small
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Format check
+        run: |
+          files=$(gofmt -l $(git ls-files '*.go'))
+          test -z "$files" || { echo "$files"; exit 1; }
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test -race -count=1 ./...
+
+      - name: Build
+        run: go build ./...

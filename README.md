@@ -305,6 +305,25 @@ ageage/
 
 ---
 
+## Development
+
+Run the local verification suite before submitting changes:
+
+```sh
+gofmt -w $(git ls-files '*.go')
+go vet ./...
+go test ./...
+go test -race ./...
+go build ./...
+```
+
+The Forgejo `Test` workflow runs formatting checks, vet, race-enabled tests, and
+the build automatically for pushes to `public` and for pull requests. Tests use
+temporary directories and local `httptest` servers; they do not require API keys,
+model access, a browser installation, or public network access.
+
+---
+
 ## Dependencies
 
 | Package | Purpose |

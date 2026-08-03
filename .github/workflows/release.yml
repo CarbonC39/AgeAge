@@ -1,0 +1,65 @@
+name: Build and Release
+
+on:
+  push:
+    branches:
+      - public
+
+permissions:
+  contents: write
+
+concurrency:
+  group: rolling-release
+  cancel-in-progress: true
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build binaries
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          mkdir -p dist
+          targets="linux/amd64 linux/arm64 windows/amd64 darwin/amd64 darwin/arm64"
+          for target in $targets; do
+            export GOOS=${target%/*} GOARCH=${target#*/}
+            output="dist/ageage-${GOOS}-${GOARCH}"
+            [ "$GOOS" = "windows" ] && output="${output}.exe"
+            echo "Building $output"
+            go build -trimpath -ldflags "-s -w" -o "$output" .
+          done
+
+      - name: Publish rolling release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git tag --force latest "$GITHUB_SHA"
+          git push origin refs/tags/latest --force
+
+          notes="Rolling build from ${GITHUB_SHA}"
+          if gh release view latest >/dev/null 2>&1; then
+            gh release upload latest dist/* --clobber
+            gh release edit latest \
+              --target "$GITHUB_SHA" \
+              --title "Latest build" \
+              --notes "$notes" \
+              --latest
+          else
+            gh release create latest dist/* \
+              --target "$GITHUB_SHA" \
+              --title "Latest build" \
+              --notes "$notes" \
+              --latest
+          fi

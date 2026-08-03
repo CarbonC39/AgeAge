@@ -317,7 +317,7 @@ go test -race ./...
 go build ./...
 ```
 
-The Forgejo `Test` workflow runs formatting checks, vet, race-enabled tests, and
+The GitHub Actions `Test` workflow runs formatting checks, vet, race-enabled tests, and
 the build automatically for pushes to `public` and for pull requests. Tests use
 temporary directories and local `httptest` servers; they do not require API keys,
 model access, a browser installation, or public network access.

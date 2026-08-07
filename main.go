@@ -237,7 +237,7 @@ func runInit(cmd *cobra.Command, args []string) error {
 	fmt.Println(strings.Repeat("═", 52))
 
 	// ─── 1/7  Storage ────────────────────────────────────────
-	printInitSection("1/7  Storage")
+	printInitSection("1/8  Storage")
 	fmt.Println("AgeAge directory — one folder for config.toml, AGENT.md, SOUL.md,")
 	fmt.Println("memories, skills, and session data.")
 	fmt.Println("Launch with: ageage cli -c <dir>/config.toml")
@@ -253,7 +253,7 @@ func runInit(cmd *cobra.Command, args []string) error {
 	workspace := readLine(reader, ".")
 
 	// ─── 2/7  LLM Provider ───────────────────────────────────
-	printInitSection("2/7  LLM Provider")
+	printInitSection("2/8  LLM Provider")
 	fmt.Println("Base URL examples:")
 	fmt.Println("  OpenAI:    https://api.openai.com/v1")
 	fmt.Println("  Anthropic: https://api.anthropic.com/v1")
@@ -278,7 +278,7 @@ func runInit(cmd *cobra.Command, args []string) error {
 	model := pickModel(reader, baseURL, apiKey)
 
 	// ─── 3/7  Agent Behavior ─────────────────────────────────
-	printInitSection("3/7  Agent Behavior")
+	printInitSection("3/8  Agent Behavior")
 	fmt.Println("Mode:")
 	fmt.Println("  1) supervised — pause for confirmation before every tool call")
 	fmt.Println("                  Recommended for CLI use; you review each action")
@@ -290,11 +290,11 @@ func runInit(cmd *cobra.Command, args []string) error {
 		agentMode = "full"
 	}
 
-	// ─── 4/7  Intent Router ──────────────────────────────────
-	printInitSection("4/7  Intent Router  (optional)")
+	// ─── 4/8  Intent Router ──────────────────────────────────
+	printInitSection("4/8  Intent Router  (optional)")
 	fmt.Println("The router classifies each request by answering 3 factual checks")
 	fmt.Println("(needs tools? needs multiple steps? needs synthesis?) and routes to")
-	fmt.Println("the right model tier — direct, atomic, or workflow.")
+	fmt.Println("the right model tier — base, medium, or strong.")
 	fmt.Println("Requires at least a cheap classifier model; strong model is optional.")
 	fmt.Println("Skip if you use a single model for everything.")
 	fmt.Print("Configure router? (y/N): ")
@@ -304,15 +304,15 @@ func runInit(cmd *cobra.Command, args []string) error {
 		classDefault := suggestModel(baseURL)
 		fmt.Printf("  Classifier model (cheap; used for intent classification; default: %s): ", classDefault)
 		routerClassifier = readLine(reader, classDefault)
-		fmt.Printf("  Atomic model (single-tool tasks; default: %s): ", model)
+		fmt.Printf("  Medium model (single-tool tasks; default: %s): ", model)
 		routerMedium = readLine(reader, model)
 		strongDefault := getStrongModel(baseURL, model)
-		fmt.Printf("  Workflow model (multi-step tasks; default: %s): ", strongDefault)
+		fmt.Printf("  Strong model (multi-step tasks; default: %s): ", strongDefault)
 		routerStrong = readLine(reader, strongDefault)
 	}
 
 	// ─── 5/7  Skill Quality  ─────────────────────────────────
-	printInitSection("5/7  Skill Quality  (optional)")
+	printInitSection("5/8  Skill Quality  (optional)")
 	fmt.Println("The Evaluator reviews auto-generated skills after they run,")
 	fmt.Println("patching deficiencies in the background. It stops once a skill")
 	fmt.Println("passes N consecutive times (success threshold).")
@@ -329,7 +329,7 @@ func runInit(cmd *cobra.Command, args []string) error {
 	}
 
 	// ─── 6/7  Web Tools ──────────────────────────────────────
-	printInitSection("6/7  Web Tools")
+	printInitSection("6/8  Web Tools")
 	fmt.Println("Search backend:")
 	fmt.Println("  1) DuckDuckGo  — no API key, works immediately")
 	fmt.Println("  2) Brave       — higher quality results (Brave Search API key required)")
@@ -345,8 +345,8 @@ func runInit(cmd *cobra.Command, args []string) error {
 	fmt.Print("Select (default: 1): ")
 	fetchBackend, jinaKey, pythonCmd := parseFetchChoice(reader, readLine(reader, "1"))
 
-	// ─── 7/7  Default Tools ───────────────────────────────────
-	printInitSection("7/7  Default Tools")
+	// ─── 7/8  Default Tools ───────────────────────────────────
+	printInitSection("7/8  Default Tools")
 	fmt.Println("All tools are enabled by default. An allowlist restricts the agent to")
 	fmt.Println("only the tools you name (useful for leaner or constrained deployments).")
 	fmt.Print("Customize tool allowlist? (y/N): ")
@@ -355,6 +355,36 @@ func runInit(cmd *cobra.Command, args []string) error {
 		selectedTools = selectTools(reader, nil)
 	}
 	toolsLine := toolsLineFromSlice(selectedTools)
+
+	// ─── 8/8  Advanced Settings (optional) ────────────────────
+	// Newer safety/context switches live behind a single gate: answering "n"
+	// keeps the sensible defaults (forbid_rm off, auto-create on, no
+	// summarization, tool-call compression on).
+	printInitSection("8/8  Advanced Settings  (optional)")
+	advancedSet := strings.ToLower(readLine(reader, "n")) == "y"
+
+	// Effective values; defaults apply unless the user explicitly opts in below.
+	forbidRM := false         // [security] forbid_rm
+	plannerEnabled := true    // [planner] enabled
+	summarizeEnabled := false // [summarize] enabled
+	keepRawToolCalls := false // [history] compress_tool_turns = false
+
+	if advancedSet {
+		fmt.Println("  These control destructive-action safety and context behaviour.")
+
+		fmt.Println()
+		fmt.Print("  Block permanent deletion (rm)? The agent must then use the system trash (y/N): ")
+		forbidRM = strings.ToLower(readLine(reader, "n")) == "y"
+
+		fmt.Print("  Auto-create skills for recurring workflows? (Y/n) [router must be enabled]: ")
+		plannerEnabled = strings.ToLower(readLine(reader, "y")) != "n"
+
+		fmt.Print("  Auto-compress long conversations with an LLM summary? (y/N): ")
+		summarizeEnabled = strings.ToLower(readLine(reader, "n")) == "y"
+
+		fmt.Print("  Preserve raw tool calls in history for KV-cache hits (disable compression)? (y/N): ")
+		keepRawToolCalls = strings.ToLower(readLine(reader, "n")) == "y"
+	}
 
 	// ─── Generate files ───────────────────────────────────────
 	for _, d := range []string{
@@ -379,7 +409,8 @@ func runInit(cmd *cobra.Command, args []string) error {
 			routerEnabled, routerClassifier, routerMedium, routerStrong,
 			evalEnabled, evalThreshold,
 			searchBackend, searxngURL, tavilyKey, braveKey,
-			fetchBackend, jinaKey, pythonCmd)
+			fetchBackend, jinaKey, pythonCmd,
+			forbidRM, plannerEnabled, summarizeEnabled, keepRawToolCalls)
 		if err := os.WriteFile(cfgPath, []byte(content), 0o644); err != nil {
 			return fmt.Errorf("failed to write config: %w", err)
 		}
@@ -427,6 +458,7 @@ You are a helpful, friendly, and knowledgeable AI assistant.
 	fmt.Println("  /session new [name]  — start a fresh named session")
 	fmt.Println("  /undo                — roll back the last turn")
 	fmt.Println("  /help                — list all commands")
+	fmt.Println("  ageage cron list     — manage scheduled tasks")
 	fmt.Println()
 	fmt.Println("More options in config.toml:")
 	fmt.Println("  [summarize]    — auto-compress long conversation history")
@@ -438,6 +470,9 @@ You are a helpful, friendly, and knowledgeable AI assistant.
 	fmt.Println("  [multimodal]   — vision and document converter settings")
 	fmt.Println("  [bash]         — auto-allow commands, env var passthrough")
 	fmt.Println("  [security]     — restrict paths, blocked commands, forbid_rm")
+	fmt.Println()
+	fmt.Println("Reference: example.config.toml in the repo root is a fully")
+	fmt.Println("           commented copy of every available option.")
 	fmt.Println()
 	return nil
 }
@@ -583,6 +618,7 @@ func buildInitConfig(
 	evalEnabled bool, evalThreshold int,
 	searchBackend, searxngURL, tavilyKey, braveKey string,
 	fetchBackend, jinaKey, pythonCmd string,
+	forbidRM, plannerEnabled, summarizeEnabled, keepRawToolCalls bool,
 ) string {
 	if pythonCmd == "" {
 		pythonCmd = "python"
@@ -622,7 +658,11 @@ func buildInitConfig(
 
 	p("[planner]\n")
 	p("# Controls automatic skill creation for recurring workflows.\n")
-	p("enabled = true  # false = never auto-create skills/pipelines (creation is manual only)\n\n")
+	if plannerEnabled {
+		p("enabled = true   # auto-create skills/pipelines for recurring workflows\n\n")
+	} else {
+		p("enabled = false  # never auto-create skills/pipelines (creation is manual only)\n\n")
+	}
 
 	if routerEnabled {
 		p("[router]\n")
@@ -664,7 +704,11 @@ func buildInitConfig(
 
 	p("[summarize]\n")
 	p("# Auto-compress long conversation history to stay within context limits.\n")
-	p("enabled     = false\n")
+	if summarizeEnabled {
+		p("enabled     = true\n")
+	} else {
+		p("enabled     = false\n")
+	}
 	p("# model     = \"\"  # defaults to [llm].model; use a cheaper model to save cost\n")
 	p("threshold   = 10  # compress after this many message pairs\n")
 	p("keep_recent = 4   # keep N most recent messages intact after compression\n\n")
@@ -672,7 +716,11 @@ func buildInitConfig(
 	p("[history]\n")
 	p("# In-place compression: collapses old tool-call turns into narrative text.\n")
 	p("# Disable to keep raw tool-call JSON byte-identical across turns (KV-cache hits).\n")
-	p("compress_tool_turns = true\n")
+	if keepRawToolCalls {
+		p("compress_tool_turns = false  # keep raw tool-call JSON for KV-cache stability\n")
+	} else {
+		p("compress_tool_turns = true\n")
+	}
 	p("keep_recent_turns   = 2\n\n")
 
 	p("[cron]\n")
@@ -722,7 +770,7 @@ func buildInitConfig(
 	p("]\n")
 	p("allowed_roots   = []  # extra roots the agent may access; empty = workspace only\n")
 	p("forbidden_roots = []  # paths the agent can never access regardless of allowed_roots\n")
-	p("forbid_rm       = false  # true = block rm in bash entirely; agent must use system trash\n\n")
+	p("forbid_rm       = %t  # true = block rm in bash entirely; agent must use system trash\n\n", forbidRM)
 
 	p("[multimodal]\n")
 	p("vision          = true        # false if your model does not support images\n")
@@ -785,11 +833,11 @@ func suggestModel(baseURL string) string {
 	case strings.Contains(baseURL, "deepseek"):
 		return "deepseek-chat"
 	case strings.Contains(baseURL, "generativelanguage") || strings.Contains(baseURL, "gemini"):
-		return "gemini-2.0-flash"
+		return "gemini-3.5-flash"
 	case strings.Contains(baseURL, "mistral"):
 		return "mistral-small-latest"
 	case strings.Contains(baseURL, "11434"): // Ollama
-		return "llama3.2"
+		return "llama3.3"
 	default:
 		return "gpt-4o-mini"
 	}
@@ -811,7 +859,7 @@ func getStrongModel(baseURL, baseModel string) string {
 	case strings.Contains(baseURL, "mistral"):
 		return "mistral-large-latest"
 	case strings.Contains(baseURL, "generativelanguage") || strings.Contains(baseURL, "gemini"):
-		return strings.ReplaceAll(baseModel, "flash", "pro")
+		return "gemini-3.1-pro"
 	case strings.Contains(baseURL, "deepseek"):
 		return "deepseek-reasoner"
 	case strings.Contains(baseModel, "gpt-4o-mini"):

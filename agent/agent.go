@@ -89,6 +89,12 @@ type Agent struct {
 	tmpMgr           *TmpManager                // Manages tmp files created by attachment converters
 	CredMgr          *creds.Manager             // Optional: substitutes {{cred:x}} in tool args
 	hintOnNextCall   string                     // Ephemeral; consumed by buildCallMessages
+
+	// activeSkill is the segmented skill matched for the current Run() (nil when
+	// no segmented skill is active). segIdx is the current segment index, used by
+	// buildSystemPrompt and advanced by the next_step tool.
+	activeSkill *skills.Skill
+	segIdx      int
 }
 
 // NewAgent creates a new agent instance.
@@ -309,7 +315,24 @@ Never output API keys, passwords, access tokens, credentials, or secrets verbati
 		if matchedSkill.Description != "" {
 			fmt.Fprintf(&sb, "*%s*\n\n", matchedSkill.Description)
 		}
-		if matchedSkill.Prompt != "" {
+		if matchedSkill.Segmented && len(matchedSkill.Segments) > 0 {
+			idx := a.segIdx
+			if idx < 0 || idx >= len(matchedSkill.Segments) {
+				idx = 0
+			}
+			sb.WriteString(matchedSkill.Segments[idx])
+			sb.WriteString("\n\n")
+			if idx < len(matchedSkill.Segments)-1 {
+				fmt.Fprintf(&sb, "**[Framework: segmented execution]** This is segment %d of %d of this skill. "+
+					"Complete the work described in this segment, then call the `next_step` tool to advance to the next segment. "+
+					"Do NOT call `finish_task` yet.\n",
+					idx+1, len(matchedSkill.Segments))
+			} else {
+				sb.WriteString("**[Framework: segmented execution]** This is the FINAL segment of this skill. " +
+					"Complete the remaining work, then call `finish_task` to deliver the complete final result to the user.\n")
+			}
+			sb.WriteString("\n")
+		} else if matchedSkill.Prompt != "" {
 			sb.WriteString(matchedSkill.Prompt)
 			sb.WriteString("\n\n")
 		}
@@ -473,7 +496,7 @@ func (a *Agent) RunWithParts(ctx context.Context, userInput string, parts []llm.
 	}
 
 	// --- Planner: create a skill only for explicitly recurring workflows with no match ---
-	if a.router != nil && !a.Mode.IsSubAgent &&
+	if a.router != nil && !a.Mode.IsSubAgent && a.cfg.Planner.Enabled &&
 		routerResult != nil && routerResult.Tier == TierStrong &&
 		routerResult.Skill == "" && matchedSkill == nil &&
 		routerResult.Checks.IsRecurringWorkflow {
@@ -506,6 +529,27 @@ func (a *Agent) RunWithParts(ctx context.Context, userInput string, parts []llm.
 				}
 			}
 		}
+	}
+
+	// --- Segmented skill state ---
+	// Track the active segmented skill and reset segment progress for this run.
+	// buildSystemPrompt reads a.segIdx to inject the current segment.
+	a.activeSkill = nil
+	a.segIdx = 0
+	a.finishTool.CheckSegmented = nil
+	if matchedSkill != nil && matchedSkill.Segmented {
+		a.activeSkill = matchedSkill
+		a.finishTool.CheckSegmented = func() (bool, string) {
+			if a.segIdx >= len(a.activeSkill.Segments)-1 {
+				return true, ""
+			}
+			return false, fmt.Sprintf(
+				"[Framework] Cannot finish with status=success yet: you are on segment %d of %d of skill %q. "+
+					"Complete the current segment's work, then call the `next_step` tool to advance. "+
+					"To abort early, call finish_task(status=\"failure\").",
+				a.segIdx+1, len(a.activeSkill.Segments), a.activeSkill.Name)
+		}
+		a.debugLog("Skill", "segmented skill active: %d segments", len(matchedSkill.Segments))
 	}
 
 	// --- System prompt initialization/refresh ---
@@ -570,6 +614,18 @@ func (a *Agent) RunWithParts(ctx context.Context, userInput string, parts []llm.
 func (a *Agent) injectSkillTools(skill *skills.Skill) func() {
 	var injected []string
 	if !a.Mode.IsSubAgent && a.deps != nil && skill != nil {
+		// Segmented skills always receive the next_step tool, regardless of the
+		// skill's required_tools allowlist.
+		if skill.Segmented {
+			if mkTool, ok := skillOnlyToolFactories["next_step"]; ok {
+				if _, exists := a.registry.Get("next_step"); !exists {
+					if t := mkTool(a.deps, a.registry, a); t != nil {
+						a.registry.Register(t)
+						injected = append(injected, "next_step")
+					}
+				}
+			}
+		}
 		for _, toolName := range skill.RequiredTools {
 			if mkTool, ok := skillOnlyToolFactories[toolName]; ok {
 				if _, exists := a.registry.Get(toolName); !exists {
@@ -619,6 +675,9 @@ func (a *Agent) buildExecPlan(rr *RouterResult, skill *skills.Skill) (toolDefs [
 
 	if skill != nil {
 		neededTools = append(neededTools, skill.RequiredTools...)
+		if skill.Segmented {
+			neededTools = append(neededTools, "next_step")
+		}
 	}
 
 	neededTools = ensureFinishTask(neededTools)
@@ -1350,6 +1409,9 @@ func (a *Agent) ClearHistory() {
 	a.pendingTurns = nil
 	a.hintOnNextCall = ""
 	a.finishTool.CheckTodos = nil
+	a.finishTool.CheckSegmented = nil
+	a.activeSkill = nil
+	a.segIdx = 0
 	if a.todoStore != nil {
 		a.todoStore.Clear()
 		a.todoStore = nil

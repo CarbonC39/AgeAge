@@ -10,6 +10,7 @@ import (
 
 	"ageage/config"
 	"ageage/llm"
+	"ageage/skills"
 	"ageage/tools"
 )
 
@@ -307,5 +308,71 @@ func TestAgentRunPropagatesBaseClientError(t *testing.T) {
 	}
 	if got := fmt.Sprint(ag.Messages()); !strings.Contains(got, "question") {
 		t.Fatalf("conversation lost user input: %s", got)
+	}
+}
+
+func TestAgentRunSegmentedSkillAdvancesSegments(t *testing.T) {
+	segSkill := &skills.Skill{
+		Name:      "segtest",
+		Segmented: true,
+		Segments:  []string{"Segment ONE instructions here.", "Segment TWO final instructions."},
+	}
+	client := &fakeChatClient{steps: []fakeChatStep{
+		{message: toolCallMessage("next_step", `{}`, "call-next")},
+		{message: finishMessage("final result")},
+	}}
+	ag := newLoopTestAgent(t, client, nil)
+	ag.skills = []skills.Skill{*segSkill}
+	// No factory deps in the test harness, so inject next_step manually.
+	ag.registry.Register(&NextStepTool{agent: ag})
+
+	result, err := ag.Run(context.Background(), "/segtest", nil)
+	if err != nil || result != "final result" {
+		t.Fatalf("Run = (%q, %v)", result, err)
+	}
+	if len(client.calls) != 2 {
+		t.Fatalf("model calls = %d, want 2", len(client.calls))
+	}
+	firstSystem := client.calls[0].messages[0].Content
+	secondSystem := client.calls[1].messages[0].Content
+	if !strings.Contains(firstSystem, "Segment ONE") || strings.Contains(firstSystem, "Segment TWO") {
+		t.Fatalf("first call system prompt should contain only segment 1:\n%s", firstSystem)
+	}
+	if !strings.Contains(firstSystem, "next_step") {
+		t.Fatalf("first call should instruct using next_step:\n%s", firstSystem)
+	}
+	if !strings.Contains(secondSystem, "Segment TWO") || strings.Contains(secondSystem, "Segment ONE") {
+		t.Fatalf("second call system prompt should contain only segment 2:\n%s", secondSystem)
+	}
+	if !strings.Contains(secondSystem, "finish_task") {
+		t.Fatalf("second call should instruct using finish_task:\n%s", secondSystem)
+	}
+}
+
+func TestFinishToolBlocksSuccessBeforeFinalSegment(t *testing.T) {
+	segSkill := &skills.Skill{
+		Name:      "segtest",
+		Segmented: true,
+		Segments:  []string{"Segment one.", "Segment two."},
+	}
+	client := &fakeChatClient{steps: []fakeChatStep{
+		// Agent tries to finish on segment 0 → guarded, loop continues with hint.
+		{message: finishMessage("done early")},
+		{message: toolCallMessage("next_step", `{}`, "call-next")},
+		{message: finishMessage("done properly")},
+	}}
+	ag := newLoopTestAgent(t, client, nil)
+	ag.skills = []skills.Skill{*segSkill}
+	ag.registry.Register(&NextStepTool{agent: ag})
+
+	result, err := ag.Run(context.Background(), "/segtest", nil)
+	if err != nil || result != "done properly" {
+		t.Fatalf("Run = (%q, %v)", result, err)
+	}
+	// The guarded finish_task must have returned a tool-result hint telling the
+	// agent to advance instead.
+	secondCall := client.calls[1].messages
+	if !messagesContain(secondCall, "tool", "next_step") {
+		t.Fatalf("blocked finish did not steer the agent to next_step: %#v", secondCall)
 	}
 }

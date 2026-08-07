@@ -37,6 +37,20 @@ prompt: |
 The skill's `tools` list restricts on top of `agent.tools` config — the intersection is used.
 Body content after the frontmatter closing `---` is ignored for regular skills.
 
+HTML comments (`<!-- ... -->`) in the prompt body are stripped at load time and never
+reach the agent. Keep author notes in comments; keep comments inside code fences
+(```` ``` ````) if they are literal content the agent should see.
+
+---
+
+## Segmented Skills
+
+Add `segmented: true` to frontmatter to split the prompt body into ordered segments on
+standalone lines of `===`, `---` or `***`. Only one segment is injected at a time; the
+framework steers the agent with the `next_step` tool between segments, and `finish_task`
+is blocked until the final segment. Use segmented skills for long, strictly-ordered
+workflows where each phase must stay focused.
+
 ---
 
 ## Creating or Modifying a Skill

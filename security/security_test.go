@@ -92,3 +92,50 @@ func TestCommandBlocklistIsCaseInsensitive(t *testing.T) {
 		t.Fatalf("safe command rejected: %s", reason)
 	}
 }
+
+func TestForbidRMBlocksRmInvocations(t *testing.T) {
+	checker := NewChecker(t.TempDir(), nil, nil, nil)
+	checker.SetForbidRM(true)
+
+	blocked := []string{
+		"rm -rf foo",
+		"rm foo.txt",
+		"/usr/bin/rm -r foo",
+		"echo done && rm -rf /tmp/x",
+		"echo done; rm /tmp/x",
+		"sudo rm -rf foo",
+		"command rm foo",
+		"env FOO=1 rm -rf foo",
+		"Remove-Item -Recurse foo",
+		"del /q foo",
+	}
+	for _, cmd := range blocked {
+		if safe, reason := checker.IsCommandSafe(cmd); safe {
+			t.Fatalf("rm command %q was considered safe", cmd)
+		} else if !strings.Contains(reason, "forbid_rm") {
+			t.Fatalf("rm command %q got unexpected reason: %s", cmd, reason)
+		}
+	}
+
+	allowed := []string{
+		"cat rm",
+		"terraform plan",
+		"grep -rm pattern file",
+		"remove foo",
+		"rmdir --help",
+		"go build ./...",
+		"git commit -m 'rm stuff'",
+	}
+	for _, cmd := range allowed {
+		if safe, reason := checker.IsCommandSafe(cmd); !safe {
+			t.Fatalf("safe command %q was blocked: %s", cmd, reason)
+		}
+	}
+}
+
+func TestForbidRMOffAllowsRm(t *testing.T) {
+	checker := NewChecker(t.TempDir(), nil, nil, nil)
+	if safe, reason := checker.IsCommandSafe("rm -rf foo"); !safe {
+		t.Fatalf("rm blocked when forbid_rm is off: %s", reason)
+	}
+}

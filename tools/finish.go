@@ -17,6 +17,9 @@ type FinishTool struct {
 	// CheckTodos, when non-nil, is called on status="success" to verify all todos
 	// are complete. Returns (allDone bool, pendingDescription string).
 	CheckTodos func() (bool, string)
+	// CheckSegmented, when non-nil, is called on status="success" to verify the
+	// agent is on the final segment of a segmented skill. Returns (ok, message).
+	CheckSegmented func() (bool, string)
 }
 
 func (t *FinishTool) Name() string { return "finish_task" }
@@ -62,14 +65,23 @@ func (t *FinishTool) Execute(_ context.Context, args json.RawMessage) (string, e
 	}
 
 	// Validate todos before allowing a success completion.
-	if params.Status == "success" && t.CheckTodos != nil {
-		ok, pending := t.CheckTodos()
-		if !ok {
-			return fmt.Sprintf(
-				"[Framework] Cannot finish with status=success: pending todos remain:\n%s\n\n"+
-					"Complete them first, then call finish_task(status=\"success\"). "+
-					"To abort early, call finish_task(status=\"failure\").", pending), nil
-			// t.Finished stays false — the run loop continues.
+	if params.Status == "success" {
+		if t.CheckTodos != nil {
+			ok, pending := t.CheckTodos()
+			if !ok {
+				return fmt.Sprintf(
+					"[Framework] Cannot finish with status=success: pending todos remain:\n%s\n\n"+
+						"Complete them first, then call finish_task(status=\"success\"). "+
+						"To abort early, call finish_task(status=\"failure\").", pending), nil
+				// t.Finished stays false — the run loop continues.
+			}
+		}
+		if t.CheckSegmented != nil {
+			ok, msg := t.CheckSegmented()
+			if !ok {
+				return msg, nil
+				// t.Finished stays false — the run loop continues.
+			}
 		}
 	}
 

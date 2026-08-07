@@ -150,6 +150,62 @@ func main() {
 	credCmd.AddCommand(credKeygenCmd, credListCmd, credAddCmd, credSetCmd, credRemoveCmd)
 	rootCmd.AddCommand(credCmd)
 
+	// --- ageage cron ---
+	cronCmd := &cobra.Command{
+		Use:   "cron",
+		Short: "Manage scheduled tasks",
+	}
+	cronCmd.PersistentFlags().StringP("config", "c", "", "Path to config.toml")
+
+	cronListCmd := &cobra.Command{
+		Use:   "list",
+		Short: "List scheduled tasks with next-run time and last status",
+		RunE:  runCronList,
+	}
+
+	cronAddCmd := &cobra.Command{
+		Use:   "add <schedule> <command>",
+		Short: "Add a scheduled task",
+		Long: "Add a scheduled task. <command> is free text, or 'skill:<name> [args]' to " +
+			"run an existing skill/pipeline on schedule. Results are delivered to the " +
+			"room named by --delivery (channelType:channelID[:t:threadID]) in connect/serve mode.",
+		Args: cobra.ExactArgs(2),
+		RunE: runCronAdd,
+	}
+	cronAddCmd.Flags().String("delivery", "", "IM delivery target: channelType:channelID or channelType:channelID:t:threadID")
+
+	cronRemoveCmd := &cobra.Command{
+		Use:     "remove <id>",
+		Aliases: []string{"rm"},
+		Short:   "Remove a scheduled task",
+		Args:    cobra.ExactArgs(1),
+		RunE:    runCronRemove,
+	}
+
+	cronRunCmd := &cobra.Command{
+		Use:   "run <id>",
+		Short: "Run a scheduled task immediately",
+		Args:  cobra.ExactArgs(1),
+		RunE:  runCronRun,
+	}
+
+	cronPauseCmd := &cobra.Command{
+		Use:   "pause <id>",
+		Short: "Pause a scheduled task without removing it",
+		Args:  cobra.ExactArgs(1),
+		RunE:  runCronPause,
+	}
+
+	cronResumeCmd := &cobra.Command{
+		Use:   "resume <id>",
+		Short: "Resume a paused scheduled task",
+		Args:  cobra.ExactArgs(1),
+		RunE:  runCronResume,
+	}
+
+	cronCmd.AddCommand(cronListCmd, cronAddCmd, cronRemoveCmd, cronRunCmd, cronPauseCmd, cronResumeCmd)
+	rootCmd.AddCommand(cronCmd)
+
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
 	}
@@ -764,7 +820,7 @@ func detectPython() string {
 // startChannels registers and starts channel connectors based on config.
 // Returns the manager (for shutdown) and count of registered channels.
 // If no channels are enabled, returns nil manager and 0 count.
-func startChannels(factory *agent.AgentFactory) (*channel.Manager, int) {
+func startChannels(factory *agent.AgentFactory) (*channel.Manager, int, func(tools.CronEntry, string)) {
 	cfg := factory.Config
 
 	// Session manager — one per .ageage directory (shared across all chats).
@@ -1522,9 +1578,43 @@ func startChannels(factory *agent.AgentFactory) (*channel.Manager, int) {
 	}
 
 	if registered == 0 {
-		return nil, 0
+		return nil, 0, nil
 	}
-	return manager, registered
+
+	// cronDeliver posts cron run results to the room named in the entry's
+	// delivery field ("channelType:channelID" or "channelType:channelID:t:threadID").
+	cronDeliver := func(e tools.CronEntry, summary string) {
+		if e.Delivery == "" {
+			return
+		}
+		parts := strings.SplitN(e.Delivery, ":", 2)
+		if len(parts) != 2 {
+			fmt.Printf("[cron] invalid delivery target %q\n", e.Delivery)
+			return
+		}
+		ch, ok := channelsByType[parts[0]]
+		if !ok {
+			fmt.Printf("[cron] no channel of type %q for delivery\n", parts[0])
+			return
+		}
+		channelID, threadID := parts[1], ""
+		if idx := strings.Index(channelID, ":t:"); idx >= 0 {
+			threadID = channelID[idx+3:]
+			channelID = channelID[:idx]
+		}
+		msg := fmt.Sprintf("⏰ Cron **%s** ran:\n\n%s", e.ID, summary)
+		if threadID != "" {
+			if te, ok2 := ch.(channel.ThreadEditable); ok2 {
+				if _, err := te.SendMessageInThread(channelID, threadID, threadID, msg); err != nil {
+					fmt.Printf("[cron] delivery error: %s\n", err)
+				}
+				return
+			}
+		}
+		ch.Send(channelID, msg)
+	}
+
+	return manager, registered, cronDeliver
 }
 
 // --- ageage connect ---
@@ -1544,13 +1634,14 @@ func runConnect(cmd *cobra.Command, args []string) error {
 
 	watchCtx, watchCancel := context.WithCancel(context.Background())
 	defer watchCancel()
-	go factory.WatchSkills(watchCtx)
-	go agent.NewCronScheduler(factory.CronStore, factory).Run(watchCtx)
 
-	manager, registered := startChannels(factory)
+	manager, registered, cronDeliver := startChannels(factory)
 	if registered == 0 {
 		return fmt.Errorf("no channels enabled. Enable at least one channel in [channels] config")
 	}
+
+	go factory.WatchSkills(watchCtx)
+	go agent.NewCronScheduler(factory.CronStore, factory, cronDeliver).Run(watchCtx)
 
 	fmt.Printf("\n  ▸ %d channel(s) running  ·  Ctrl+C to stop\n\n", registered)
 
@@ -1585,11 +1676,9 @@ func runServe(cmd *cobra.Command, args []string) error {
 
 	watchCtx, watchCancel := context.WithCancel(context.Background())
 	defer watchCancel()
-	go factory.WatchSkills(watchCtx)
-	go agent.NewCronScheduler(factory.CronStore, factory).Run(watchCtx)
 
-	// Start channel connectors in the background.
-	manager, chCount := startChannels(factory)
+	// Start channel connectors in the background (also provides cron delivery).
+	manager, chCount, cronDeliver := startChannels(factory)
 	if chCount > 0 {
 		fmt.Printf("  ▸ %d channel(s) starting alongside API server\n", chCount)
 		go func() {
@@ -1608,6 +1697,9 @@ func runServe(cmd *cobra.Command, args []string) error {
 			os.Exit(0)
 		}()
 	}
+
+	go factory.WatchSkills(watchCtx)
+	go agent.NewCronScheduler(factory.CronStore, factory, cronDeliver).Run(watchCtx)
 
 	srv := server.NewServer(factory, factory.Config.Server.Host, factory.Config.Server.Port)
 	return srv.Start()
@@ -1633,6 +1725,7 @@ func runCLI(cmd *cobra.Command, args []string) error {
 			factory.Config.Security.AllowedRoots,
 			factory.Config.Security.ForbiddenRoots,
 		)
+		factory.SecurityChecker.SetForbidRM(factory.Config.Security.ForbidRM)
 	} else {
 		fmt.Fprintf(os.Stderr, "warning: could not determine working directory: %s — using workspace as fallback\n", err)
 	}
@@ -1657,7 +1750,9 @@ func runCLI(cmd *cobra.Command, args []string) error {
 	watchCtx, watchCancel := context.WithCancel(context.Background())
 	defer watchCancel()
 	go factory.WatchSkills(watchCtx)
-	go agent.NewCronScheduler(factory.CronStore, factory).Run(watchCtx)
+	go agent.NewCronScheduler(factory.CronStore, factory, func(e tools.CronEntry, summary string) {
+		fmt.Printf("\n  ⏰ Cron %s ran:\n%s\n\n", e.ID, summary)
+	}).Run(watchCtx)
 
 	// ── Session setup ─────────────────────────────────────────────────────────
 	sm := agent.NewSessionManager(factory.Config.AgeAgeDirPath())
@@ -2595,7 +2690,7 @@ func runMCP(cmd *cobra.Command, args []string) error {
 	watchCtx, watchCancel := context.WithCancel(context.Background())
 	defer watchCancel()
 	go factory.WatchSkills(watchCtx)
-	go agent.NewCronScheduler(factory.CronStore, factory).Run(watchCtx)
+	go agent.NewCronScheduler(factory.CronStore, factory, nil).Run(watchCtx)
 
 	mcpSrv := server.NewMCPServer(factory)
 	return mcpSrv.Start()
@@ -2698,6 +2793,163 @@ func runCredRemove(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// --- ageage cron ---
+
+// cronStoreFromCmd loads the config and opens the cron store for the CLI cron
+// subcommands.
+func cronStoreFromCmd(cmd *cobra.Command) (*tools.CronStore, error) {
+	configPath, _ := cmd.Flags().GetString("config")
+	configPath = findConfigFile(configPath)
+	cfg, err := config.LoadConfig(configPath)
+	if err != nil {
+		return nil, err
+	}
+	return tools.NewCronStore(filepath.Join(cfg.ConfigDir(), "data", "cron.json")), nil
+}
+
+func runCronList(cmd *cobra.Command, args []string) error {
+	store, err := cronStoreFromCmd(cmd)
+	if err != nil {
+		return err
+	}
+	entries := store.List()
+	if len(entries) == 0 {
+		fmt.Println("No scheduled tasks.")
+		return nil
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Created < entries[j].Created })
+
+	now := time.Now()
+	for _, e := range entries {
+		state := "enabled"
+		if !e.Enabled {
+			state = "paused"
+		}
+		status := e.LastStatus
+		if status == "" {
+			status = "never"
+		}
+		fmt.Printf("\n  ID:       %s  (%s)\n", e.ID, state)
+		fmt.Printf("  Schedule: %s\n", e.Schedule)
+		fmt.Printf("  Command:  %s\n", e.Command)
+		fmt.Printf("  Status:   %s | runs: %d", status, e.RunCount)
+		if e.LastRun != "" {
+			fmt.Printf(" | last: %s", e.LastRun)
+		}
+		if next, ok := tools.NextRunTime(e.Schedule, now); ok {
+			fmt.Printf(" | next: %s", next.Format(time.RFC3339))
+		}
+		fmt.Println()
+		if e.Delivery != "" {
+			fmt.Printf("  Delivery: %s\n", e.Delivery)
+		}
+		if e.LastError != "" {
+			fmt.Printf("  Last err: %s\n", e.LastError)
+		}
+	}
+	fmt.Println()
+	return nil
+}
+
+func runCronAdd(cmd *cobra.Command, args []string) error {
+	store, err := cronStoreFromCmd(cmd)
+	if err != nil {
+		return err
+	}
+	schedule, command := args[0], args[1]
+	delivery, _ := cmd.Flags().GetString("delivery")
+	if err := tools.ValidateCronExpr(schedule); err != nil {
+		return err
+	}
+	entry, err := store.Add(schedule, command, delivery, true)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Added cron task:\n")
+	fmt.Printf("  ID:       %s\n", entry.ID)
+	fmt.Printf("  Schedule: %s\n", entry.Schedule)
+	fmt.Printf("  Command:  %s\n", entry.Command)
+	if next, ok := tools.NextRunTime(entry.Schedule, time.Now()); ok {
+		fmt.Printf("  Next run: %s\n", next.Format(time.RFC3339))
+	}
+	if entry.Delivery != "" {
+		fmt.Printf("  Delivery: %s\n", entry.Delivery)
+	}
+	return nil
+}
+
+func runCronRemove(cmd *cobra.Command, args []string) error {
+	store, err := cronStoreFromCmd(cmd)
+	if err != nil {
+		return err
+	}
+	found, err := store.Remove(args[0])
+	if err != nil {
+		return err
+	}
+	if !found {
+		return fmt.Errorf("cron task %s not found", args[0])
+	}
+	fmt.Printf("Removed cron task %s.\n", args[0])
+	return nil
+}
+
+func runCronRun(cmd *cobra.Command, args []string) error {
+	configPath, _ := cmd.Flags().GetString("config")
+	configPath = findConfigFile(configPath)
+
+	factory, err := agent.NewFactory(configPath, debugFlag)
+	if err != nil {
+		return err
+	}
+	if err := agent.EnsureAgeAgeDir(factory.Config.EffectiveWorkDir()); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not create .ageage directory: %s\n", err)
+	}
+
+	e, ok := factory.CronStore.Get(args[0])
+	if !ok {
+		return fmt.Errorf("cron task %s not found", args[0])
+	}
+
+	result, err := agent.ExecuteCronEntry(context.Background(), factory, e)
+	status := "success"
+	errMsg := ""
+	if err != nil {
+		status = "error"
+		errMsg = err.Error()
+	}
+	_, _, _ = factory.CronStore.UpdateResult(e.ID, time.Now(), status, errMsg, result)
+	if err != nil {
+		return fmt.Errorf("cron run failed: %w", err)
+	}
+	fmt.Println(result)
+	return nil
+}
+
+func runCronPause(cmd *cobra.Command, args []string) error {
+	return setCronEnabled(cmd, args[0], false, "paused")
+}
+
+func runCronResume(cmd *cobra.Command, args []string) error {
+	return setCronEnabled(cmd, args[0], true, "resumed")
+}
+
+func setCronEnabled(cmd *cobra.Command, id string, enabled bool, verb string) error {
+	store, err := cronStoreFromCmd(cmd)
+	if err != nil {
+		return err
+	}
+	found, err := store.SetEnabled(id, enabled)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return fmt.Errorf("cron task %s not found", id)
+	}
+	fmt.Printf("Cron task %s %s.\n", id, verb)
+	return nil
+}
+
 // --- ageage tools ---
 
 // toolEntry describes a tool available for selection.
@@ -2720,6 +2972,7 @@ var knownTools = []toolEntry{
 	{"cron_add", "Schedule cron tasks", false},
 	{"cron_remove", "Remove cron tasks", false},
 	{"cron_list", "List cron tasks", false},
+	{"cron_run", "Run a cron task immediately", false},
 	{"delegate", "Delegate to a sub-agent", false},
 	{"grep", "Search file content", true},
 	{"glob", "Find files by pattern", true},

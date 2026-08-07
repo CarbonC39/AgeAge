@@ -82,6 +82,7 @@ func (f *AgentFactory) GetStandardToolNames() []string {
 	add("cron_add")
 	add("cron_remove")
 	add("cron_list")
+	add("cron_run")
 	add("glob")
 	add("grep")
 	add("tree")
@@ -186,6 +187,7 @@ func NewFactory(configPath string, debug bool) (*AgentFactory, error) {
 		cfg.Security.AllowedRoots,
 		cfg.Security.ForbiddenRoots,
 	)
+	sec.SetForbidRM(cfg.Security.ForbidRM)
 
 	// Load skills once.
 	loadedSkills, err := skills.LoadSkills(cfg.SkillsDir())
@@ -520,6 +522,18 @@ func (f *AgentFactory) CreateAgentFiltered(confirmMgr *tools.ConfirmationManager
 	if shouldRegisterTool("cron_list") {
 		registry.Register(&tools.CronListTool{Store: f.CronStore})
 	}
+	if shouldRegisterTool("cron_run") {
+		registry.Register(&tools.CronRunTool{
+			Store: f.CronStore,
+			RunFunc: func(ctx context.Context, id string) (string, error) {
+				e, ok := f.CronStore.Get(id)
+				if !ok {
+					return "", fmt.Errorf("cron task %s not found", id)
+				}
+				return ExecuteCronEntry(ctx, f, e)
+			},
+		})
+	}
 
 	// Delegation tool.
 	if shouldRegisterTool("delegate") {
@@ -595,5 +609,35 @@ func (f *AgentFactory) CreateAgentFiltered(confirmMgr *tools.ConfirmationManager
 	}
 
 	currentAgent = ag
+	return ag
+}
+
+// CreateCronAgent creates an agent for unsupervised scheduled execution.
+//
+// Cron tasks run in full mode: every confirmation-gated tool is switched to
+// unsupervised because there is no human at the terminal to answer prompts.
+// Hard security rules still apply — blocked_commands, security.forbid_rm, path
+// allowlists, and the credentials file block — so scheduled maintenance cannot
+// escalate to unchecked destructive operations.
+func (f *AgentFactory) CreateCronAgent() *Agent {
+	ag := f.CreateAgent(nil, "cron")
+	for _, t := range ag.registry.ListAll() {
+		switch v := t.(type) {
+		case *tools.BashTool:
+			v.Supervised = false
+		case *tools.FileWriteTool:
+			v.Supervised = false
+		case *tools.FileEditTool:
+			v.Supervised = false
+		case *tools.MemoryStoreTool:
+			v.Supervised = false
+		case *tools.MemoryForgetTool:
+			v.Supervised = false
+		case *tools.CronAddTool:
+			v.Supervised = false
+		case *tools.CronRemoveTool:
+			v.Supervised = false
+		}
+	}
 	return ag
 }

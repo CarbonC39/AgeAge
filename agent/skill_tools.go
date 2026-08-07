@@ -25,6 +25,9 @@ import (
 // A factory may return nil if it requires capabilities beyond AgentDeps
 // (e.g. escalate needs a full *AgentFactory for model selection).
 var skillOnlyToolFactories = map[string]func(AgentDeps, *tools.Registry, *Agent) tools.Tool{
+	"next_step": func(_ AgentDeps, _ *tools.Registry, a *Agent) tools.Tool {
+		return &NextStepTool{agent: a}
+	},
 	"grep": func(f AgentDeps, _ *tools.Registry, _ *Agent) tools.Tool {
 		return &tools.GrepTool{Security: f.GetSecurity()}
 	},
@@ -191,6 +194,48 @@ func runSkillDelegate(
 		fmt.Printf("  ⤷  %-10s done\n", label)
 	}
 	return result, nil
+}
+
+// ── NextStepTool ─────────────────────────────────────────────────────────────
+
+// NextStepTool advances a segmented skill to its next segment. It is injected
+// automatically whenever a segmented skill is active and removed at turn end.
+// Advancing rebuilds the system prompt with the new segment's instructions, so
+// the very next LLM call sees the new guidance.
+type NextStepTool struct {
+	agent *Agent
+}
+
+func (t *NextStepTool) Name() string { return "next_step" }
+
+func (t *NextStepTool) Description() string {
+	return "Advance to the next segment of the currently active segmented skill. " +
+		"Call this tool after completing the work described in the current segment. " +
+		"The next segment's instructions replace the current ones."
+}
+
+func (t *NextStepTool) Parameters() map[string]interface{} {
+	return map[string]interface{}{
+		"type":       "object",
+		"properties": map[string]interface{}{},
+	}
+}
+
+func (t *NextStepTool) Execute(_ context.Context, args json.RawMessage) (string, error) {
+	a := t.agent
+	sk := a.activeSkill
+	if sk == nil || !sk.Segmented || len(sk.Segments) == 0 {
+		return "", fmt.Errorf("next_step called but no segmented skill is active")
+	}
+	if a.segIdx >= len(sk.Segments)-1 {
+		return "", fmt.Errorf("already on the final segment; call finish_task to complete the task")
+	}
+
+	a.segIdx++
+	a.conv.SetSystemContent(a.buildSystemPrompt(sk))
+	return fmt.Sprintf("Advanced to segment %d of %d of skill %q. "+
+		"Continue working according to the new instructions.",
+		a.segIdx+1, len(sk.Segments), sk.Name), nil
 }
 
 // ── EscalateTool ────────────────────────────────────────────────────────────

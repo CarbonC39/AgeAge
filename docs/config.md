@@ -217,6 +217,57 @@ When triggered, messages older than `keep_recent` pairs are condensed into a sin
 
 ---
 
+## `[history]`
+
+In-place compression of old tool-call turns. Unlike LLM-based summarization, this is deterministic: tool-call exchanges older than `keep_recent_turns` are collapsed into a single narrative assistant message, saving tokens without an LLM round-trip.
+
+```toml
+[history]
+compress_tool_turns = true
+keep_recent_turns   = 2
+```
+
+| Key                  | Type | Default | Description |
+|----------------------|------|---------|-------------|
+| `compress_tool_turns`| bool | `true`  | Collapse old tool-call turns into natural-language narrative messages. **Disable this when you want to preserve the raw tool-call JSON in history** — for example to keep prompt bytes byte-identical across turns and maximise KV-cache hits. |
+| `keep_recent_turns`  | int  | `2`     | How many of the most recent tool-call turns stay uncompressed (raw tool calls + results). |
+
+---
+
+## `[planner]`
+
+Controls the automatic skill creator. When the router detects an **explicitly recurring workflow** (`is_recurring_workflow: true`) with no matching skill, the Planner authors a new `.md` or `.yaml` skill file in the background.
+
+```toml
+[planner]
+enabled = true
+```
+
+| Key      | Type | Default | Description |
+|----------|------|---------|-------------|
+| `enabled`| bool | `true`  | When `false`, the agent never auto-creates skills/pipelines; skills can only be created manually (or with the explicit `/build` command, which is unaffected). |
+
+---
+
+## `[cron]`
+
+Settings for the scheduled-task system. Cron entries are stored in `data/cron.json`; each runs as an isolated, **unsupervised** agent (full mode — no interactive confirmations) that is still subject to hard security rules (`blocked_commands`, `forbid_rm`, path allowlists). Commands of the form `skill:<name>` invoke an existing skill or pipeline on schedule. Results are persisted on the entry and optionally delivered to an IM room.
+
+```toml
+[cron]
+catch_up   = false
+max_output = 2000
+```
+
+| Key          | Type | Default | Description |
+|--------------|------|---------|-------------|
+| `catch_up`   | bool | `false` | When `true`, after a process restart each enabled entry runs once for its most recent missed trigger (within the last 7 days). |
+| `max_output` | int  | `2000`  | Max characters of the last run's output persisted on the entry for auditing. |
+
+Manage tasks with `ageage cron list|add|remove|run|pause|resume`, or via the `cron_add` / `cron_remove` / `cron_list` / `cron_run` agent tools.
+
+---
+
 ## `[bash]`
 
 ```toml
@@ -423,6 +474,7 @@ Each `@path` token is resolved to an absolute path, processed through the approp
 blocked_commands = ["rm -rf /", "mkfs"]
 allowed_roots    = []
 forbidden_roots  = []
+forbid_rm        = false
 ```
 
 | Key               | Type        | Default | Description |
@@ -430,6 +482,7 @@ forbidden_roots  = []
 | `blocked_commands`| string list | (see below) | Shell command substrings that are always rejected. |
 | `allowed_roots`   | string list | `[]`    | If non-empty, file operations outside the workspace are only permitted under these directories. |
 | `forbidden_roots` | string list | `[]`    | File operations targeting these directories are always rejected, even if inside the workspace. |
+| `forbid_rm`       | bool        | `false` | Completely block `rm` (and its Windows aliases `Remove-Item`/`del`/`erase`) in the bash tool, so the agent can never permanently delete files. Detection is token-aware (a file named `rm` can still be `cat`-ed); the block message steers the agent to the system trash (`gio trash` / `trash-put` / `trash`) for recoverable deletion. |
 
 Default blocked commands: `rm -rf /`, `rm -rf /*`, `mkfs`, `dd if=`, `:(){ :|:& };:`, `> /dev/sda`, `chmod -R 777 /`.
 

@@ -18,7 +18,9 @@ type Config struct {
 	Agent      AgentConfig      `toml:"agent"`
 	SubAgent   SubAgentConfig   `toml:"subagent"`
 	Pipeline   PipelineConfig   `toml:"pipeline"`
+	Planner    PlannerConfig    `toml:"planner"`
 	Router     RouterConfig     `toml:"router"`
+	Cron       CronConfig       `toml:"cron"`
 	Summarize  SummarizeConfig  `toml:"summarize"`
 	History    HistoryConfig    `toml:"history"`
 	Security   SecurityConfig   `toml:"security"`
@@ -31,6 +33,24 @@ type Config struct {
 	Channels   ChannelConfig    `toml:"channels"`
 	Server     ServerConfig     `toml:"server"`
 	Eval       EvalConfig       `toml:"eval"`
+}
+
+// PlannerConfig holds settings for the automatic skill/pipeline creator.
+type PlannerConfig struct {
+	// Enabled controls whether the Planner auto-creates a skill or pipeline when
+	// the router detects an explicitly recurring workflow with no matching skill.
+	// The explicit `/build` command is unaffected.
+	Enabled bool `toml:"enabled"`
+}
+
+// CronConfig holds settings for the cron scheduler.
+type CronConfig struct {
+	// CatchUp, when true, runs the most recent missed trigger of an enabled
+	// entry once at scheduler startup after a process restart.
+	CatchUp bool `toml:"catch_up"`
+	// MaxOutput caps how many characters of the last run's output are persisted
+	// on the entry for auditing. Defaults to 2000.
+	MaxOutput int `toml:"max_output"`
 }
 
 // PipelineModels maps pipeline node model tiers to specific model configs.
@@ -152,6 +172,10 @@ type SecurityConfig struct {
 	BlockedCommands []string `toml:"blocked_commands"`
 	AllowedRoots    []string `toml:"allowed_roots"`
 	ForbiddenRoots  []string `toml:"forbidden_roots"`
+	// ForbidRM blocks `rm` (and its Windows aliases) in the bash tool so the
+	// agent can never permanently delete files. Recoverable deletion is still
+	// possible through the system trash (gio trash / trash-put).
+	ForbidRM bool `toml:"forbid_rm"`
 }
 
 // BashConfig holds bash tool settings.
@@ -294,6 +318,7 @@ func DefaultConfig() *Config {
 				"> /dev/sda",
 				"chmod -R 777 /",
 			},
+			ForbidRM: false,
 		},
 		Router: RouterConfig{
 			Enabled:         false,
@@ -301,6 +326,13 @@ func DefaultConfig() *Config {
 			MediumModel:     ModelConfig{}, // inherits base LLM model
 			StrongModel:     ModelConfig{}, // inherits base LLM model
 			MaxHistory:      8,
+		},
+		Planner: PlannerConfig{
+			Enabled: true,
+		},
+		Cron: CronConfig{
+			CatchUp:   false,
+			MaxOutput: 2000,
 		},
 		Summarize: SummarizeConfig{
 			Enabled:    false,

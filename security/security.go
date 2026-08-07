@@ -14,7 +14,12 @@ type Checker struct {
 	forbiddenRoots  []string
 	workspace       string
 	blockedFiles    []string // hardcoded per-file blocks (e.g. credentials.toml)
+	forbidRM        bool     // blocks rm and its aliases in bash commands
 }
+
+// SetForbidRM enables or disables blocking of rm (permanent deletion) commands.
+// The agent is steered towards recoverable system-trash deletion instead.
+func (c *Checker) SetForbidRM(enabled bool) { c.forbidRM = enabled }
 
 // NewChecker creates a new security checker.
 func NewChecker(workspace string, blockedCmds, allowedRoots, forbiddenRoots []string) *Checker {
@@ -54,6 +59,13 @@ func NewChecker(workspace string, blockedCmds, allowedRoots, forbiddenRoots []st
 func (c *Checker) IsCommandSafe(cmd string) (bool, string) {
 	lower := strings.ToLower(strings.TrimSpace(cmd))
 
+	// Hard rule: never allow permanent deletion via rm.
+	if c.forbidRM && isRMCommand(lower) {
+		return false, "command permanently deletes files (rm), which is disabled by security.forbid_rm. " +
+			"Use the system trash for recoverable deletion: `gio trash <path>` (Linux), " +
+			"`trash <path>` (macOS), or move to the Recycle Bin on Windows."
+	}
+
 	for _, blocked := range c.blockedCommands {
 		if strings.Contains(lower, strings.ToLower(blocked)) {
 			return false, fmt.Sprintf("command contains blocked pattern: %q", blocked)
@@ -61,6 +73,131 @@ func (c *Checker) IsCommandSafe(cmd string) (bool, string) {
 	}
 
 	return true, ""
+}
+
+// isRMCommand reports whether a lowercased shell command invokes rm (or its
+// platform aliases) as the command word — never as an argument. It splits the
+// command on shell control operators so `cat rm` (reading a file named "rm")
+// stays allowed while `rm -rf x` and `echo a && rm x` are blocked.
+func isRMCommand(cmd string) bool {
+	tokens := shellTokens(cmd)
+	segmentStart := true // true at command start and right after a control operator
+	prev := ""
+	envPrefix := false // after `env`, skip NAME=VALUE assignments
+
+	for _, tok := range tokens {
+		lower := tok
+
+		if isShellControlOp(lower) {
+			segmentStart = true
+			prev = ""
+			envPrefix = false
+			continue
+		}
+
+		// `env` may be followed by arbitrary NAME=VALUE assignments before the
+		// real command; those are transparent to command detection.
+		if envPrefix {
+			if strings.Contains(lower, "=") {
+				prev = lower
+				continue
+			}
+			envPrefix = false
+			if isRMWord(lower) {
+				return true
+			}
+			prev = lower
+			segmentStart = false
+			continue
+		}
+
+		if segmentStart && isRMWord(lower) {
+			return true
+		}
+		if (prev == "sudo" || prev == "command") && isRMWord(lower) {
+			return true
+		}
+		if lower == "env" {
+			envPrefix = true
+		}
+
+		segmentStart = false
+		prev = lower
+	}
+	return false
+}
+
+// isRMWord matches rm and its common permanent-deletion aliases.
+// Linux/macOS: rm (+ absolute paths). Windows PowerShell: Remove-Item, del,
+// erase (all Remove-Item aliases). rmdir/rd are intentionally not matched —
+// they only remove empty directories and are not "rm".
+func isRMWord(lower string) bool {
+	switch lower {
+	case "rm", "/bin/rm", "/usr/bin/rm", "remove-item", "del", "erase":
+		return true
+	}
+	return false
+}
+
+// isShellControlOp reports whether a token is a shell control operator that
+// starts a new command (and therefore resets command-word position).
+func isShellControlOp(tok string) bool {
+	switch tok {
+	case ";", "&", "&&", "||", "|", "(", ")":
+		return true
+	}
+	return false
+}
+
+// shellTokens splits a shell command into words and control operators,
+// keeping quoted strings intact. Multi-character operators (&&, ||) are
+// emitted as single tokens so command boundaries are detectable.
+func shellTokens(cmd string) []string {
+	var tokens []string
+	var cur strings.Builder
+	var quote byte
+	flush := func() {
+		if cur.Len() > 0 {
+			tokens = append(tokens, cur.String())
+			cur.Reset()
+		}
+	}
+	i := 0
+	for i < len(cmd) {
+		ch := cmd[i]
+		switch {
+		case quote != 0:
+			cur.WriteByte(ch)
+			if ch == quote {
+				quote = 0
+			}
+			i++
+		case ch == '\'' || ch == '"':
+			quote = ch
+			cur.WriteByte(ch)
+			i++
+		case ch == '&' || ch == '|':
+			flush()
+			if i+1 < len(cmd) && cmd[i+1] == ch {
+				tokens = append(tokens, cmd[i:i+2])
+				i += 2
+			} else {
+				tokens = append(tokens, string(ch))
+				i++
+			}
+		case strings.ContainsRune(" \t\n;<()", rune(ch)):
+			flush()
+			if strings.ContainsRune(";()", rune(ch)) {
+				tokens = append(tokens, string(ch))
+			}
+			i++
+		default:
+			cur.WriteByte(ch)
+			i++
+		}
+	}
+	flush()
+	return tokens
 }
 
 // Workspace returns the configured workspace root (canonical absolute path).

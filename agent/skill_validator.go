@@ -31,9 +31,9 @@ var standardToolNames = []string{
 	"glob", "grep", "tree",
 	"web_fetch", "web_search",
 	"memory_store", "memory_recall", "memory_forget",
-	"cron_add", "cron_remove", "cron_list",
+	"cron_add", "cron_remove", "cron_list", "cron_run",
 	"delegate", "ask_user", "update_todos",
-	"finish_task", "node_complete",
+	"finish_task", "node_complete", "next_step",
 }
 
 // ValidateSkillFile loads a skill file at path and checks it for common errors.

@@ -120,6 +120,38 @@ If an unrecognised value is used, a warning is logged and the normal router flow
 
 When multiple skills are matched simultaneously, the **highest** tier wins.
 
+### `segmented` *(boolean, optional)*
+
+**Progressive instruction delivery** for long or multi-phase workflows. Must be explicitly set to `true` — segmented mode is never inferred.
+
+```yaml
+segmented: true
+```
+
+When enabled, the prompt body is split into **segments** on standalone separator lines of three or more `=` `-` or `*`:
+
+```markdown
+---
+name: staged-report
+description: "Produce a report in two controlled stages."
+segmented: true
+---
+
+Phase 1 — gather the raw data with the tools below.
+
+================================================================
+
+Phase 2 — write the final report from the gathered data.
+```
+
+Only **one segment** is injected into the system prompt at a time (each replaces the previous). The framework injects a short note at the end of each segment: non-final segments instruct the agent to call the **`next_step`** tool after finishing that phase; the final segment instructs it to call `finish_task`. `next_step` is injected automatically and removed at turn end.
+
+`finish_task(status="success")` is **blocked before the final segment** — the agent is steered back to `next_step`. Early abort is still possible via `finish_task(status="failure")`.
+
+Requirements:
+- At least **two** non-empty segments; otherwise the skill fails to load.
+- This is a markdown-skill feature; YAML pipeline skills cannot be segmented.
+
 ---
 
 ## Prompt body
@@ -136,6 +168,8 @@ Everything after the closing `---` of the frontmatter is the skill's prompt, inj
 ```
 
 Write the body as instructions directed at the agent. Be explicit: specify the steps to follow, the output format, and what to do in edge cases. The agent treats this content as authoritative system-level guidance.
+
+> **Author comments:** HTML comments (`<!-- ... -->`) in the prompt body are **stripped at load time** and never reach the agent. Use them for author notes and TODO markers. Comments inside fenced code blocks (```` ``` ```` or `~~~`) are preserved — they are literal content.
 
 ---
 

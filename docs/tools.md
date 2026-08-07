@@ -210,15 +210,17 @@ Removes a specific memory entry by ID.
 
 ### `cron_add`
 
-Registers a recurring task with a cron schedule. Tasks are stored in `data/cron.json` and executed by the framework's cron runner.
+Registers a recurring task with a cron schedule. Tasks are stored in `data/cron.json` and executed by the framework's cron runner as isolated, **unsupervised** agents (no interactive confirmations — hard security rules still apply).
 
-| Parameter  | Type   | Required | Description                                                   |
-|------------|--------|----------|---------------------------------------------------------------|
-| `schedule` | string | Yes      | Standard 5-field cron expression (e.g., `*/5 * * * *`).       |
-| `command`  | string | Yes      | Description of the task to execute on each trigger.           |
+| Parameter  | Type    | Required | Description                                                   |
+|------------|---------|----------|---------------------------------------------------------------|
+| `schedule` | string  | Yes      | Standard 5-field cron expression (e.g., `*/5 * * * *`).       |
+| `command`  | string  | Yes      | Task description, or `skill:<name> [args]` to run an existing skill/pipeline on schedule. |
+| `delivery` | string  | No       | IM delivery target for the result: `channelType:channelID` or `channelType:channelID:t:threadID` (e.g. `matrix:!room:chat.lomia.uk`). Only active in `connect`/`serve` modes. |
+| `enabled`  | boolean | No       | Start enabled (default `true`).                               |
 
 **Notes:**
-- Returns the assigned task ID on success.
+- Returns the assigned task ID and next run time on success.
 - Requires confirmation in supervised mode.
 
 ---
@@ -235,7 +237,20 @@ Removes a scheduled task by ID.
 
 ### `cron_list`
 
-Lists all currently registered scheduled tasks. Takes no parameters.
+Lists all currently registered scheduled tasks, including enabled/paused state, last run status, run count, and next run time. Takes no parameters.
+
+---
+
+### `cron_run`
+
+Immediately executes a scheduled task by ID, outside its normal schedule.
+
+| Parameter | Type   | Required | Description                    |
+|-----------|--------|----------|--------------------------------|
+| `id`      | string | Yes      | The cron task ID to run now.   |
+
+**Notes:**
+- Returns the run's output directly; the result is also recorded on the entry's audit fields.
 
 ---
 

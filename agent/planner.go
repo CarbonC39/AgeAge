@@ -241,15 +241,15 @@ func (p *Planner) buildSystemPrompt(guide, pipeline string) string {
 		"  Always include a prompt instruction telling the agent to put complete findings in vars.\n" +
 		"- Call finish_task(status=\"success\", summary=<absolute path of file>) when done.\n\n" +
 		"## Node type selection\n\n" +
-		"Choose the MOST specific type — prefer deterministic over LLM-driven:\n\n" +
+		"Choose the MOST specific execution strategy — prefer deterministic over LLM-driven:\n\n" +
 		"  type: auto  — deterministic action (tool + args fully known at authoring time).\n" +
 		"               Zero LLM cost. Use for: file reads, bash commands, web fetches\n" +
 		"               of known URLs, API calls with known params.\n\n" +
-		"  delegate    — use the delegate tool inside a type:agent node when you know the\n" +
-		"               sub-task and can supply a pre_tool. Better than a bare agent node.\n\n" +
 		"  type: agent — ONLY when genuine LLM reasoning is required (analysis, synthesis,\n" +
 		"               decision-making). Do NOT use for deterministic actions.\n\n" +
-		"Priority: auto > delegate > agent.\n\n")
+		"  Inside a type: agent node you may also invoke the delegate tool when the sub-task\n" +
+		"  is well-defined and a pre_tool can supply context — that beats a bare agent node.\n\n" +
+		"Priority: auto > agent (using delegate for well-defined sub-tasks).\n\n")
 
 	sb.WriteString("## Skill Format Selection\n\n" +
 		"Default to .md (agent skill). Only use .yaml (pipeline) when ALL of the following are true:\n" +

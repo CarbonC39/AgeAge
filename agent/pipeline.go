@@ -603,6 +603,16 @@ func (e *PipelineExecutor) runAgentNodeAttempt(
 	// Apply model from tier (node or fallback).
 	e.applyNodeModel(subAgent, tier)
 
+	// Swap finish_task → node_complete BEFORE building the system prompt, so
+	// buildSystemPrompt emits the pipeline-aware completion rules (node_complete
+	// as the completion tool, no summary-field guidance).
+	resultCh := make(chan NodeResult, 1)
+	subAgent.registry.Unregister("finish_task")
+	subAgent.registry.Register(&NodeCompleteTool{
+		resultCh:   resultCh,
+		finishTool: subAgent.finishTool,
+	})
+
 	// Pre-inject the system prompt. RunWithParts checks len(messages)==0 to
 	// determine the first turn; setting it here tells RunWithParts that the
 	// system prompt is already built and should not be overwritten.
@@ -618,14 +628,6 @@ func (e *PipelineExecutor) runAgentNodeAttempt(
 		"never substitute \"output\", \"answer\", \"text\", or any other name unless " +
 		"explicitly told to use a different name."
 	subAgent.conv.Reset([]llm.Message{{Role: "system", Content: sysprompt}})
-
-	// Swap finish_task → node_complete.
-	resultCh := make(chan NodeResult, 1)
-	subAgent.registry.Unregister("finish_task")
-	subAgent.registry.Register(&NodeCompleteTool{
-		resultCh:   resultCh,
-		finishTool: subAgent.finishTool,
-	})
 
 	e.debugf("Agent▷", "%s  %q", node.ID, truncateStr(taskPrompt, 200))
 

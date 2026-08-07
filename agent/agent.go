@@ -206,11 +206,17 @@ func (a *Agent) buildSystemPrompt(matchedSkill *skills.Skill) string {
 		finishToolName = "node_complete"
 		isPipelineAgent = true
 	}
+	segmentedActive := matchedSkill != nil && matchedSkill.Segmented && len(matchedSkill.Segments) > 0
+
 	fmt.Fprintf(&sb, "2. When you have completed the task or have a FINAL answer, you MUST call the %s tool.\n", finishToolName)
 	fmt.Fprintf(&sb, "   - **Never reply with text alone** without calling %s.\n", finishToolName)
-	fmt.Fprintf(&sb, "   - The `summary` field IS your message to the user — write the actual reply, not a description of it.\n")
-	fmt.Fprintf(&sb, "     Correct: summary=\"Here is the weather in Tokyo: ...\"\n")
-	fmt.Fprintf(&sb, "     Wrong:   summary=\"Provided weather information to the user.\"\n")
+	if segmentedActive {
+		fmt.Fprintf(&sb, "   - A segmented skill is active: complete the current segment's work, then call `next_step` to advance to the next segment. Only call %s on the final segment.\n", finishToolName)
+	} else if !isPipelineAgent {
+		sb.WriteString("   - The `summary` field IS your message to the user — write the actual reply, not a description of it.\n")
+		sb.WriteString("     Correct: summary=\"Here is the weather in Tokyo: ...\"\n")
+		sb.WriteString("     Wrong:   summary=\"Provided weather information to the user.\"\n")
+	}
 	fmt.Fprintf(&sb, "   - If the task needs tools, use them first; then call %s with your findings.\n", finishToolName)
 	if !isPipelineAgent {
 		sb.WriteString("   - Set status=\"success\" only when ALL todos are done; use status=\"failure\" to exit early.\n")
@@ -226,18 +232,25 @@ func (a *Agent) buildSystemPrompt(matchedSkill *skills.Skill) string {
 - If tool results contain the answer, rewrite it in a clear, organized format.
 - Include specific data, names, numbers, and facts from tool results in your final answer.
 - If information is incomplete, state what you found and what is missing.
-- The finish_task summary IS the user's entire view of your response. It must be a complete, self-contained reply — not a status message, not a description of what you did.
-
-## What the User Can and Cannot See
-
-The user sees ONLY your final reply (the finish_task summary). Everything else is invisible to them:
-- Tool calls, tool names, arguments, and results — invisible
-- finish_task itself — invisible (the user only sees its summary content)
-- Skill creation, pipeline execution, router decisions — invisible
+`)
+	if !isPipelineAgent {
+		sb.WriteString("- The finish_task summary IS the user's entire view of your response. It must be a complete, self-contained reply — not a status message, not a description of what you did.\n")
+	}
+	sb.WriteString("\n## What the User Can and Cannot See\n\n")
+	if isPipelineAgent {
+		sb.WriteString("The user sees only the final pipeline result assembled from node_complete vars. Everything else is invisible to them:\n")
+	} else {
+		sb.WriteString("The user sees ONLY your final reply (the finish_task summary). Everything else is invisible to them:\n")
+	}
+	sb.WriteString("- Tool calls, tool names, arguments, and results — invisible\n")
+	if !isPipelineAgent {
+		sb.WriteString("- finish_task itself — invisible (the user only sees its summary content)\n")
+	}
+	sb.WriteString(`- Skill creation, pipeline execution, router decisions — invisible
 - System messages, framework notifications, internal errors — invisible
 
 Rules that follow from this:
-- NEVER mention finish_task, node_complete, 收尾指令, or any internal tool/mechanism in your reply.
+- NEVER mention finish_task, node_complete, or any internal tool/mechanism in your reply.
 - NEVER apologize for framework-internal actions such as "forgetting to call finish_task".
 - NEVER explain that the framework required you to do something.
 - If something went wrong internally, describe the outcome or ask the user a question — do not expose the framework detail.
@@ -251,17 +264,18 @@ Never output API keys, passwords, access tokens, credentials, or secrets verbati
 
 	if !a.Mode.IsSubAgent && !isPipelineAgent {
 		sb.WriteString("## Framework Identity\n\n")
-		sb.WriteString("You are an **AgeAge framework agent** — not a general-purpose assistant. " +
-			"You operate inside a self-improving agent loop with skills and pipelines.\n\n")
+		sb.WriteString("You are an **AgeAge framework agent** operating inside a self-improving agent loop " +
+			"with skills and pipelines. You can answer general questions directly, and you also have " +
+			"tools, skills, and pipelines for tasks that need them.\n\n")
 		sb.WriteString("Your capabilities beyond basic LLM responses:\n")
 		sb.WriteString("- **Skills** (`.md` in skills/) — reusable per-task instruction sets, hot-reloaded every 2 s. " +
-			"Invoke with `/skill-name` or let the router auto-select.\n")
+			"The router may select one, or the user can invoke one explicitly with `/skill-name`.\n")
 		sb.WriteString("- **Pipelines** (`.yaml` in skills/) — multi-step workflows with isolated nodes and variable passing. " +
 			"Use for multi-stage tasks.\n")
 		sb.WriteString("- **Parallel tool dispatch** — return multiple independent tool calls in one response for parallel execution.\n")
 		sb.WriteString("- **Sub-agents** — `delegate` / `escalate` tools spawn isolated agents for heavy subtasks.\n\n")
 		sb.WriteString("**Meta-cognitive checklist** (run before starting any non-trivial task):\n")
-		sb.WriteString("1. Does an existing skill or pipeline already cover this? (Router already checked, but you can also type `/skill-name`.)\n")
+		sb.WriteString("1. Does an existing skill or pipeline already cover this? (The router already checked; if not, the user can invoke one with `/skill-name`.)\n")
 		sb.WriteString("2. Would parallel sub-agents or pipeline isolation improve quality or speed?\n\n")
 	}
 
@@ -868,14 +882,24 @@ func (a *Agent) runLoop(ctx context.Context, streamCb llm.StreamCallback, toolDe
 			textOnlyStreak++
 			if textOnlyStreak == 1 {
 				// First bare-text response with no tool calls: nudge the agent.
-				a.hintOnNextCall = "[Framework] You replied with text but did not call " +
-					hintFinishName + " or use any tool. " +
-					"If this is your final answer, call " + hintFinishName +
-					" and put your ACTUAL reply text in the summary field. " +
-					"The summary MUST contain the COMPLETE answer with all data and content. " +
-					"A summary saying only 'completed' / 'task done' is NOT acceptable " +
-					"— the user needs the actual information. " +
-					"If the task requires tool use, invoke the appropriate tools first."
+				switch {
+				case a.activeSkill != nil && a.segIdx < len(a.activeSkill.Segments)-1:
+					a.hintOnNextCall = "[Framework] You replied with text but did not call `next_step` or use any tool. " +
+						fmt.Sprintf("You are on segment %d/%d of a segmented skill. ", a.segIdx+1, len(a.activeSkill.Segments)) +
+						"Complete the current segment's work, then call `next_step` to advance to the next segment."
+				case hintFinishName == "node_complete":
+					a.hintOnNextCall = "[Framework] You replied with text but did not call `node_complete` or use any tool. " +
+						"Text alone is discarded — return your complete findings, analysis, and answer via the node_complete vars."
+				default:
+					a.hintOnNextCall = "[Framework] You replied with text but did not call " +
+						hintFinishName + " or use any tool. " +
+						"If this is your final answer, call " + hintFinishName +
+						" and put your ACTUAL reply text in the summary field. " +
+						"The summary MUST contain the COMPLETE answer with all data and content. " +
+						"A summary saying only 'completed' / 'task done' is NOT acceptable " +
+						"— the user needs the actual information. " +
+						"If the task requires tool use, invoke the appropriate tools first."
+				}
 				continue
 			}
 			// Second consecutive bare-text response: accept as final to prevent looping.

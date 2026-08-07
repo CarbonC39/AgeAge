@@ -376,3 +376,59 @@ func TestFinishToolBlocksSuccessBeforeFinalSegment(t *testing.T) {
 		t.Fatalf("blocked finish did not steer the agent to next_step: %#v", secondCall)
 	}
 }
+
+func TestBuildSystemPromptPipelineAgentUsesNodeComplete(t *testing.T) {
+	ag := newLoopTestAgent(t, &fakeChatClient{}, nil)
+	ag.registry.Unregister("finish_task")
+	ag.registry.Register(&NodeCompleteTool{resultCh: make(chan NodeResult, 1), finishTool: ag.finishTool})
+
+	prompt := ag.buildSystemPrompt(nil)
+	if !strings.Contains(prompt, "MUST call the node_complete tool") {
+		t.Fatalf("pipeline prompt missing node_complete rule:\n%s", prompt)
+	}
+	if strings.Contains(prompt, "MUST call the finish_task tool") {
+		t.Fatalf("pipeline prompt still names finish_task as the completion tool:\n%s", prompt)
+	}
+	if strings.Contains(prompt, "`summary` field IS your message") {
+		t.Fatalf("pipeline prompt leaks summary-field guidance that node_complete does not have:\n%s", prompt)
+	}
+	if strings.Contains(prompt, "Set status=\"success\" only when ALL todos are done") {
+		t.Fatalf("pipeline prompt includes main-agent todo rule:\n%s", prompt)
+	}
+}
+
+func TestBuildSystemPromptMainAgentKeepsSummaryGuidance(t *testing.T) {
+	ag := newLoopTestAgent(t, &fakeChatClient{}, nil)
+	prompt := ag.buildSystemPrompt(nil)
+	if !strings.Contains(prompt, "MUST call the finish_task tool") {
+		t.Fatalf("main prompt missing finish_task rule:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "`summary` field IS your message") {
+		t.Fatalf("main prompt missing summary-field guidance:\n%s", prompt)
+	}
+}
+
+func TestAgentRunSegmentedSkillNudgesNextStepOnBareText(t *testing.T) {
+	segSkill := &skills.Skill{
+		Name:      "segtest",
+		Segmented: true,
+		Segments:  []string{"Segment one.", "Segment two."},
+	}
+	client := &fakeChatClient{steps: []fakeChatStep{
+		{message: llm.Message{Role: "assistant", Content: "just some text"}},
+		{message: toolCallMessage("next_step", `{}`, "call-next")},
+		{message: finishMessage("done")},
+	}}
+	ag := newLoopTestAgent(t, client, nil)
+	ag.skills = []skills.Skill{*segSkill}
+	ag.registry.Register(&NextStepTool{agent: ag})
+
+	result, err := ag.Run(context.Background(), "/segtest", nil)
+	if err != nil || result != "done" {
+		t.Fatalf("Run = (%q, %v)", result, err)
+	}
+	// The bare-text nudge must steer the agent to next_step, not finish_task.
+	if !messagesContain(client.calls[1].messages, "user", "next_step") {
+		t.Fatalf("bare-text nudge did not mention next_step: %#v", client.calls[1].messages)
+	}
+}

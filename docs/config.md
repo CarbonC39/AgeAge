@@ -2,6 +2,8 @@
 
 AgeAge is configured through a single TOML file, typically `config.toml` in the workspace directory. Run `ageage init` to generate a starter file interactively.
 
+> **Looking for a complete starting point?** The repo ships `example.config.toml` — a fully commented config covering the current feature set (including `[history]` compression, `[planner]`, `[cron]`, and `forbid_rm`). Copy it to your config directory and fill in the placeholders.
+
 All paths in the config are resolved relative to the config file's location unless they are absolute.
 
 > **CLI working directory:** In `ageage cli` mode the agent's file-operation root is the directory you launched the command from (not the config workspace). This means tools like `file_read`, `bash`, and `@path` attachments resolve paths relative to your shell's current directory. In `ageage serve` mode the workspace directory is used instead.

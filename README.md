@@ -43,6 +43,8 @@ go build -o ageage .
 
 # 2. Create a workspace with a starter config
 ./ageage init
+# or copy the fully commented example and fill it in:
+cp example.config.toml workspace/config.toml
 
 # 3. Start chatting
 ./ageage cli

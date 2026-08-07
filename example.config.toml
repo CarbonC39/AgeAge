@@ -1,0 +1,196 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# AgeAge example configuration
+#
+# Copy this file to your config directory as config.toml, fill in the
+# placeholders, and adjust to taste. It reflects the CURRENT feature set,
+# including the newer additions:
+#
+#   [history]   in-place tool-call compression toggle (KV-cache stability)
+#   [planner]   disable auto-creating skills/pipelines
+#   [cron]      scheduled tasks: audit fields, catch-up, IM delivery
+#   forbid_rm   [security] block permanent deletion (rm) in the bash tool
+#   segmented   markdown skills can inject one prompt segment per step
+#
+# Only the [llm] block is required; every other key shown is optional and
+# falls back to the built-in defaults (see docs/config.md).
+# ─────────────────────────────────────────────────────────────────────────────
+
+workspace = "./workspace"   # root the agent reads/writes files in (serve/connect)
+
+# ── LLM (required) ───────────────────────────────────────────────────────────
+[llm]
+api_key     = "sk-..."
+base_url    = "https://api.openai.com/v1"   # any OpenAI-compatible endpoint
+model       = "gpt-4o-mini"
+temperature = 0.7
+max_tokens  = 8192            # -1 = no limit
+
+# ── Agent loop ───────────────────────────────────────────────────────────────
+[agent]
+max_iterations     = 20       # hard cap on tool-call rounds per user turn
+mode               = "supervised"  # "full" skips all confirmations
+non_include_tools  = []       # exact names or prefixes to never register (e.g. "cron")
+tools              = []       # positive allowlist; empty = all tools
+max_parallel_tools = 0        # >1 enables parallel tool dispatch within one response
+
+# ── Sub-agents (delegate / escalate) ─────────────────────────────────────────
+[subagent]
+max_iterations = 10
+timeout        = 300
+
+# [subagent.model]
+# model   = ""      # independent model for sub-agents; defaults to [llm].model
+# api_key = ""
+# base_url = ""
+
+# ── Pipeline execution ───────────────────────────────────────────────────────
+[pipeline]
+foreach_concurrency = 1       # >1 runs foreach iterations in parallel
+
+# [pipeline.models.base]
+# model = ""      # per-tier overrides for pipeline nodes
+# [pipeline.models.medium]
+# model = ""
+# [pipeline.models.strong]
+# model = ""
+
+# ── Auto skill creation ──────────────────────────────────────────────────────
+[planner]
+enabled = true                # false = never auto-create skills/pipelines;
+                              #         creation becomes manual only
+                              #         (/build still works explicitly)
+
+# ── Intent router (optional) ─────────────────────────────────────────────────
+[router]
+enabled     = false           # true routes each request across model tiers
+max_history = 8
+
+# [router.classifier]         # cheap model for intent classification
+# model    = "gpt-4o-mini"
+# api_key  = ""
+# base_url = ""
+
+# [router.medium]             # model for linear tool-using tasks
+# model = ""
+
+# [router.strong]             # model for complex/multi-step tasks + escalate
+# model = ""
+
+# ── Scheduled tasks (cron) ───────────────────────────────────────────────────
+[cron]
+catch_up   = false            # true = run the most recent missed trigger once at startup
+max_output = 2000             # chars of the last run persisted for auditing
+
+# Manage with:  ageage cron list|add|remove|run|pause|resume
+# or via the agent tools cron_add / cron_remove / cron_list / cron_run.
+# The command field supports "skill:<name> [args]" to run an existing skill or
+# pipeline on schedule. Add a "delivery" target (e.g.
+# "matrix:!room:chat.lomia.uk") to post results to an IM room in connect/serve
+# mode.
+
+# ── Context summarization ────────────────────────────────────────────────────
+[summarize]
+enabled     = false
+model       = ""              # defaults to [llm].model
+threshold   = 10              # compress after this many message pairs
+keep_recent = 4               # keep this many recent pairs verbatim
+
+# ── In-place tool-call compression ───────────────────────────────────────────
+# Collapses old tool-call turns into natural-language narrative messages to
+# save tokens. Disable when you want the raw tool-call JSON kept byte-identical
+# across turns (e.g. to maximise KV-cache hits with a caching provider).
+[history]
+compress_tool_turns = true
+keep_recent_turns   = 2
+
+# ── Security ─────────────────────────────────────────────────────────────────
+[security]
+blocked_commands = [
+  "rm -rf /", "rm -rf /*", "mkfs", "dd if=",
+  ":(){ :|:& };:", "> /dev/sda", "chmod -R 777 /", "format c:",
+]
+allowed_roots   = []          # extra roots beyond the workspace; empty = workspace only
+forbidden_roots = []          # paths the agent can never access
+forbid_rm       = false       # true = block rm in bash entirely; the agent must
+                              # use the system trash for recoverable deletion
+
+# ── Bash tool ────────────────────────────────────────────────────────────────
+[bash]
+auto_allow_commands  = []     # command prefixes that skip supervised confirmation
+max_output_bytes     = 4194304
+passthrough_env_vars = []     # extra env var names/prefixes forwarded to subprocesses
+
+# ── Web tools ────────────────────────────────────────────────────────────────
+[web_search]
+backend         = "duckduckgo"  # "duckduckgo", "searxng", "tavily", or "brave"
+searxng_url     = ""
+tavily_api_key  = ""           # or TAVILY_API_KEY env var
+brave_api_key   = ""           # or BRAVE_API_KEY env var
+max_results     = 10
+blocked_domains = []
+
+[web_fetch]
+backend        = "native"     # "native", "jina", or "crawl4ai"
+jina_api_key   = ""
+crawl4ai_cmd   = "python"
+max_characters = 15000
+
+# ── Browser automation ───────────────────────────────────────────────────────
+[browser]
+backend      = "playwright"   # "playwright" or "agent-browser"
+headless     = true
+browser_type = "chromium"     # "chromium", "firefox", or "webkit"
+agent_bin    = "agent-browser"
+timeout      = 30             # seconds per browser action
+
+# ── Multimodal attachments ───────────────────────────────────────────────────
+[multimodal]
+vision          = true        # false if your model does not support images
+max_image_bytes = 10485760    # 10 MB
+
+# [[multimodal.converters]]
+# extensions = ["pdf"]
+# command    = "pdftotext {input} {output}"
+
+# ── MCP servers ──────────────────────────────────────────────────────────────
+[mcp]
+enabled = false
+# [mcp.servers.example]
+# command = "npx"
+# args    = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+# env     = { API_KEY = "..." }
+
+# ── HTTP API server (ageage serve) ───────────────────────────────────────────
+[server]
+host = "127.0.0.1"
+port = 8080
+
+# ── Evaluator (auto-generated skill quality) ─────────────────────────────────
+[eval]
+success_threshold = 3         # stop evaluating after N consecutive passes
+
+# [eval.model]
+# model = ""                  # cheaper model once a skill has passed once
+
+# ── IM channels (ageage connect) ─────────────────────────────────────────────
+# [channels]
+# parallel = false            # true = handle multiple incoming messages concurrently
+#
+# [channels.telegram]
+# enabled       = true
+# bot_token     = "..."
+# allowed_users = []          # Telegram user IDs (as strings); empty = allow all
+#
+# [channels.discord]
+# enabled       = true
+# bot_token     = "..."
+# channel_ids   = []          # Discord channel IDs to monitor
+# allowed_users = []
+#
+# [channels.matrix]
+# enabled       = true
+# homeserver    = "https://matrix.org"
+# user_id       = "@bot:matrix.org"
+# access_token  = "..."
+# room_ids      = []          # rooms to monitor; empty = all joined rooms
+# allowed_users = []

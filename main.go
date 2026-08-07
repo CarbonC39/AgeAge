@@ -430,11 +430,14 @@ You are a helpful, friendly, and knowledgeable AI assistant.
 	fmt.Println()
 	fmt.Println("More options in config.toml:")
 	fmt.Println("  [summarize]    — auto-compress long conversation history")
+	fmt.Println("  [history]      — toggle in-place tool-call compression (KV-cache)")
+	fmt.Println("  [planner]      — disable auto-creating skills/pipelines")
+	fmt.Println("  [cron]         — scheduled tasks (see: ageage cron list)")
 	fmt.Println("  [channels.*]   — Telegram, Discord, Matrix connectors")
 	fmt.Println("  [mcp.servers]  — connect external MCP tool servers")
 	fmt.Println("  [multimodal]   — vision and document converter settings")
 	fmt.Println("  [bash]         — auto-allow commands, env var passthrough")
-	fmt.Println("  [security]     — restrict allowed paths and blocked commands")
+	fmt.Println("  [security]     — restrict paths, blocked commands, forbid_rm")
 	fmt.Println()
 	return nil
 }
@@ -617,6 +620,10 @@ func buildInitConfig(
 	p("# [pipeline.models.medium]\n# model = \"\"  # tier=medium nodes\n")
 	p("# [pipeline.models.strong]\n# model = \"\"  # tier=strong nodes\n\n")
 
+	p("[planner]\n")
+	p("# Controls automatic skill creation for recurring workflows.\n")
+	p("enabled = true  # false = never auto-create skills/pipelines (creation is manual only)\n\n")
+
 	if routerEnabled {
 		p("[router]\n")
 		p("# Routes requests to different model tiers by task complexity.\n")
@@ -662,6 +669,17 @@ func buildInitConfig(
 	p("threshold   = 10  # compress after this many message pairs\n")
 	p("keep_recent = 4   # keep N most recent messages intact after compression\n\n")
 
+	p("[history]\n")
+	p("# In-place compression: collapses old tool-call turns into narrative text.\n")
+	p("# Disable to keep raw tool-call JSON byte-identical across turns (KV-cache hits).\n")
+	p("compress_tool_turns = true\n")
+	p("keep_recent_turns   = 2\n\n")
+
+	p("[cron]\n")
+	p("# Scheduled tasks: run unsupervised in full mode (hard security rules still apply).\n")
+	p("catch_up   = false  # run the most recent missed trigger once after a restart\n")
+	p("max_output = 2000   # chars of the last run persisted for auditing\n\n")
+
 	p("[bash]\n")
 	p("auto_allow_commands = []  # command prefixes that skip supervised confirmation\n")
 	p("# max_output_bytes   = 4194304  # 4 MB cap on combined stdout+stderr\n")
@@ -703,7 +721,8 @@ func buildInitConfig(
 	p("  \"format c:\", \"del /f /s /q c:\\\\\",\n")
 	p("]\n")
 	p("allowed_roots   = []  # extra roots the agent may access; empty = workspace only\n")
-	p("forbidden_roots = []  # paths the agent can never access regardless of allowed_roots\n\n")
+	p("forbidden_roots = []  # paths the agent can never access regardless of allowed_roots\n")
+	p("forbid_rm       = false  # true = block rm in bash entirely; agent must use system trash\n\n")
 
 	p("[multimodal]\n")
 	p("vision          = true        # false if your model does not support images\n")

@@ -17,12 +17,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache: true
@@ -49,17 +49,16 @@ jobs:
           git push origin refs/tags/latest --force
 
           notes="Rolling build from ${GITHUB_SHA}"
+          # Recreate the rolling release on every build. Deleting first keeps it
+          # clean and published even when a previous run left it as a draft or
+          # prerelease (which GitHub refuses to mark --latest). The tag itself is
+          # force-pushed above; --cleanup-tag=false keeps it, and --target below
+          # recreates it at the build commit even if it somehow disappears.
           if gh release view latest >/dev/null 2>&1; then
-            gh release upload latest dist/* --clobber
-            gh release edit latest \
-              --target "$GITHUB_SHA" \
-              --title "Latest build" \
-              --notes "$notes" \
-              --latest
-          else
-            gh release create latest dist/* \
-              --target "$GITHUB_SHA" \
-              --title "Latest build" \
-              --notes "$notes" \
-              --latest
+            gh release delete latest --yes --cleanup-tag=false
           fi
+          gh release create latest dist/* \
+            --target "$GITHUB_SHA" \
+            --title "Latest build" \
+            --notes "$notes" \
+            --latest

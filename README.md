@@ -63,6 +63,64 @@ Full configuration reference: [docs/config.md](docs/config.md)
 
 ---
 
+## Basic usage
+
+After `./ageage init`, start a session with:
+
+```sh
+./ageage cli              # interactive terminal session
+./ageage cli -c path/to/config.toml
+```
+
+### Slash commands
+
+| Command | What it does |
+|---------|--------------|
+| `/help` | Show this command list |
+| `/build [description]` | Ask the Planner to author a reusable skill or pipeline |
+| `/clear` | Clear the current conversation (keeps the session) |
+| `/stop` | Interrupt the running task |
+| `/summarize` | Compress conversation history with an LLM summary |
+| `/undo` | Remove the last user→assistant turn |
+| `/retry [text]` | Re-run the last message, optionally with extra instructions |
+| `/think` | Show the last captured reasoning think-block |
+| `/skills` | List loaded skills (`/name` invokes one directly) |
+| `/session` or `/s` | Session management (see below) |
+
+Type `exit` or `quit` to leave the CLI.
+
+### Sessions
+
+Each conversation lives in a session under `.ageage/sessions/`. Session history persists across runs — the same session can be resumed with `/s switch`.
+
+```
+/s              List sessions
+/s new [name]   Create and switch to a new session
+/s switch <name>   Switch sessions (prefix matching supported)
+/s rename <new>     Rename the current session
+/s delete <name>    Delete a session (moves it to the trash)
+```
+
+### File attachments
+
+Attach files inline with `@path`; images are sent as vision parts, documents
+are converted to text via the configured converters:
+
+```
+You ▸ Summarise @report.pdf and check @screenshot.png for issues
+```
+
+### Other entry points
+
+| Mode | Command |
+|------|---------|
+| IM channels (Telegram/Discord/Matrix) | `./ageage connect` |
+| HTTP API (OpenAI-compatible) | `./ageage serve <data-dir>` |
+| MCP server over stdio | `./ageage mcp` |
+| Inspect tools / skills / credentials / cron | `./ageage tools`, `./ageage skills`, `./ageage cred`, `./ageage cron` |
+
+---
+
 ## Architecture overview
 
 ```mermaid

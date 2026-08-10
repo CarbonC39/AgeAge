@@ -236,7 +236,7 @@ func runInit(cmd *cobra.Command, args []string) error {
 	fmt.Println("AgeAge Setup Wizard")
 	fmt.Println(strings.Repeat("═", 52))
 
-	// ─── 1/7  Storage ────────────────────────────────────────
+	// ─── 1/8  Storage ────────────────────────────────────────
 	printInitSection("1/8  Storage")
 	fmt.Println("AgeAge directory — one folder for config.toml, AGENT.md, SOUL.md,")
 	fmt.Println("memories, skills, and session data.")
@@ -252,7 +252,7 @@ func runInit(cmd *cobra.Command, args []string) error {
 	fmt.Print("Workspace (default: . — runtime launch directory): ")
 	workspace := readLine(reader, ".")
 
-	// ─── 2/7  LLM Provider ───────────────────────────────────
+	// ─── 2/8  LLM Provider ───────────────────────────────────
 	printInitSection("2/8  LLM Provider")
 	fmt.Println("Base URL examples:")
 	fmt.Println("  OpenAI:    https://api.openai.com/v1")
@@ -277,7 +277,7 @@ func runInit(cmd *cobra.Command, args []string) error {
 
 	model := pickModel(reader, baseURL, apiKey)
 
-	// ─── 3/7  Agent Behavior ─────────────────────────────────
+	// ─── 3/8  Agent Behavior ─────────────────────────────────
 	printInitSection("3/8  Agent Behavior")
 	fmt.Println("Mode:")
 	fmt.Println("  1) supervised — pause for confirmation before every tool call")
@@ -311,7 +311,7 @@ func runInit(cmd *cobra.Command, args []string) error {
 		routerStrong = readLine(reader, strongDefault)
 	}
 
-	// ─── 5/7  Skill Quality  ─────────────────────────────────
+	// ─── 5/8  Skill Quality  ─────────────────────────────────
 	printInitSection("5/8  Skill Quality  (optional)")
 	fmt.Println("The Evaluator reviews auto-generated skills after they run,")
 	fmt.Println("patching deficiencies in the background. It stops once a skill")
@@ -328,7 +328,7 @@ func runInit(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// ─── 6/7  Web Tools ──────────────────────────────────────
+	// ─── 6/8  Web Tools ──────────────────────────────────────
 	printInitSection("6/8  Web Tools")
 	fmt.Println("Search backend:")
 	fmt.Println("  1) DuckDuckGo  — no API key, works immediately")
@@ -356,35 +356,25 @@ func runInit(cmd *cobra.Command, args []string) error {
 	}
 	toolsLine := toolsLineFromSlice(selectedTools)
 
-	// ─── 8/8  Advanced Settings (optional) ────────────────────
-	// Newer safety/context switches live behind a single gate: answering "n"
-	// keeps the sensible defaults (forbid_rm off, auto-create on, no
-	// summarization, tool-call compression on).
-	printInitSection("8/8  Advanced Settings  (optional)")
-	advancedSet := strings.ToLower(readLine(reader, "n")) == "y"
+	// ─── 8/8  Safety & Context (optional) ─────────────────────
+	// These safety/context switches are asked directly (like the Evaluator in
+	// step 5/8) instead of being hidden behind a single "advanced" gate. Each
+	// defaults to the sensible value; answering with Enter keeps it.
+	printInitSection("8/8  Safety & Context  (optional)")
+	fmt.Println("  These control destructive-action safety and context behaviour.")
 
-	// Effective values; defaults apply unless the user explicitly opts in below.
-	forbidRM := false         // [security] forbid_rm
-	plannerEnabled := true    // [planner] enabled
-	summarizeEnabled := false // [summarize] enabled
-	keepRawToolCalls := false // [history] compress_tool_turns = false
+	fmt.Println()
+	fmt.Print("  Block permanent deletion (rm)? The agent must then use the system trash (y/N): ")
+	forbidRM := strings.ToLower(readLine(reader, "n")) == "y"
 
-	if advancedSet {
-		fmt.Println("  These control destructive-action safety and context behaviour.")
+	fmt.Print("  Auto-create skills for recurring workflows? (Y/n) [router must be enabled]: ")
+	plannerEnabled := strings.ToLower(readLine(reader, "y")) != "n"
 
-		fmt.Println()
-		fmt.Print("  Block permanent deletion (rm)? The agent must then use the system trash (y/N): ")
-		forbidRM = strings.ToLower(readLine(reader, "n")) == "y"
+	fmt.Print("  Auto-compress long conversations with an LLM summary? (y/N): ")
+	summarizeEnabled := strings.ToLower(readLine(reader, "n")) == "y"
 
-		fmt.Print("  Auto-create skills for recurring workflows? (Y/n) [router must be enabled]: ")
-		plannerEnabled = strings.ToLower(readLine(reader, "y")) != "n"
-
-		fmt.Print("  Auto-compress long conversations with an LLM summary? (y/N): ")
-		summarizeEnabled = strings.ToLower(readLine(reader, "n")) == "y"
-
-		fmt.Print("  Preserve raw tool calls in history for KV-cache hits (disable compression)? (y/N): ")
-		keepRawToolCalls = strings.ToLower(readLine(reader, "n")) == "y"
-	}
+	fmt.Print("  Preserve raw tool calls in history for KV-cache hits (disable compression)? (y/N): ")
+	keepRawToolCalls := strings.ToLower(readLine(reader, "n")) == "y"
 
 	// ─── Generate files ───────────────────────────────────────
 	for _, d := range []string{
@@ -2182,6 +2172,25 @@ func runCLI(cmd *cobra.Command, args []string) error {
 				continue
 			}
 
+			// /build [description] — create a skill or pipeline without entering
+			// the agent loop. The planner runs isolated; conversation history is
+			// untouched.
+			if lower == "/build" || strings.HasPrefix(lower, "/build ") {
+				task := strings.TrimSpace(input[len("/build"):])
+				ui.printStatus("Building skill/pipeline…")
+				history := ag.Messages()
+				docsDir := filepath.Join(factory.Config.AgeAgeDirPath(), "docs")
+				planner := agent.NewPlanner(factory, docsDir, factory.GetStandardToolNames())
+				skill, buildErr := planner.CreateSkill(context.Background(), task, history)
+				if buildErr != nil {
+					ui.printErr(fmt.Sprintf("Build failed: %s", buildErr))
+				} else {
+					ui.printOK(fmt.Sprintf("Built %s — use /%s to activate.", skill.Name, skill.CommandName()))
+				}
+				signalReady()
+				continue
+			}
+
 			// /retry [modifier] — re-run last message, optionally with extra text.
 			// directRun bypasses the switch so a retried message that happens to match
 			// a slash command (e.g. user originally typed "/clear") is never intercepted.
@@ -2279,6 +2288,7 @@ func runCLI(cmd *cobra.Command, args []string) error {
 					}{
 						{"General", [][]string{
 							{"/help", "Show this help"},
+							{"/build [description]", "Create a skill or pipeline (uses conversation context)"},
 							{"/clear", "Clear conversation history"},
 							{"/stop", "Interrupt a running task"},
 							{"/summarize", "Compress conversation history"},

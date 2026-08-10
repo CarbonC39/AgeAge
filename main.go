@@ -311,8 +311,16 @@ func runInit(cmd *cobra.Command, args []string) error {
 		routerStrong = readLine(reader, strongDefault)
 	}
 
-	// ─── 5/8  Skill Quality  ─────────────────────────────────
-	printInitSection("5/8  Skill Quality  (optional)")
+	// ─── 5/8  Planner ─────────────────────────────────────────
+	printInitSection("5/8  Planner")
+	fmt.Println("The Planner auto-creates a reusable skill or pipeline when it")
+	fmt.Println("detects a recurring workflow with no matching skill.")
+	fmt.Println("Disable to keep skill/pipeline creation manual (via /build).")
+	fmt.Print("Auto-create skills for recurring workflows? (Y/n): ")
+	plannerEnabled := strings.ToLower(readLine(reader, "y")) != "n"
+
+	// ─── 6/8  Skill Quality  ─────────────────────────────────
+	printInitSection("6/8  Skill Quality  (optional)")
 	fmt.Println("The Evaluator reviews auto-generated skills after they run,")
 	fmt.Println("patching deficiencies in the background. It stops once a skill")
 	fmt.Println("passes N consecutive times (success threshold).")
@@ -328,8 +336,8 @@ func runInit(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// ─── 6/8  Web Tools ──────────────────────────────────────
-	printInitSection("6/8  Web Tools")
+	// ─── 7/8  Web Tools ──────────────────────────────────────
+	printInitSection("7/8  Web Tools")
 	fmt.Println("Search backend:")
 	fmt.Println("  1) DuckDuckGo  — no API key, works immediately")
 	fmt.Println("  2) Brave       — higher quality results (Brave Search API key required)")
@@ -345,8 +353,8 @@ func runInit(cmd *cobra.Command, args []string) error {
 	fmt.Print("Select (default: 1): ")
 	fetchBackend, jinaKey, pythonCmd := parseFetchChoice(reader, readLine(reader, "1"))
 
-	// ─── 7/8  Default Tools ───────────────────────────────────
-	printInitSection("7/8  Default Tools")
+	// ─── 8/8  Default Tools ───────────────────────────────────
+	printInitSection("8/8  Default Tools")
 	fmt.Println("All tools are enabled by default. An allowlist restricts the agent to")
 	fmt.Println("only the tools you name (useful for leaner or constrained deployments).")
 	fmt.Print("Customize tool allowlist? (y/N): ")
@@ -356,25 +364,30 @@ func runInit(cmd *cobra.Command, args []string) error {
 	}
 	toolsLine := toolsLineFromSlice(selectedTools)
 
-	// ─── 8/8  Safety & Context (optional) ─────────────────────
-	// These safety/context switches are asked directly (like the Evaluator in
-	// step 5/8) instead of being hidden behind a single "advanced" gate. Each
-	// defaults to the sensible value; answering with Enter keeps it.
-	printInitSection("8/8  Safety & Context  (optional)")
-	fmt.Println("  These control destructive-action safety and context behaviour.")
+	// ─── Advanced Settings (optional) ─────────────────────────
+	// Optional extras that don't belong in the main flow. They default to the
+	// sensible value; answering "n" to the gate keeps all of them unchanged.
+	printInitSection("Advanced Settings  (optional)")
+	fmt.Println("These control destructive-action safety and context behaviour.")
+	fmt.Println("All default to safe values; skip unless you need to change them.")
+	fmt.Print("Configure advanced settings? (y/N): ")
+	advancedSet := strings.ToLower(readLine(reader, "n")) == "y"
 
-	fmt.Println()
-	fmt.Print("  Block permanent deletion (rm)? The agent must then use the system trash (y/N): ")
-	forbidRM := strings.ToLower(readLine(reader, "n")) == "y"
+	forbidRM := false         // [security] forbid_rm
+	summarizeEnabled := false // [summarize] enabled
+	keepRawToolCalls := false // [history] compress_tool_turns = false
 
-	fmt.Print("  Auto-create skills for recurring workflows? (Y/n) [router must be enabled]: ")
-	plannerEnabled := strings.ToLower(readLine(reader, "y")) != "n"
+	if advancedSet {
+		fmt.Println()
+		fmt.Print("  Block permanent deletion (rm)? The agent must then use the system trash (y/N): ")
+		forbidRM = strings.ToLower(readLine(reader, "n")) == "y"
 
-	fmt.Print("  Auto-compress long conversations with an LLM summary? (y/N): ")
-	summarizeEnabled := strings.ToLower(readLine(reader, "n")) == "y"
+		fmt.Print("  Auto-compress long conversations with an LLM summary? (y/N): ")
+		summarizeEnabled = strings.ToLower(readLine(reader, "n")) == "y"
 
-	fmt.Print("  Preserve raw tool calls in history for KV-cache hits (disable compression)? (y/N): ")
-	keepRawToolCalls := strings.ToLower(readLine(reader, "n")) == "y"
+		fmt.Print("  Preserve raw tool calls in history for KV-cache hits (disable compression)? (y/N): ")
+		keepRawToolCalls = strings.ToLower(readLine(reader, "n")) == "y"
+	}
 
 	// ─── Generate files ───────────────────────────────────────
 	for _, d := range []string{

@@ -307,8 +307,8 @@ func (c *Client) prepareMessages(messages []Message) []Message {
 	// Also re-encode tool-call arguments so any raw control characters inside
 	// string values are properly escaped — some providers re-parse `arguments`
 	// server-side and reject requests with unescaped control chars.
-	out := make([]Message, len(messages))
-	for i, m := range messages {
+	out := make([]Message, 0, len(messages))
+	for _, m := range messages {
 		m.ReasoningContent = ""
 		if len(m.ToolCalls) > 0 {
 			fixed := make([]ToolCall, len(m.ToolCalls))
@@ -318,7 +318,15 @@ func (c *Client) prepareMessages(messages []Message) []Message {
 			}
 			m.ToolCalls = fixed
 		}
-		out[i] = m
+		// Drop degenerate assistant messages (no content, no parts, no tool
+		// calls). Providers reject them with "content or tool_calls must be
+		// set"; they can only have been left in history by a previous buggy run
+		// or an empty model response. They carry no information, so dropping
+		// them is safe and never breaks tool-call pairing.
+		if m.Role == "assistant" && m.Content == "" && len(m.Parts) == 0 && len(m.ToolCalls) == 0 {
+			continue
+		}
+		out = append(out, m)
 	}
 	if c.isGemini() {
 		return sanitizeForGemini(out)

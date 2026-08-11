@@ -57,6 +57,45 @@ func TestPrepareMessagesStripsReasoningContent(t *testing.T) {
 	}
 }
 
+func TestPrepareMessagesDropsDegenerateAssistantMessages(t *testing.T) {
+	client := NewClient("", "http://example.invalid", "model", false, 0)
+	messages := []Message{
+		{Role: "system", Content: "sys"},
+		{Role: "user", Content: "question"},
+		{Role: "assistant", Content: "valid answer"},
+		{Role: "assistant"}, // degenerate: neither content nor tool_calls
+		{Role: "user", Content: "next"},
+	}
+	got := client.prepareMessages(messages)
+	if len(got) != 4 {
+		t.Fatalf("prepared messages = %#v, want 4", got)
+	}
+	for _, m := range got {
+		if m.Role == "assistant" && m.Content == "" && len(m.ToolCalls) == 0 {
+			t.Fatalf("degenerate assistant message survived: %#v", got)
+		}
+	}
+	if got[2].Content != "valid answer" {
+		t.Fatalf("valid assistant message was altered: %#v", got)
+	}
+}
+
+func TestPrepareMessagesKeepsEmptyToolCallMessage(t *testing.T) {
+	client := NewClient("", "http://example.invalid", "model", false, 0)
+	msg := Message{
+		Role: "assistant",
+		ToolCalls: []ToolCall{{
+			ID:       "call-1",
+			Type:     "function",
+			Function: FunctionCall{Name: "bash", Arguments: `{"command":"ls"}`},
+		}},
+	}
+	got := client.prepareMessages([]Message{msg})
+	if len(got) != 1 || len(got[0].ToolCalls) != 1 {
+		t.Fatalf("tool-call assistant message was dropped: %#v", got)
+	}
+}
+
 func TestChatCompletionStreamAssemblesContentAndUsage(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/chat/completions" {

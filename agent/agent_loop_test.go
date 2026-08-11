@@ -230,6 +230,41 @@ func TestAgentRunAcceptsSecondBareTextResponse(t *testing.T) {
 	}
 }
 
+func TestAgentRunRecoversFromEmptyAssistantResponse(t *testing.T) {
+	// First response is degenerate (no content, no tool calls) — e.g. a
+	// thinking model that streamed only reasoning. The loop must not persist
+	// it, must nudge, and must succeed on the retry instead of sending an
+	// invalid empty assistant message back to the provider.
+	client := &fakeChatClient{steps: []fakeChatStep{
+		{message: llm.Message{Role: "assistant"}},
+		{message: finishMessage("recovered answer")},
+	}}
+	ag := newLoopTestAgent(t, client, nil)
+
+	result, err := ag.Run(context.Background(), "question", nil)
+	if err != nil || result != "recovered answer" {
+		t.Fatalf("Run = (%q, %v)", result, err)
+	}
+	if len(client.calls) != 2 {
+		t.Fatalf("model calls = %d, want 2", len(client.calls))
+	}
+	for i, call := range client.calls {
+		for _, m := range call.messages {
+			if m.Role == "assistant" && m.Content == "" && len(m.ToolCalls) == 0 {
+				t.Fatalf("call %d sent empty assistant message: %#v", i+1, call.messages)
+			}
+		}
+	}
+	if !messagesContain(client.calls[1].messages, "user", "did not call finish_task") {
+		t.Fatalf("retry input lacks completion hint: %#v", client.calls[1].messages)
+	}
+	for _, m := range ag.Messages() {
+		if m.Role == "assistant" && m.Content == "" && len(m.ToolCalls) == 0 {
+			t.Fatalf("empty assistant message persisted in history: %#v", ag.Messages())
+		}
+	}
+}
+
 func TestAgentRunFallsBackAfterUpgradedClientError(t *testing.T) {
 	base := &fakeChatClient{steps: []fakeChatStep{{message: finishMessage("fallback answer")}}}
 	upgraded := &fakeChatClient{steps: []fakeChatStep{{err: errors.New("upgrade unavailable")}}}

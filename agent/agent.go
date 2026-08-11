@@ -876,7 +876,16 @@ func (a *Agent) runLoop(ctx context.Context, streamCb llm.StreamCallback, toolDe
 		turnStart := a.conv.Len()
 		cleanedMsg := *assistantMsg
 		cleanedMsg.Content = sanitizeOutput(cleanedMsg.Content)
-		a.conv.Append(cleanedMsg)
+
+		// A degenerate response — no content, no multimodal parts, and no tool
+		// calls (e.g. a thinking model that streamed only reasoning, or a
+		// truncated completion) — must never enter history: providers reject
+		// assistant messages with neither content nor tool_calls on the next
+		// request, turning a recoverable empty reply into a hard 400.
+		degenerate := cleanedMsg.Content == "" && len(cleanedMsg.Parts) == 0 && len(cleanedMsg.ToolCalls) == 0
+		if !degenerate {
+			a.conv.Append(cleanedMsg)
+		}
 
 		if len(cleanedMsg.ToolCalls) == 0 {
 			textOnlyStreak++

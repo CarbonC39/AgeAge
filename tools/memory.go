@@ -5,9 +5,41 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
+
+const (
+	maxMemoryRecallEntries = 50
+	maxMemoryRecallChars   = 12000
+)
+
+var memoryLocks sync.Map // canonical path -> *sync.RWMutex
+
+func memoryLock(path string) *sync.RWMutex {
+	canonical, err := filepath.Abs(path)
+	if err != nil {
+		canonical = path
+	}
+	lock := &sync.RWMutex{}
+	actual, _ := memoryLocks.LoadOrStore(canonical, lock)
+	return actual.(*sync.RWMutex)
+}
+
+// ensureMemoryPermissions repairs files created by older releases. It must be
+// called while holding the path's write lock because chmod mutates filesystem
+// metadata and must not race with atomic replacement.
+func ensureMemoryPermissions(path string) error {
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	return os.Chmod(path, 0o600)
+}
 
 // MemoryEntry represents a single memory record in MEMORY.jsonl.
 type MemoryEntry struct {
@@ -77,11 +109,19 @@ func (t *MemoryStoreTool) Execute(_ context.Context, args json.RawMessage) (stri
 		return "", fmt.Errorf("failed to marshal memory entry: %w", err)
 	}
 
-	f, err := os.OpenFile(t.MemoryPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	lock := memoryLock(t.MemoryPath)
+	lock.Lock()
+	defer lock.Unlock()
+	f, err := os.OpenFile(t.MemoryPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		return "", fmt.Errorf("failed to open memory file: %w", err)
 	}
 	defer f.Close()
+	// OpenFile does not change an existing file's mode; tighten it on every
+	// write so files created by older versions are repaired automatically.
+	if err := f.Chmod(0o600); err != nil {
+		return "", fmt.Errorf("failed to protect memory file: %w", err)
+	}
 
 	if _, err := f.WriteString(string(data) + "\n"); err != nil {
 		return "", fmt.Errorf("failed to write memory: %w", err)
@@ -99,6 +139,12 @@ type MemoryRecallTool struct {
 // checked per turn so memory_recall becomes available immediately after the
 // first memory_store call without advertising an empty tool beforehand.
 func (t *MemoryRecallTool) HasMemories() bool {
+	lock := memoryLock(t.MemoryPath)
+	lock.Lock()
+	defer lock.Unlock()
+	if err := ensureMemoryPermissions(t.MemoryPath); err != nil {
+		return false
+	}
 	info, err := os.Stat(t.MemoryPath)
 	return err == nil && info.Size() > 0
 }
@@ -130,6 +176,12 @@ func (t *MemoryRecallTool) Execute(_ context.Context, args json.RawMessage) (str
 		return "", fmt.Errorf("invalid arguments: %w", err)
 	}
 
+	lock := memoryLock(t.MemoryPath)
+	lock.Lock()
+	defer lock.Unlock()
+	if err := ensureMemoryPermissions(t.MemoryPath); err != nil {
+		return "", fmt.Errorf("failed to protect memory file: %w", err)
+	}
 	data, err := os.ReadFile(t.MemoryPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -162,6 +214,9 @@ func (t *MemoryRecallTool) Execute(_ context.Context, args json.RawMessage) (str
 		}
 		if matched {
 			matches = append(matches, entry)
+			if len(matches) >= maxMemoryRecallEntries {
+				break
+			}
 		}
 	}
 
@@ -172,11 +227,24 @@ func (t *MemoryRecallTool) Execute(_ context.Context, args json.RawMessage) (str
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("Found %d memory(ies):\n\n", len(matches)))
 	for _, m := range matches {
-		sb.WriteString(fmt.Sprintf("- [%s] %s", m.Timestamp, m.Content))
+		line := fmt.Sprintf("- [%s] %s", m.Timestamp, m.Content)
 		if m.Tags != "" {
-			sb.WriteString(fmt.Sprintf(" (tags: %s)", m.Tags))
+			line += fmt.Sprintf(" (tags: %s)", m.Tags)
 		}
-		sb.WriteString("\n")
+		line += "\n"
+		if sb.Len()+len(line) > maxMemoryRecallChars {
+			const notice = "... (memory recall truncated)\n"
+			remaining := maxMemoryRecallChars - sb.Len()
+			if remaining > 0 {
+				if remaining < len(notice) {
+					sb.WriteString(notice[:remaining])
+				} else {
+					sb.WriteString(notice)
+				}
+			}
+			break
+		}
+		sb.WriteString(line)
 	}
 
 	return sb.String(), nil
@@ -225,6 +293,12 @@ func (t *MemoryForgetTool) Execute(_ context.Context, args json.RawMessage) (str
 		}
 	}
 
+	lock := memoryLock(t.MemoryPath)
+	lock.Lock()
+	defer lock.Unlock()
+	if err := ensureMemoryPermissions(t.MemoryPath); err != nil {
+		return "", fmt.Errorf("failed to protect memory file: %w", err)
+	}
 	data, err := os.ReadFile(t.MemoryPath)
 	if err != nil {
 		return "", fmt.Errorf("failed to read memory file: %w", err)
@@ -258,8 +332,32 @@ func (t *MemoryForgetTool) Execute(_ context.Context, args json.RawMessage) (str
 	if newContent != "" {
 		newContent += "\n"
 	}
-	if err := os.WriteFile(t.MemoryPath, []byte(newContent), 0o644); err != nil {
-		return "", fmt.Errorf("failed to write memory file: %w", err)
+	// Rewrite through a same-directory temporary file and atomic rename. This
+	// prevents concurrent readers or crashes from observing a truncated JSONL.
+	dir := filepath.Dir(t.MemoryPath)
+	tmp, err := os.CreateTemp(dir, ".memory-*.tmp")
+	if err != nil {
+		return "", fmt.Errorf("failed to create memory temp file: %w", err)
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		return "", fmt.Errorf("failed to protect memory temp file: %w", err)
+	}
+	if _, err := tmp.WriteString(newContent); err != nil {
+		tmp.Close()
+		return "", fmt.Errorf("failed to write memory temp file: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return "", fmt.Errorf("failed to sync memory temp file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return "", fmt.Errorf("failed to close memory temp file: %w", err)
+	}
+	if err := os.Rename(tmpName, t.MemoryPath); err != nil {
+		return "", fmt.Errorf("failed to replace memory file: %w", err)
 	}
 
 	return fmt.Sprintf("Memory %s removed.", params.ID), nil

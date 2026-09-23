@@ -127,6 +127,8 @@ backend       = "native"          # "native", "jina", or "crawl4ai"
 jina_api_key  = ""                # Optional Jina API key
 crawl4ai_cmd  = "python"          # Python command for crawl4ai backend
 max_characters = 20000            # Output character cap (native backend)
+allow_private  = false            # Keep private/loopback/link-local targets blocked by default
+allowed_domains = []              # Optional host/domain allowlist
 ```
 
 ---
@@ -156,6 +158,8 @@ All backends fall back to DuckDuckGo automatically if the API key is missing or 
 backend         = "duckduckgo"   # or "tavily" / "brave" / "searxng"
 max_results     = 10
 blocked_domains = ["example.com"]
+allow_private   = false          # permit private search endpoints only in trusted environments
+allowed_domains = []             # optional host/domain allowlist
 
 searxng_url     = "http://localhost:8080"
 tavily_api_key  = ""   # or set TAVILY_API_KEY env var
@@ -215,13 +219,14 @@ Registers a recurring task with a cron schedule. Tasks are stored in `data/cron.
 | Parameter  | Type    | Required | Description                                                   |
 |------------|---------|----------|---------------------------------------------------------------|
 | `schedule` | string  | Yes      | Standard 5-field cron expression (e.g., `*/5 * * * *`).       |
-| `command`  | string  | Yes      | Task description, or `skill:<name> [args]` to run an existing skill/pipeline on schedule. |
-| `delivery` | string  | No       | IM delivery target for the result: `channelType:channelID` or `channelType:channelID:t:threadID` (e.g. `matrix:!room:chat.lomia.uk`). Only active in `connect`/`serve` modes. |
-| `enabled`  | boolean | No       | Start enabled (default `true`).                               |
+| `task`     | string  | Yes      | Task description, or `skill:<name> [args]` to run an existing skill/pipeline on schedule. |
+| `continue_current_session` | boolean | No | Continue the source logical session. This field exists only when `[cron].session_integration = true`. |
 
 **Notes:**
 - Returns the assigned task ID and next run time on success.
 - Requires confirmation in supervised mode.
+- Ownership and result delivery are supplied by the runtime. An Agent cannot target another room or thread.
+- By default, the schema contains exactly `schedule` and `task`.
 
 ---
 
@@ -251,6 +256,16 @@ Immediately executes a scheduled task by ID, outside its normal schedule.
 
 **Notes:**
 - Returns the run's output directly; the result is also recorded on the entry's audit fields.
+
+### `cron_pause` / `cron_resume`
+
+Pause or resume one of the current principal's scheduled tasks.
+
+| Parameter | Type   | Required | Description                    |
+|-----------|--------|----------|--------------------------------|
+| `id`      | string | Yes      | The cron task ID to change.    |
+
+Agent cron tools only expose entries owned by the current principal and source session. The administrative CLI retains a complete view.
 
 ---
 

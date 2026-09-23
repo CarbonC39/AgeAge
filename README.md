@@ -119,6 +119,8 @@ You ▸ Summarise @report.pdf and check @screenshot.png for issues
 | MCP server over stdio | `./ageage mcp` |
 | Inspect tools / skills / credentials / cron | `./ageage tools`, `./ageage skills`, `./ageage cred`, `./ageage cron` |
 
+In IM mode, Matrix AgeAge commands use `!` (for example `!help` and `!session new`); Telegram and Discord commands continue to use `/`. IM progress visibility is configured with `[notifications]`, including per-channel overrides. See the [channel configuration](docs/config.md#channels) for details.
+
 ---
 
 ## Architecture overview
@@ -294,6 +296,18 @@ Images are sent as `image_url` parts when `multimodal.vision = true`; non-image 
 - **Supervised mode** — destructive tools pause for `y / n / a` confirmation; `bash.auto_allow_commands` defines prefix patterns that skip confirmation in that directory
 - **`credentials.toml`** — unconditionally blocked from all file tools regardless of config; cannot be overridden
 - **IM group chats** — bot only responds when @mentioned or replied to; `allowed_users` must be configured or group messages are denied
+- **Scoped interaction replies** — confirmations and `ask_user` answers are bound to their channel, thread, session, and sender instead of being selected by arrival order
+- **Network egress** — web and browser tools reject local, private, link-local, multicast, and cloud-metadata targets by default and recheck native HTTP redirects
+- **Private memory storage** — memory files use mode `0600`; recall output is bounded and updates are synchronized and atomically replaced
+
+### Security migration notes
+
+- Existing local API setups remain unauthenticated by default and continue to bind to `127.0.0.1`. Before exposing the API beyond localhost, configure `server.api_key`, explicit `server.cors_origins`, request limits, and optionally `server.health_auth`.
+- Private web endpoints that previously worked are now blocked. Enable `allow_private` only for the specific web or browser tool that needs trusted internal access, or use `allowed_domains` to narrow its destinations.
+- IM approvals now require the same conversation scope and an authorized sender. Integrations that inject replies directly should use the scoped confirmation and user-input APIs.
+- Tool extensions may implement `MetadataProvider` to declare execution properties. Extensions without metadata remain compatible but are conservatively treated as side-effecting and medium risk.
+
+See [docs/config.md](docs/config.md) for the server and network settings, and [docs/tools.md](docs/tools.md) for tool behavior.
 
 ### Credential system
 

@@ -57,6 +57,7 @@ var skillOnlyToolFactories = map[string]func(AgentDeps, *tools.Registry, *Agent)
 	"ask_user": func(f AgentDeps, _ *tools.Registry, a *Agent) tools.Tool {
 		return &tools.AskUserTool{
 			ChannelID:     a.GetChannelID(),
+			Scope:         a.GetInteractionScope(),
 			Manager:       f.GetUserInputMgr(),
 			NotifyFuncPtr: &a.Callbacks.AskUser,
 		}

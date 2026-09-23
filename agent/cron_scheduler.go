@@ -132,19 +132,7 @@ func (s *CronScheduler) runEntry(ctx context.Context, e tools.CronEntry) {
 		fmt.Printf("[cron] %s firing (%s): %s\n", e.ID, e.Schedule, e.Command)
 	}
 
-	summary, err := ExecuteCronEntry(ctx, s.factory, e)
-
-	status := "success"
-	errMsg := ""
-	if err != nil {
-		status = "error"
-		errMsg = err.Error()
-	}
-	maxOut := s.factory.Config.Cron.MaxOutput
-	if maxOut <= 0 {
-		maxOut = 2000
-	}
-	_, _, _ = s.store.UpdateResult(e.ID, time.Now(), status, errMsg, truncateStr(summary, maxOut))
+	summary, err := s.factory.CronService.Run(ctx, tools.AdminCronActor(), e.ID)
 
 	if s.factory.Debug {
 		if err != nil {
@@ -174,10 +162,24 @@ func (s *CronScheduler) runEntry(ctx context.Context, e tools.CronEntry) {
 // Each entry uses a persistent session (cron-<id>) so recurring tasks build up
 // context across runs.
 func ExecuteCronEntry(ctx context.Context, factory *AgentFactory, e tools.CronEntry) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	sm := NewSessionManager(factory.Config.AgeAgeDirPath())
-	sessionID := SanitizeSessionID("cron-" + e.ID)
-	if err := sm.EnsureSession(sessionID); err != nil {
+	sessionID := cronSessionID(factory.Config.Cron.SessionIntegration, e)
+	tx, unlockSession, err := sm.BeginSessionTransactionContext(ctx, sessionID)
+	if err != nil {
+		return "", err
+	}
+	defer unlockSession()
+	if err := sm.ensureSessionLocked(sessionID); err != nil {
 		return "", fmt.Errorf("session error: %w", err)
+	}
+	sharedSession := factory.Config.Cron.SessionIntegration && e.ContinueCurrentSession && e.Owner.SessionID != ""
+	if !sharedSession {
+		if err := registerCronSession(factory.Config.AgeAgeDirPath(), sessionID, e); err != nil {
+			return "", fmt.Errorf("register cron session: %w", err)
+		}
 	}
 
 	ag := factory.CreateCronAgent()
@@ -186,11 +188,11 @@ func ExecuteCronEntry(ctx context.Context, factory *AgentFactory, e tools.CronEn
 	ag.Mode.InjectSoul = false
 
 	// Restore prior history so recurring tasks can build up context over time.
-	if msgs, err := sm.LoadHistory(sessionID); err == nil && len(msgs) > 0 {
+	if msgs, err := tx.LoadHistory(); err == nil && len(msgs) > 0 {
 		ag.SetMessages(msgs)
 	}
 
-	input := e.Command
+	input := e.TaskText()
 	if strings.HasPrefix(input, "skill:") {
 		rest := strings.TrimPrefix(input, "skill:")
 		parts := strings.SplitN(rest, " ", 2)
@@ -201,7 +203,12 @@ func ExecuteCronEntry(ctx context.Context, factory *AgentFactory, e tools.CronEn
 	}
 
 	result, err := ag.Run(ctx, input, nil)
-	saveErr := sm.SaveHistory(sessionID, ag.Messages())
+	if err != nil && ctx.Err() != nil {
+		// Do not persist a half-written scheduled turn after cancellation or
+		// timeout. The audit path still records the failed run.
+		return "", err
+	}
+	saveErr := tx.SaveHistory(ag.Messages())
 	if err != nil {
 		return "", err
 	}
@@ -209,4 +216,27 @@ func ExecuteCronEntry(ctx context.Context, factory *AgentFactory, e tools.CronEn
 		return result, fmt.Errorf("history save failed: %w", saveErr)
 	}
 	return result, nil
+}
+
+func cronSessionID(sessionIntegration bool, e tools.CronEntry) string {
+	if sessionIntegration && e.ContinueCurrentSession && e.Owner.SessionID != "" {
+		return SanitizeSessionID(e.Owner.SessionID)
+	}
+	return SanitizeSessionID("cron-" + e.ID)
+}
+
+func registerCronSession(ageageDir, sessionID string, e tools.CronEntry) error {
+	registry, err := OpenSessionRegistry(ageageDir)
+	if err != nil {
+		return err
+	}
+	return registry.Bind(SessionBinding{
+		Key:         "cron:" + e.ID,
+		SessionID:   sessionID,
+		ChannelType: e.Owner.ChannelType,
+		ChannelID:   e.Owner.ChannelID,
+		ThreadID:    e.Owner.ThreadID,
+		OwnerID:     e.Owner.SenderID,
+		Kind:        "cron",
+	})
 }

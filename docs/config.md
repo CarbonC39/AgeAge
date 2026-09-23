@@ -257,16 +257,49 @@ Settings for the scheduled-task system. Cron entries are stored in `data/cron.js
 
 ```toml
 [cron]
-catch_up   = false
-max_output = 2000
+catch_up           = false
+max_output         = 2000
+timeout            = 300
+session_integration = false
 ```
 
 | Key          | Type | Default | Description |
 |--------------|------|---------|-------------|
 | `catch_up`   | bool | `false` | When `true`, after a process restart each enabled entry runs once for its most recent missed trigger (within the last 7 days). |
 | `max_output` | int  | `2000`  | Max characters of the last run's output persisted on the entry for auditing. |
+| `timeout` | int | `300` | Maximum run duration in seconds for scheduled and manual execution. Non-positive values use five minutes. |
+| `session_integration` | bool | `false` | Adds the optional `continue_current_session` boolean to `cron_add`. Disabled keeps each task in its own persistent session. |
 
-Manage tasks with `ageage cron list|add|remove|run|pause|resume`, or via the `cron_add` / `cron_remove` / `cron_list` / `cron_run` agent tools.
+Manage tasks with `ageage cron list|add|remove|run|pause|resume`, or via the `cron_add`, `cron_remove`, `cron_list`, `cron_run`, `cron_pause`, and `cron_resume` agent tools. Agent-created tasks are owned by the current principal and source session; their delivery target is the originating room/thread. CLI commands are administrative.
+
+---
+
+## `[notifications]`
+
+Controls which structured Agent progress events are rendered by IM channels. This policy is runtime configuration; it is not added to the Agent prompt or tool schemas.
+
+```toml
+[notifications]
+preset      = "balanced"  # "quiet", "balanced", or "verbose"
+include     = []
+exclude     = []
+throttle_ms = 750
+
+[notifications.channels.matrix]
+preset = "quiet"
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `preset` | string | `"balanced"` | Base progress detail: `quiet`, `balanced`, or `verbose`. |
+| `include` | string list | `[]` | Optional category allowlist. |
+| `exclude` | string list | `[]` | Categories to suppress; takes precedence over `include`. |
+| `throttle_ms` | int | `750` | Minimum interval used when coalescing progress updates. |
+| `channels` | table | `{}` | Per-channel overrides for `matrix`, `telegram`, or `discord`. |
+
+Stable categories are `lifecycle`, `plan`, `waiting`, `tool`, `subagent`, and `cron`. Balanced mode suppresses per-tool spam while retaining lifecycle and milestone updates; verbose enables every category.
+
+Progress is scoped to one Agent run. On channels that support editing, AgeAge creates one progress message and edits it in place; throttling coalesces bursts and identical updates are ignored. Thread and topic runs keep that message in the originating thread. Cron result delivery uses the same policy, so `exclude = ["cron"]` disables scheduled-result pushes without disabling task execution or audit records.
 
 ---
 
@@ -326,6 +359,8 @@ brave_api_key   = ""   # or set BRAVE_API_KEY env var
 | `backend`         | string      | `"duckduckgo"` | Search backend: `"duckduckgo"`, `"searxng"`, `"tavily"`, or `"brave"`. |
 | `max_results`     | int         | `10`           | Maximum results returned per query (Brave caps at 20). |
 | `blocked_domains` | string list | `[]`           | Domains to exclude (e.g. `["youtube.com"]`). Subdomain matching included. |
+| `allow_private`   | bool        | `false`        | Allow private, loopback, link-local, and metadata search endpoints (trusted environments only). |
+| `allowed_domains` | string list | `[]`           | Optional host/domain allowlist for search requests. |
 | `searxng_url`     | string      | `""`           | Full URL of your SearXNG instance (required for `backend = "searxng"`). |
 | `tavily_api_key`  | string      | `""`           | Tavily API key. Falls back to `TAVILY_API_KEY` env var. |
 | `brave_api_key`   | string      | `""`           | Brave Search API key. Falls back to `BRAVE_API_KEY` env var. |
@@ -359,6 +394,8 @@ backend        = "native"
 max_characters = 15000
 jina_api_key   = ""
 crawl4ai_cmd   = "python"
+allow_private  = false
+allowed_domains = []
 ```
 
 | Key             | Type   | Default    | Description |
@@ -367,6 +404,8 @@ crawl4ai_cmd   = "python"
 | `max_characters`| int    | `15000`    | Character limit on returned content. |
 | `jina_api_key`  | string | `""`       | Optional Jina Reader API key (improves rate limits). |
 | `crawl4ai_cmd`  | string | `"python"` | Python executable for the crawl4ai backend. |
+| `allow_private` | bool   | `false` | Allow private, loopback, link-local, and metadata targets (trusted environments only). |
+| `allowed_domains` | array | `[]` | Optional host/domain allowlist. Empty permits public hosts; subdomains match their parent domain. |
 
 **Backends:**
 
@@ -389,6 +428,8 @@ headless     = true
 browser_type = "chromium"
 agent_bin    = "agent-browser"
 timeout      = 30
+allow_private = false
+allowed_domains = []
 ```
 
 | Key           | Type   | Default          | Description |
@@ -398,6 +439,8 @@ timeout      = 30
 | `browser_type`| string | `"chromium"`     | Browser to launch (playwright only): `"chromium"`, `"firefox"`, or `"webkit"`. |
 | `agent_bin`   | string | `"agent-browser"`| Command to invoke agent-browser. Supports multi-word values such as `"npx agent-browser"` or `"npx --yes agent-browser"`. |
 | `timeout`     | int    | `30`             | Seconds allowed per browser action. |
+| `allow_private` | bool | `false` | Allow private, loopback, link-local, and metadata targets (trusted environments only). |
+| `allowed_domains` | array | `[]` | Optional host/domain allowlist. Empty permits public hosts; subdomains match their parent domain. |
 
 **Backends:**
 
@@ -627,22 +670,24 @@ All IM channels share these UX behaviours when the platform supports them:
 
 These commands are handled directly in the channel handler and never routed through the agent.
 
+Matrix uses `!` as the AgeAge command prefix so commands do not collide with Matrix client commands. Telegram and Discord use `/`. In the table below, `<prefix>` means `!` on Matrix and `/` on Telegram or Discord. On Matrix, `!!text` escapes a leading `!` and sends `!text` to the Agent as ordinary input.
+
 | Command | Description |
 |---------|-------------|
-| `/clear` | Clear conversation history for the current session (session stays). |
-| `/stop` | Abort the running agent task. |
-| `/summarize` | Compress conversation history into a summary. |
-| `/undo` | Remove the last turn from history. |
-| `/retry [text]` | Re-run the last message, optionally with additional text appended. |
-| `/sessions` | List all sessions for this room/chat, newest first. Matrix sessions include a `matrix.to` link to jump to the thread. |
-| `/session list\|ls` | List sessions scoped to this chat. |
-| `/session new\|n [name]` | Create a new session and switch to it. On Matrix top-level messages, the bot's reply starts a thread — continue in that thread to stay in the session. |
-| `/session switch\|sw <name>` | Switch to an existing session (prefix matching supported). |
-| `/session remove\|rm <name>` | Move a session to the OS trash (fallback: permanent delete). Cannot remove the currently active session. |
-| `/cred list\|ls` | List stored credential names. |
-| `/cred remove\|rm <name>` | Remove a credential. |
-| `/cred reload` | Hot-reload credentials from disk (after CLI edits). |
-| `/help` | Show available commands. |
+| `<prefix>clear` | Clear conversation history for the current session (session stays). |
+| `<prefix>stop` | Abort the running agent task. |
+| `<prefix>summarize` | Compress conversation history into a summary. |
+| `<prefix>undo` | Remove the last turn from history. |
+| `<prefix>retry [text]` | Re-run the last message, optionally with additional text appended. |
+| `<prefix>sessions` | List all sessions for this room/chat, newest first. Matrix sessions include a `matrix.to` link to jump to the thread. |
+| `<prefix>session list\|ls` | List sessions scoped to this chat. |
+| `<prefix>session new\|n [name]` | Create a new session and switch to it. On Matrix top-level messages, the bot's reply starts a thread — continue in that thread to stay in the session. |
+| `<prefix>session switch\|sw <name>` | Switch to an existing session. |
+| `<prefix>session remove\|rm <name>` | Move a session to the OS trash (fallback: permanent delete). Cannot remove the currently active session. |
+| `<prefix>cred list\|ls` | List stored credential names. |
+| `<prefix>cred remove\|rm <name>` | Remove a credential. |
+| `<prefix>cred reload` | Hot-reload credentials from disk (after CLI edits). |
+| `<prefix>help` | Show available commands. |
 
 > **Session scope:** Each room/channel/DM has its own session namespace. A session named `research` in one Telegram chat is independent from `research` in another. Matrix threads each get their own isolated session that resumes automatically after a restart.
 
@@ -711,7 +756,7 @@ allowed_users = ["@alice:matrix.org", "@bob:matrix.org"]
 
 **Thread sessions:** When a message arrives inside a Matrix thread (`m.thread`), it is automatically routed to a thread-specific session — independent from other threads in the same room. The session ID is derived from the thread's root event ID so history resumes correctly after a restart. In group rooms the bot only responds when its user ID (`@bot:matrix.org`) appears in the message body.
 
-Use `/session new` from a top-level message to have the bot create a thread and start a fresh named session inside it.
+Use `!session new` from a top-level message to have the bot create a thread and start a fresh named session inside it.
 
 ---
 
@@ -723,7 +768,24 @@ HTTP API server used by `ageage serve`.
 [server]
 host = "127.0.0.1"
 port = 8080
+# api_key = ""                      # optional Bearer token for /v1/*
+# health_auth = false                # require it for /health too
+# cors_origins = ["https://app.example"]
+# max_body_bytes = 4194304           # 4 MiB
+# max_concurrent = 8                  # in-flight /v1 requests
 ```
+
+`/v1/models` and `/v1/chat/completions` accept `Authorization: Bearer <api_key>`
+when `api_key` is configured. The health probe is public by default; set
+`health_auth = true` when the probe itself must be authenticated. With no API
+key and no CORS origins, the legacy wildcard CORS response is retained. For an
+authenticated deployment, configure explicit `cors_origins`; wildcard origins
+are never emitted alongside authentication credentials.
+
+Requests larger than `max_body_bytes` receive HTTP 413. Once
+`max_concurrent` requests are active, additional API requests receive HTTP 429;
+streaming requests hold a slot until the stream ends or its client context is
+cancelled.
 
 ---
 

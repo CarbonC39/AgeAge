@@ -78,15 +78,27 @@ max_history = 8
 
 # ── Scheduled tasks (cron) ───────────────────────────────────────────────────
 [cron]
-catch_up   = false            # true = run the most recent missed trigger once at startup
-max_output = 2000             # chars of the last run persisted for auditing
+catch_up            = false   # true = run the most recent missed trigger once at startup
+max_output          = 2000    # characters of the last run persisted for auditing
+timeout             = 300     # maximum scheduled/manual run duration in seconds
+session_integration = false   # optionally allow cron_add to continue the source session
 
 # Manage with:  ageage cron list|add|remove|run|pause|resume
-# or via the agent tools cron_add / cron_remove / cron_list / cron_run.
-# The command field supports "skill:<name> [args]" to run an existing skill or
-# pipeline on schedule. Add a "delivery" target (e.g.
-# "matrix:!room:chat.lomia.uk") to post results to an IM room in connect/serve
-# mode.
+# or via the corresponding agent tools. Agent-created tasks are scoped to the
+# current principal and source session, and deliver to the originating thread.
+# The task field supports "skill:<name> [args]".
+
+# ── IM progress notifications ───────────────────────────────────────────────
+[notifications]
+preset      = "balanced"    # "quiet", "balanced", or "verbose"
+include     = []             # optional category allowlist
+exclude     = []             # categories to suppress; takes precedence
+throttle_ms = 750             # minimum interval for coalesced progress updates
+
+# Optional per-channel overrides. Categories: lifecycle, plan, waiting, tool,
+# subagent, cron.
+# [notifications.channels.matrix]
+# preset = "quiet"
 
 # ── Context summarization ────────────────────────────────────────────────────
 [summarize]
@@ -128,12 +140,18 @@ tavily_api_key  = ""           # or TAVILY_API_KEY env var
 brave_api_key   = ""           # or BRAVE_API_KEY env var
 max_results     = 10
 blocked_domains = []
+allow_private   = false       # permit private search endpoints only in trusted environments
+allowed_domains = []          # optional host/domain allowlist for search requests
 
 [web_fetch]
 backend        = "native"     # "native", "jina", or "crawl4ai"
 jina_api_key   = ""
 crawl4ai_cmd   = "python"
 max_characters = 15000
+# Private/loopback/link-local targets are blocked by default.
+allow_private  = false
+# Optional host/domain allowlist; empty permits public hosts.
+allowed_domains = []
 
 # ── Browser automation ───────────────────────────────────────────────────────
 [browser]
@@ -142,6 +160,8 @@ headless     = true
 browser_type = "chromium"     # "chromium", "firefox", or "webkit"
 agent_bin    = "agent-browser"
 timeout      = 30             # seconds per browser action
+allow_private = false         # permit private/loopback/link-local targets only in trusted environments
+allowed_domains = []          # optional host/domain allowlist; empty permits public hosts
 
 # ── Multimodal attachments ───────────────────────────────────────────────────
 [multimodal]
@@ -164,6 +184,17 @@ enabled = false
 [server]
 host = "127.0.0.1"
 port = 8080
+# Optional Bearer token for /v1/*; leave empty for local development.
+# api_key = ""
+# Require the same token for /health (default: false).
+# health_auth = false
+# Browser origins allowed to call the API. Empty preserves wildcard CORS only
+# when api_key is empty; use explicit origins for authenticated deployments.
+# cors_origins = ["https://chat.example.com"]
+# Maximum /v1/chat/completions request body in bytes (default: 4194304).
+# max_body_bytes = 4194304
+# Maximum number of in-flight /v1 requests (default: 8).
+# max_concurrent = 8
 
 # ── Evaluator (auto-generated skill quality) ─────────────────────────────────
 [eval]

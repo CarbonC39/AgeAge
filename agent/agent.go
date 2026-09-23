@@ -79,7 +79,9 @@ type Agent struct {
 	// Nil for manually constructed agents that do not need those services.
 	deps AgentDeps
 
-	currentChannelID string                     // For async confirmations in channel mode
+	currentChannelID string                 // For async confirmations in channel mode
+	interactionScope tools.InteractionScope // Owner scope for confirmations and ask_user
+	scopeMu          sync.RWMutex
 	ConfirmationMgr  *tools.ConfirmationManager // Optional: for async confirmations
 	SessionDir       string                     // Directory for the active session
 	MaxIterations    int                        // Maximum iterations for this agent run
@@ -93,8 +95,9 @@ type Agent struct {
 	// activeSkill is the segmented skill matched for the current Run() (nil when
 	// no segmented skill is active). segIdx is the current segment index, used by
 	// buildSystemPrompt and advanced by the next_step tool.
-	activeSkill *skills.Skill
-	segIdx      int
+	activeSkill   *skills.Skill
+	segIdx        int
+	commandPrefix string // slash by default; IM integrations may set this to "!"
 }
 
 // NewAgent creates a new agent instance.
@@ -152,17 +155,37 @@ func (a *Agent) SetMessages(msgs []llm.Message) {
 	a.conv.Reset(msgs)
 }
 
-// parseSkillCommand checks whether input begins with a /skill-name command.
+// SetCommandPrefix configures the explicit skill-command prefix for this
+// agent. CLI agents retain the default slash prefix; Matrix agents use '!'.
+func (a *Agent) SetCommandPrefix(prefix string) {
+	if prefix == "" {
+		prefix = "/"
+	}
+	a.commandPrefix = prefix
+}
+
+// parseSkillCommand checks whether input begins with the configured
+// skill-name command. A doubled prefix is an escape for a literal prefix.
 func (a *Agent) parseSkillCommand(input string) (*skills.Skill, string) {
-	if !strings.HasPrefix(input, "/") || len(a.skills) == 0 {
+	prefix := a.commandPrefix
+	if prefix == "" {
+		prefix = "/"
+	}
+	if strings.HasPrefix(input, prefix+prefix) {
+		return nil, strings.TrimPrefix(input, prefix)
+	}
+	if !strings.HasPrefix(input, prefix) || len(a.skills) == 0 {
 		return nil, input
 	}
-	rest := strings.TrimPrefix(input, "/")
-	parts := strings.SplitN(rest, " ", 2)
-	cmdName := NormalizeSkillName(parts[0])
+	rest := strings.TrimPrefix(input, prefix)
+	fields := strings.Fields(rest)
+	if len(fields) == 0 {
+		return nil, input
+	}
+	cmdName := NormalizeSkillName(fields[0])
 	remaining := ""
-	if len(parts) > 1 {
-		remaining = strings.TrimSpace(parts[1])
+	if len(rest) > len(fields[0]) {
+		remaining = strings.TrimSpace(rest[len(fields[0]):])
 	}
 	for i := range a.skills {
 		if NormalizeSkillName(a.skills[i].Name) == cmdName {
@@ -531,9 +554,13 @@ func (a *Agent) RunWithParts(ctx context.Context, userInput string, parts []llm.
 					if desc == "" {
 						desc = "(no description)"
 					}
+					prefix := a.commandPrefix
+					if prefix == "" {
+						prefix = "/"
+					}
 					a.Callbacks.Notify(fmt.Sprintf(
-						"🔧 Created skill **%s** — %s\nInvoke later with `/%s` or describe a matching task.",
-						skill.CommandName(), desc, skill.CommandName()))
+						"🔧 Created skill **%s** — %s\nInvoke later with `%s%s` or describe a matching task.",
+						skill.CommandName(), desc, prefix, skill.CommandName()))
 				}
 			} else if err != nil {
 				a.debugLog("Planner", "skill creation failed (%s) — proceeding without skill", err)
@@ -797,7 +824,7 @@ func (a *Agent) runLoop(ctx context.Context, streamCb llm.StreamCallback, toolDe
 		var toolCallStreamCb llm.ToolCallStreamCb
 		if streamCb != nil && maxPar > 1 {
 			toolCallStreamCb = func(idx int, call llm.ToolCall) {
-				if !isReadOnlyTool(call.Function.Name) {
+				if !a.isReadOnlyTool(call.Function.Name) {
 					return
 				}
 				ch := make(chan toolExecResult, 1)
@@ -857,7 +884,7 @@ func (a *Agent) runLoop(ctx context.Context, streamCb llm.StreamCallback, toolDe
 		// Serialize the entire batch if any tool has side effects.
 		hasMutation := false
 		for _, tc := range assistantMsg.ToolCalls {
-			if !isReadOnlyTool(tc.Function.Name) {
+			if !a.isReadOnlyTool(tc.Function.Name) {
 				hasMutation = true
 				break
 			}
@@ -1035,9 +1062,10 @@ func (a *Agent) runPipelineSkill(ctx context.Context, skill *skills.Skill, input
 		a.Callbacks.Notify,
 		a.Callbacks.AskUser,
 		a.ConfirmationMgr,
-		a.currentChannelID,
+		a.GetChannelID(),
 		a.registry,
 	)
+	exec.scope = a.GetInteractionScope()
 	result, err = exec.Run(ctx)
 	if err != nil {
 		return "", "", err
@@ -1088,18 +1116,16 @@ func stripLeadingThinkBlocks(s string) string {
 	return s
 }
 
-// readOnlyTools is the set of tool names guaranteed to have no side effects.
-var readOnlyTools = map[string]bool{
-	"file_read":     true,
-	"web_fetch":     true,
-	"web_search":    true,
-	"memory_recall": true,
-	"glob":          true,
-	"grep":          true,
-	"cron_list":     true,
+// isReadOnlyTool consults the registry descriptor rather than a name-based
+// allowlist.  Unknown and legacy tools receive the registry's conservative
+// default and are therefore serialized with other potentially mutating tools.
+func (a *Agent) isReadOnlyTool(name string) bool {
+	if a == nil || a.registry == nil {
+		return false
+	}
+	metadata, ok := a.registry.Metadata(name)
+	return ok && metadata.ReadOnly
 }
-
-func isReadOnlyTool(name string) bool { return readOnlyTools[name] }
 
 // --- Debug helpers ---
 
@@ -1456,7 +1482,25 @@ func (a *Agent) ClearHistory() {
 
 // SetChannelID sets the current channel ID for async confirmations.
 func (a *Agent) SetChannelID(channelID string) {
+	a.scopeMu.Lock()
 	a.currentChannelID = channelID
+	a.interactionScope.ChannelID = channelID
+	a.scopeMu.Unlock()
+}
+
+// SetInteractionScope binds interactive requests created by this agent to the
+// originating channel, thread/session, and sender.
+func (a *Agent) SetInteractionScope(scope tools.InteractionScope) {
+	a.scopeMu.Lock()
+	a.interactionScope = scope
+	a.currentChannelID = scope.ChannelID
+	a.scopeMu.Unlock()
+}
+
+func (a *Agent) GetInteractionScope() tools.InteractionScope {
+	a.scopeMu.RLock()
+	defer a.scopeMu.RUnlock()
+	return a.interactionScope
 }
 
 // SetLLMClient overrides the LLM client for this agent.
@@ -1469,6 +1513,8 @@ func (a *Agent) SetLLMClient(client ChatClient) {
 
 // GetChannelID returns the current channel ID.
 func (a *Agent) GetChannelID() string {
+	a.scopeMu.RLock()
+	defer a.scopeMu.RUnlock()
 	return a.currentChannelID
 }
 

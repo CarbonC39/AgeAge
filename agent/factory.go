@@ -28,6 +28,7 @@ type AgentFactory struct {
 	SecurityChecker *security.Checker
 	Debug           bool
 	CronStore       *tools.CronStore
+	CronService     *tools.CronService
 	UserInputMgr    *tools.UserInputManager       // Shared ask_user pending-input state
 	MCPSessions     map[string]*mcp.ClientSession // Active MCP sessions
 	InjectSoul      bool                          // Passed to each created agent; true in serve/connect, false in CLI
@@ -40,6 +41,9 @@ type AgentFactory struct {
 	mcpMu    sync.RWMutex
 	skillsMu sync.RWMutex
 	Skills   []skills.Skill
+	// cronAgentBuilder is a test seam for exercising scheduler/session behavior
+	// without a remote model. Production leaves it nil.
+	cronAgentBuilder func() *Agent
 }
 
 // GetSkills returns the current skill list (thread-safe; supports hot reload).
@@ -83,6 +87,8 @@ func (f *AgentFactory) GetStandardToolNames() []string {
 	add("cron_remove")
 	add("cron_list")
 	add("cron_run")
+	add("cron_pause")
+	add("cron_resume")
 	add("glob")
 	add("grep")
 	add("tree")
@@ -240,13 +246,12 @@ func NewFactory(configPath string, debug bool) (*AgentFactory, error) {
 		fmt.Printf("⚠️  Warning: credentials unavailable: %s\n", err)
 		credMgr = nil
 	}
-	// Hardcode-block the credentials file path in the security checker so that
-	// file_read / file_write / file_edit tools cannot touch it.
-	if credMgr != nil {
-		sec.BlockFile(cfg.CredentialsPath())
-	}
+	// Hard-block the configured credentials path regardless of whether manager
+	// initialisation succeeded. File tools must never become a fallback reader
+	// for a credentials file after decryption/configuration errors.
+	sec.BlockFile(cfg.CredentialsPath())
 
-	return &AgentFactory{
+	factory := &AgentFactory{
 		Config:          cfg,
 		Skills:          loadedSkills,
 		LLMClient:       clientLLM,
@@ -257,7 +262,15 @@ func NewFactory(configPath string, debug bool) (*AgentFactory, error) {
 		MCPSessions:     mcpSessions,
 		CredMgr:         credMgr,
 		DocsDir:         docsDir,
-	}, nil
+	}
+	cronService := tools.NewCronService(cronStore, cfg.Cron.SessionIntegration)
+	cronService.Timeout = time.Duration(cfg.Cron.Timeout) * time.Second
+	cronService.MaxOutput = cfg.Cron.MaxOutput
+	cronService.ExecuteFunc = func(ctx context.Context, entry tools.CronEntry) (string, error) {
+		return ExecuteCronEntry(ctx, factory, entry)
+	}
+	factory.CronService = cronService
+	return factory, nil
 }
 
 // GetConfig implements AgentDeps.
@@ -353,7 +366,6 @@ func (f *AgentFactory) CreateAgentFiltered(confirmMgr *tools.ConfirmationManager
 		// If we have a confirmation manager and a channel ID, use async confirmation.
 		if confirmMgr != nil && currentAgent != nil && currentAgent.GetChannelID() != "" {
 			ag := currentAgent
-			cid := ag.GetChannelID()
 
 			prompt := fmt.Sprintf("*Agent Confirmation Required*\nOperation: `%s`\nReply with `y`, `n`, or `a` (always allow).", operation)
 			if ag.Callbacks.Notify != nil {
@@ -362,7 +374,7 @@ func (f *AgentFactory) CreateAgentFiltered(confirmMgr *tools.ConfirmationManager
 				fmt.Printf("\n[IM Confirmation] %s\n", prompt)
 			}
 
-			_, resultCh := confirmMgr.RequestConfirmation(operation, cid, 10*time.Minute)
+			_, resultCh := confirmMgr.RequestConfirmationScoped(operation, ag.GetInteractionScope(), 10*time.Minute)
 			allowed, ok := <-resultCh
 			if !ok {
 				return false // Timeout
@@ -507,31 +519,49 @@ func (f *AgentFactory) CreateAgentFiltered(confirmMgr *tools.ConfirmationManager
 	// Cron tools.
 	if shouldRegisterTool("cron_add") {
 		registry.Register(&tools.CronAddTool{
-			Store:       f.CronStore,
-			Supervised:  isSupervised,
-			ConfirmFunc: confirmFunc,
+			Store:              f.CronStore,
+			Service:            f.CronService,
+			ScopeFunc:          func() tools.InteractionScope { return currentAgent.GetInteractionScope() },
+			SessionIntegration: f.Config.Cron.SessionIntegration,
+			Supervised:         isSupervised,
+			ConfirmFunc:        confirmFunc,
 		})
 	}
 	if shouldRegisterTool("cron_remove") {
 		registry.Register(&tools.CronRemoveTool{
 			Store:       f.CronStore,
+			Service:     f.CronService,
+			ScopeFunc:   func() tools.InteractionScope { return currentAgent.GetInteractionScope() },
 			Supervised:  isSupervised,
 			ConfirmFunc: confirmFunc,
 		})
 	}
 	if shouldRegisterTool("cron_list") {
-		registry.Register(&tools.CronListTool{Store: f.CronStore})
+		registry.Register(&tools.CronListTool{
+			Store:     f.CronStore,
+			Service:   f.CronService,
+			ScopeFunc: func() tools.InteractionScope { return currentAgent.GetInteractionScope() },
+		})
 	}
 	if shouldRegisterTool("cron_run") {
 		registry.Register(&tools.CronRunTool{
-			Store: f.CronStore,
-			RunFunc: func(ctx context.Context, id string) (string, error) {
-				e, ok := f.CronStore.Get(id)
-				if !ok {
-					return "", fmt.Errorf("cron task %s not found", id)
-				}
-				return ExecuteCronEntry(ctx, f, e)
-			},
+			Store:     f.CronStore,
+			Service:   f.CronService,
+			ScopeFunc: func() tools.InteractionScope { return currentAgent.GetInteractionScope() },
+		})
+	}
+	if shouldRegisterTool("cron_pause") {
+		registry.Register(&tools.CronPauseTool{
+			Store:     f.CronStore,
+			Service:   f.CronService,
+			ScopeFunc: func() tools.InteractionScope { return currentAgent.GetInteractionScope() },
+		})
+	}
+	if shouldRegisterTool("cron_resume") {
+		registry.Register(&tools.CronResumeTool{
+			Store:     f.CronStore,
+			Service:   f.CronService,
+			ScopeFunc: func() tools.InteractionScope { return currentAgent.GetInteractionScope() },
 		})
 	}
 
@@ -620,7 +650,18 @@ func (f *AgentFactory) CreateAgentFiltered(confirmMgr *tools.ConfirmationManager
 // allowlists, and the credentials file block — so scheduled maintenance cannot
 // escalate to unchecked destructive operations.
 func (f *AgentFactory) CreateCronAgent() *Agent {
-	ag := f.CreateAgent(nil, "cron")
+	var ag *Agent
+	if f.cronAgentBuilder != nil {
+		ag = f.cronAgentBuilder()
+	} else {
+		ag = f.CreateAgent(nil, "cron")
+	}
+	// Scheduled agents may execute ordinary tools, but cannot create, inspect,
+	// run, or remove scheduler entries. This prevents self-replication and
+	// cross-owner probing from unattended runs.
+	for _, name := range []string{"cron_add", "cron_remove", "cron_list", "cron_run", "cron_pause", "cron_resume"} {
+		ag.registry.Unregister(name)
+	}
 	for _, t := range ag.registry.ListAll() {
 		switch v := t.(type) {
 		case *tools.BashTool:
@@ -632,10 +673,6 @@ func (f *AgentFactory) CreateCronAgent() *Agent {
 		case *tools.MemoryStoreTool:
 			v.Supervised = false
 		case *tools.MemoryForgetTool:
-			v.Supervised = false
-		case *tools.CronAddTool:
-			v.Supervised = false
-		case *tools.CronRemoveTool:
 			v.Supervised = false
 		}
 	}

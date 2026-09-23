@@ -66,6 +66,7 @@ type PipelineExecutor struct {
 	// Passed through to sub-agents for supervised-mode confirmations.
 	confirmMgr *tools.ConfirmationManager
 	channelID  string
+	scope      tools.InteractionScope
 
 	nodeStatus map[string]string // node ID → nodeStatus* value
 	todoMsgID  string
@@ -590,6 +591,7 @@ func (e *PipelineExecutor) runAgentNodeAttempt(
 	//   - Do NOT load skills (IsSubAgent=true skips skill-only tool injection).
 	//   - Do NOT run the router.
 	subAgent := e.factory.CreateAgentFiltered(e.confirmMgr, e.channelID, filteredTools)
+	subAgent.SetInteractionScope(e.scope)
 	subAgent.Mode.IsSubAgent = true
 	subAgent.SessionDir = e.sessionDir
 	// SOUL is injected only in the last agent node; context is always injected.
@@ -745,6 +747,7 @@ func (e *PipelineExecutor) execNestedPipeline(ctx context.Context, node skills.P
 		e.sharedReg,
 	)
 	nestedExec.askUserNotify = e.askUserNotify
+	nestedExec.scope = e.scope
 	// Apply all resolved inputs as nested vars (including non-"input" keys).
 	for k, v := range extraVars {
 		nestedExec.vars[k] = v

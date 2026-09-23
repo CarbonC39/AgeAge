@@ -30,6 +30,10 @@ var htmlTagRe = regexp.MustCompile(`<[^>]*>`)
 
 // newRobustHTTPClient creates an HTTP client with comprehensive compatibility settings.
 func newRobustHTTPClient(timeout time.Duration) *http.Client {
+	return newRobustHTTPClientWithPolicy(timeout, defaultNetworkPolicy)
+}
+
+func newRobustHTTPClientWithPolicy(timeout time.Duration, policy *networkPolicy) *http.Client {
 	transport := &http.Transport{
 		TLSClientConfig: &tls.Config{
 			MinVersion: tls.VersionTLS12,
@@ -45,6 +49,13 @@ func newRobustHTTPClient(timeout time.Duration) *http.Client {
 		DisableCompression:    false,
 	}
 
+	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		return policy.dialContext(ctx, net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}, network, address)
+	}
+
 	return &http.Client{
 		Timeout:   timeout,
 		Transport: transport,
@@ -52,6 +63,9 @@ func newRobustHTTPClient(timeout time.Duration) *http.Client {
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if len(via) >= 10 {
 				return fmt.Errorf("too many redirects")
+			}
+			if _, err := policy.validateURL(req.Context(), req.URL.String()); err != nil {
+				return fmt.Errorf("redirect to %s blocked: %w", req.URL, err)
 			}
 			return nil
 		},
@@ -75,6 +89,13 @@ type WebFetchTool struct {
 	Cfg *config.WebFetchConfig
 }
 
+func (t *WebFetchTool) networkPolicy() *networkPolicy {
+	if t == nil || t.Cfg == nil {
+		return defaultNetworkPolicy
+	}
+	return configuredNetworkPolicy(t.Cfg.AllowPrivate, t.Cfg.AllowedDomains)
+}
+
 func (t *WebFetchTool) Name() string { return "web_fetch" }
 
 func (t *WebFetchTool) Description() string {
@@ -94,7 +115,7 @@ func (t *WebFetchTool) Parameters() map[string]interface{} {
 	}
 }
 
-func (t *WebFetchTool) Execute(_ context.Context, args json.RawMessage) (string, error) {
+func (t *WebFetchTool) Execute(ctx context.Context, args json.RawMessage) (string, error) {
 	var params struct {
 		URL string `json:"url"`
 	}
@@ -106,21 +127,25 @@ func (t *WebFetchTool) Execute(_ context.Context, args json.RawMessage) (string,
 	if !strings.HasPrefix(rawURL, "http://") && !strings.HasPrefix(rawURL, "https://") {
 		rawURL = "https://" + rawURL
 	}
+	policy := t.networkPolicy()
+	if _, err := policy.validateURL(ctx, rawURL); err != nil {
+		return "", fmt.Errorf("blocked URL: %w", err)
+	}
 
 	switch t.Cfg.Backend {
 	case "jina":
-		return t.fetchViaJina(rawURL)
+		return t.fetchViaJina(ctx, rawURL)
 	case "crawl4ai":
-		return t.fetchViaCrawl4AI(rawURL)
+		return t.fetchViaCrawl4AI(ctx, rawURL)
 	default: // "native"
-		return t.fetchNative(rawURL)
+		return t.fetchNative(ctx, rawURL, policy)
 	}
 }
 
-func (t *WebFetchTool) fetchNative(rawURL string) (string, error) {
-	client := newRobustHTTPClient(30 * time.Second)
+func (t *WebFetchTool) fetchNative(ctx context.Context, rawURL string, policy *networkPolicy) (string, error) {
+	client := newRobustHTTPClientWithPolicy(30*time.Second, policy)
 
-	req, err := http.NewRequest("GET", rawURL, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", rawURL, nil)
 	if err != nil {
 		return "", fmt.Errorf("failed to create request: %w", err)
 	}
@@ -169,12 +194,12 @@ func (t *WebFetchTool) fetchNative(rawURL string) (string, error) {
 	return truncate(content, maxChars), nil
 }
 
-func (t *WebFetchTool) fetchViaJina(rawURL string) (string, error) {
+func (t *WebFetchTool) fetchViaJina(ctx context.Context, rawURL string) (string, error) {
 	jinaURL := "https://r.jina.ai/" + rawURL
 
 	client := newRobustHTTPClient(60 * time.Second)
 
-	req, err := http.NewRequest("GET", jinaURL, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", jinaURL, nil)
 	if err != nil {
 		return "", fmt.Errorf("failed to create Jina request: %w", err)
 	}
@@ -207,7 +232,7 @@ func (t *WebFetchTool) fetchViaJina(rawURL string) (string, error) {
 	return truncate(string(body), maxChars), nil
 }
 
-func (t *WebFetchTool) fetchViaCrawl4AI(rawURL string) (string, error) {
+func (t *WebFetchTool) fetchViaCrawl4AI(ctx context.Context, rawURL string) (string, error) {
 	pythonCmd := t.Cfg.Crawl4AICmd
 	if pythonCmd == "" {
 		pythonCmd = "python"
@@ -255,7 +280,7 @@ async def main():
 asyncio.run(main())
 `
 
-	cmd := exec.Command(pythonCmd, "-c", pyScript)
+	cmd := exec.CommandContext(ctx, pythonCmd, "-c", pyScript)
 	cmd.Env = append(os.Environ(), "CRAWL4AI_URL="+rawURL)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -278,6 +303,13 @@ type WebSearchTool struct {
 	Cfg *config.WebSearchConfig
 }
 
+func (t *WebSearchTool) networkPolicy() *networkPolicy {
+	if t == nil || t.Cfg == nil {
+		return defaultNetworkPolicy
+	}
+	return configuredNetworkPolicy(t.Cfg.AllowPrivate, t.Cfg.AllowedDomains)
+}
+
 func (t *WebSearchTool) Name() string { return "web_search" }
 
 func (t *WebSearchTool) Description() string {
@@ -297,7 +329,7 @@ func (t *WebSearchTool) Parameters() map[string]any {
 	}
 }
 
-func (t *WebSearchTool) Execute(_ context.Context, args json.RawMessage) (string, error) {
+func (t *WebSearchTool) Execute(ctx context.Context, args json.RawMessage) (string, error) {
 	var params struct {
 		Query string `json:"query"`
 	}
@@ -314,34 +346,34 @@ func (t *WebSearchTool) Execute(_ context.Context, args json.RawMessage) (string
 	case "tavily":
 		if t.Cfg.TavilyAPIKey == "" {
 			fmt.Println("  ⚠  web_search: tavily_api_key not set, falling back to DuckDuckGo")
-			return t.searchViaDuckDuckGo(query)
+			return t.searchViaDuckDuckGo(ctx, query)
 		}
-		result, err := t.searchViaTavily(query)
+		result, err := t.searchViaTavily(ctx, query)
 		if err != nil {
 			fmt.Printf("  ⚠  web_search: Tavily failed (%s), falling back to DuckDuckGo\n", err)
-			return t.searchViaDuckDuckGo(query)
+			return t.searchViaDuckDuckGo(ctx, query)
 		}
 		return result, nil
 	case "brave":
 		if t.Cfg.BraveAPIKey == "" {
 			fmt.Println("  ⚠  web_search: brave_api_key not set, falling back to DuckDuckGo")
-			return t.searchViaDuckDuckGo(query)
+			return t.searchViaDuckDuckGo(ctx, query)
 		}
-		result, err := t.searchViaBrave(query)
+		result, err := t.searchViaBrave(ctx, query)
 		if err != nil {
 			fmt.Printf("  ⚠  web_search: Brave Search failed (%s), falling back to DuckDuckGo\n", err)
-			return t.searchViaDuckDuckGo(query)
+			return t.searchViaDuckDuckGo(ctx, query)
 		}
 		return result, nil
 	case "searxng":
-		result, err := t.searchViaSearXNG(query)
+		result, err := t.searchViaSearXNG(ctx, query)
 		if err != nil {
 			// Fallback to DuckDuckGo when SearXNG is unavailable or misconfigured.
-			return t.searchViaDuckDuckGo(query)
+			return t.searchViaDuckDuckGo(ctx, query)
 		}
 		return result, nil
 	default: // "duckduckgo"
-		return t.searchViaDuckDuckGo(query)
+		return t.searchViaDuckDuckGo(ctx, query)
 	}
 }
 
@@ -368,12 +400,12 @@ func (t *WebSearchTool) isBlocked(rawURL string) bool {
 	return false
 }
 
-func (t *WebSearchTool) searchViaDuckDuckGo(query string) (string, error) {
+func (t *WebSearchTool) searchViaDuckDuckGo(ctx context.Context, query string) (string, error) {
 	searchURL := fmt.Sprintf("https://html.duckduckgo.com/html/?q=%s", url.QueryEscape(query))
 
-	client := newRobustHTTPClient(15 * time.Second)
+	client := newRobustHTTPClientWithPolicy(15*time.Second, t.networkPolicy())
 
-	req, err := http.NewRequest("GET", searchURL, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", searchURL, nil)
 	if err != nil {
 		return "", fmt.Errorf("failed to create search request: %w", err)
 	}
@@ -529,7 +561,7 @@ func cleanInlineHTML(s string) string {
 	return strings.TrimSpace(s)
 }
 
-func (t *WebSearchTool) searchViaTavily(query string) (string, error) {
+func (t *WebSearchTool) searchViaTavily(ctx context.Context, query string) (string, error) {
 	maxResults := t.Cfg.MaxSearchResults
 	if maxResults <= 0 {
 		maxResults = 10
@@ -545,8 +577,8 @@ func (t *WebSearchTool) searchViaTavily(query string) (string, error) {
 		return "", fmt.Errorf("failed to build Tavily request: %w", err)
 	}
 
-	client := newRobustHTTPClient(15 * time.Second)
-	req, err := http.NewRequest("POST", "https://api.tavily.com/search", bytes.NewReader(reqBody))
+	client := newRobustHTTPClientWithPolicy(15*time.Second, t.networkPolicy())
+	req, err := http.NewRequestWithContext(ctx, "POST", "https://api.tavily.com/search", bytes.NewReader(reqBody))
 	if err != nil {
 		return "", fmt.Errorf("failed to create Tavily request: %w", err)
 	}
@@ -619,7 +651,7 @@ func (t *WebSearchTool) searchViaTavily(query string) (string, error) {
 	return sb.String(), nil
 }
 
-func (t *WebSearchTool) searchViaBrave(query string) (string, error) {
+func (t *WebSearchTool) searchViaBrave(ctx context.Context, query string) (string, error) {
 	maxResults := t.Cfg.MaxSearchResults
 	if maxResults <= 0 {
 		maxResults = 10
@@ -631,8 +663,8 @@ func (t *WebSearchTool) searchViaBrave(query string) (string, error) {
 	searchURL := fmt.Sprintf("https://api.search.brave.com/res/v1/web/search?q=%s&count=%d",
 		url.QueryEscape(query), maxResults)
 
-	client := newRobustHTTPClient(15 * time.Second)
-	req, err := http.NewRequest("GET", searchURL, nil)
+	client := newRobustHTTPClientWithPolicy(15*time.Second, t.networkPolicy())
+	req, err := http.NewRequestWithContext(ctx, "GET", searchURL, nil)
 	if err != nil {
 		return "", fmt.Errorf("failed to create Brave request: %w", err)
 	}
@@ -700,7 +732,7 @@ func (t *WebSearchTool) searchViaBrave(query string) (string, error) {
 	return sb.String(), nil
 }
 
-func (t *WebSearchTool) searchViaSearXNG(query string) (string, error) {
+func (t *WebSearchTool) searchViaSearXNG(ctx context.Context, query string) (string, error) {
 	baseURL := strings.TrimRight(t.Cfg.SearXNGURL, "/")
 	if baseURL == "" {
 		return "", fmt.Errorf("SearXNG URL not configured. Set web.searxng_url in config.toml")
@@ -708,9 +740,9 @@ func (t *WebSearchTool) searchViaSearXNG(query string) (string, error) {
 
 	searchURL := fmt.Sprintf("%s/search?q=%s&format=json", baseURL, url.QueryEscape(query))
 
-	client := newRobustHTTPClient(15 * time.Second)
+	client := newRobustHTTPClientWithPolicy(15*time.Second, t.networkPolicy())
 
-	req, err := http.NewRequest("GET", searchURL, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", searchURL, nil)
 	if err != nil {
 		return "", fmt.Errorf("failed to create SearXNG request: %w", err)
 	}

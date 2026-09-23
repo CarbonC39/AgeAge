@@ -1,7 +1,10 @@
 package server
 
 import (
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -9,7 +12,13 @@ import (
 	"time"
 
 	"ageage/agent"
+	"ageage/config"
 	"ageage/llm"
+)
+
+const (
+	defaultMaxBodyBytes  int64 = 4 * 1024 * 1024
+	defaultMaxConcurrent       = 8
 )
 
 // writeJSONError writes a properly encoded JSON error response.
@@ -26,11 +35,57 @@ func writeJSONError(w http.ResponseWriter, msg string, code int) {
 	w.Write(body)
 }
 
-// corsMiddleware adds permissive CORS headers required by browser-based clients
-// (SillyTavern, OpenWebUI, etc.).
+// corsMiddleware preserves the historical permissive CORS behavior for callers
+// that use the handler directly. Servers created with NewServer use the
+// configured CORS policy instead.
 func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return corsMiddlewareWithConfig(next, nil, false)
+}
+
+func corsMiddlewareWithConfig(next http.HandlerFunc, origins []string, authenticated bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
+		origin := r.Header.Get("Origin")
+		allowed := false
+		// Do not combine a wildcard origin with a request that carries browser
+		// credentials. This also covers clients sending an Authorization header
+		// while the server is in its unauthenticated compatibility mode.
+		carriesCredentials := authenticated || r.Header.Get("Authorization") != "" || r.Header.Get("Cookie") != ""
+		wildcard := len(origins) == 0 && !carriesCredentials
+		if wildcard {
+			allowed = true
+		} else if origin != "" {
+			for _, candidate := range origins {
+				// A wildcard is intentionally ignored for authenticated APIs. A
+				// credentialed browser request must name an explicit origin.
+				if candidate != "*" && candidate == origin {
+					allowed = true
+					break
+				}
+			}
+		}
+		if origin != "" && !wildcard {
+			w.Header().Add("Vary", "Origin")
+			if !allowed {
+				if r.Method == http.MethodOptions {
+					writeJSONError(w, "origin is not allowed", http.StatusForbidden)
+					return
+				}
+				// A non-browser client may omit Origin. For a disallowed browser
+				// origin, omit CORS headers and let the browser enforce the policy.
+				if origin != "" {
+					next(w, r)
+					return
+				}
+			}
+		}
+		if wildcard {
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+		} else if allowed {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			if carriesCredentials {
+				w.Header().Set("Access-Control-Allow-Credentials", "true")
+			}
+		}
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 		if r.Method == http.MethodOptions {
@@ -45,14 +100,63 @@ func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
 type Server struct {
 	factory *agent.AgentFactory
 	addr    string
+	config  config.ServerConfig
+	sema    chan struct{}
 }
 
 // NewServer creates a new API server.
 func NewServer(factory *agent.AgentFactory, host string, port int) *Server {
+	cfg := config.ServerConfig{}
+	if factory != nil && factory.Config != nil {
+		// Reading the complete server section here keeps the existing constructor
+		// source-compatible while allowing configured auth and limits to take
+		// effect. The host and port arguments remain authoritative for callers
+		// that used the old constructor.
+		cfg = factory.Config.Server
+	}
+	cfg.Host = host
+	cfg.Port = port
+	return NewServerWithConfig(factory, cfg)
+}
+
+// NewServerWithConfig creates a server with an explicit HTTP security policy.
+// Values omitted from a hand-written config use safe finite defaults.
+func NewServerWithConfig(factory *agent.AgentFactory, cfg config.ServerConfig) *Server {
+	if cfg.MaxBodyBytes <= 0 {
+		cfg.MaxBodyBytes = defaultMaxBodyBytes
+	}
+	if cfg.MaxConcurrent <= 0 {
+		cfg.MaxConcurrent = defaultMaxConcurrent
+	}
 	return &Server{
 		factory: factory,
-		addr:    fmt.Sprintf("%s:%d", host, port),
+		addr:    fmt.Sprintf("%s:%d", cfg.Host, cfg.Port),
+		config:  cfg,
+		sema:    make(chan struct{}, cfg.MaxConcurrent),
 	}
+}
+
+// Handler returns the configured HTTP handler. It is useful for embedding the
+// API in another server and for testing without binding a TCP listener.
+func (s *Server) Handler() http.Handler {
+	mux := http.NewServeMux()
+	api := func(next http.HandlerFunc) http.HandlerFunc {
+		h := next
+		h = s.limitConcurrent(h)
+		h = s.authenticate(h)
+		return corsMiddlewareWithConfig(h, s.config.CORSOrigins, s.config.APIKey != "")
+	}
+	mux.HandleFunc("/v1/chat/completions", api(s.handleChatCompletions))
+	mux.HandleFunc("/v1/models", api(s.handleModels))
+	if s.config.HealthAuth {
+		// Keep CORS outermost so authentication failures carry the same
+		// configured CORS headers as successful health responses and /v1 errors.
+		health := s.authenticate(s.handleHealth)
+		mux.HandleFunc("/health", corsMiddlewareWithConfig(health, s.config.CORSOrigins, s.config.APIKey != ""))
+	} else {
+		mux.HandleFunc("/health", corsMiddlewareWithConfig(s.handleHealth, s.config.CORSOrigins, false))
+	}
+	return mux
 }
 
 // chatCompletionRequest mirrors the OpenAI request format.
@@ -87,14 +191,9 @@ type responseChoice struct {
 
 // Start starts the HTTP server.
 func (s *Server) Start() error {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/chat/completions", corsMiddleware(s.handleChatCompletions))
-	mux.HandleFunc("/v1/models", corsMiddleware(s.handleModels))
-	mux.HandleFunc("/health", corsMiddleware(s.handleHealth))
-
 	srv := &http.Server{
 		Addr:         s.addr,
-		Handler:      mux,
+		Handler:      s.Handler(),
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 10 * time.Minute, // Generous for long agent runs / streaming
 		IdleTimeout:  2 * time.Minute,
@@ -102,6 +201,62 @@ func (s *Server) Start() error {
 
 	fmt.Printf("AgeAge API server listening on %s\n", s.addr)
 	return srv.ListenAndServe()
+}
+
+func (s *Server) authenticate(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if s.config.APIKey == "" || authorizedBearer(r, s.config.APIKey) {
+			next(w, r)
+			return
+		}
+		w.Header().Set("WWW-Authenticate", `Bearer realm="ageage"`)
+		writeJSONError(w, "authentication required", http.StatusUnauthorized)
+	}
+}
+
+func authorizedBearer(r *http.Request, expected string) bool {
+	value := strings.TrimSpace(r.Header.Get("Authorization"))
+	const prefix = "Bearer "
+	if len(value) <= len(prefix) || !strings.EqualFold(value[:len(prefix)], prefix) {
+		return false
+	}
+	provided := strings.TrimSpace(value[len(prefix):])
+	// Hashing first keeps ConstantTimeCompare's input lengths equal, avoiding
+	// an early length-based return while comparing keys.
+	wantSum := sha256.Sum256([]byte(expected))
+	gotSum := sha256.Sum256([]byte(provided))
+	return subtleConstantTimeCompare(wantSum[:], gotSum[:])
+}
+
+// Kept as a tiny wrapper so the security-sensitive operation is obvious at
+// call sites and easy to audit.
+func subtleConstantTimeCompare(a, b []byte) bool {
+	return subtle.ConstantTimeCompare(a, b) == 1
+}
+
+func (s *Server) limitConcurrent(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if s.sema == nil {
+			// A zero-value Server is used by direct handler tests and has no
+			// configured process-wide limit.
+			next(w, r)
+			return
+		}
+		select {
+		case s.sema <- struct{}{}:
+			defer func() { <-s.sema }()
+			next(w, r)
+		default:
+			writeJSONError(w, "too many concurrent requests", http.StatusTooManyRequests)
+		}
+	}
+}
+
+func (s *Server) maxBodyBytes() int64 {
+	if s.config.MaxBodyBytes > 0 {
+		return s.config.MaxBodyBytes
+	}
+	return defaultMaxBodyBytes
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -132,8 +287,16 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// MaxBytesReader returns a typed error once the limit is exceeded, allowing
+	// callers to distinguish an oversized request from malformed JSON.
+	r.Body = http.MaxBytesReader(w, r.Body, s.maxBodyBytes())
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeJSONError(w, "request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
 		writeJSONError(w, "failed to read body", http.StatusBadRequest)
 		return
 	}

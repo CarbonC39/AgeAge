@@ -14,18 +14,25 @@ import (
 
 // TelegramChannel connects to Telegram via Bot API (long polling).
 type TelegramChannel struct {
-	Token          string
-	AllowedUsers   []string // Telegram user IDs allowed to interact; empty = allow all
-	Options        ChannelOptions
-	AnswerCallback func(channelID, answer string) // Optional: called when an inline-keyboard button is pressed
+	Token        string
+	AllowedUsers []string // Telegram user IDs allowed to interact; empty = allow all
+	Options      ChannelOptions
+	// AnswerCallback receives the full interaction identity for an inline
+	// keyboard answer so callers can scope it to the pending request.
+	AnswerCallback func(channelID, threadID, senderID, answer string)
 	baseURL        string
 	client         *http.Client
 	stopCh         chan struct{}
 	botID          int64
 	botUsername    string // "@botname" (without @), used for mention detection
 	mu             sync.Mutex
-	typingStop     map[string]context.CancelFunc // channelID → cancel func for keep-alive typing
+	typingStop     map[string]telegramTypingState // channelID → active keep-alive state
 	typingMu       sync.Mutex
+}
+
+type telegramTypingState struct {
+	cancel context.CancelFunc
+	refs   int
 }
 
 // NewTelegram creates a new Telegram channel.
@@ -37,7 +44,7 @@ func NewTelegram(botToken string, allowedUsers []string, opts ChannelOptions) *T
 		baseURL:      fmt.Sprintf("https://api.telegram.org/bot%s", botToken),
 		client:       &http.Client{Timeout: 60 * time.Second},
 		stopCh:       make(chan struct{}),
-		typingStop:   make(map[string]context.CancelFunc),
+		typingStop:   make(map[string]telegramTypingState),
 	}
 }
 
@@ -112,7 +119,11 @@ func (t *TelegramChannel) Start(handler MessageHandler) error {
 					senderID := fmt.Sprintf("%d", cq.From.ID)
 					if t.isAllowedUser(senderID, cq.From.Username) {
 						chatID := fmt.Sprintf("%d", cq.Message.Chat.ID)
-						t.AnswerCallback(chatID, cq.Data)
+						threadID := ""
+						if cq.Message.MessageThreadID != 0 {
+							threadID = fmt.Sprintf("%d", cq.Message.MessageThreadID)
+						}
+						t.AnswerCallback(chatID, threadID, senderID, cq.Data)
 					}
 				}
 				continue
@@ -207,6 +218,12 @@ func (t *TelegramChannel) Start(handler MessageHandler) error {
 }
 
 func (t *TelegramChannel) Stop() error {
+	t.typingMu.Lock()
+	for channelID, state := range t.typingStop {
+		state.cancel()
+		delete(t.typingStop, channelID)
+	}
+	t.typingMu.Unlock()
 	close(t.stopCh)
 	return nil
 }
@@ -221,6 +238,18 @@ func (t *TelegramChannel) Send(chatID, text string) error {
 // Implements the Editable interface.
 func (t *TelegramChannel) SendMessage(chatID, text string) (string, error) {
 	return t.doSendMessageWithID(chatID, text, 0, 0)
+}
+
+// SendMessageInThread sends an editable progress/todo message inside a
+// Telegram forum topic. Implements ThreadEditable.
+func (t *TelegramChannel) SendMessageInThread(chatID, threadRootID, latestEventID, text string) (string, error) {
+	var topicID, replyTo int
+	fmt.Sscanf(threadRootID, "%d", &topicID)
+	fmt.Sscanf(latestEventID, "%d", &replyTo)
+	if topicID == 0 {
+		return "", fmt.Errorf("invalid Telegram topic ID: %q", threadRootID)
+	}
+	return t.doSendMessageWithID(chatID, text, replyTo, topicID)
 }
 
 // EditMessage edits a previously sent Telegram message using editMessageText.
@@ -248,12 +277,15 @@ func (t *TelegramChannel) Reply(chatID, replyToID, text string) error {
 // called again with typing=false. Implements TypingIndicator.
 func (t *TelegramChannel) SendTyping(channelID string, typing bool) error {
 	if typing {
-		ctx, cancel := context.WithCancel(context.Background())
 		t.typingMu.Lock()
-		if old, ok := t.typingStop[channelID]; ok {
-			old()
+		if state, ok := t.typingStop[channelID]; ok {
+			state.refs++
+			t.typingStop[channelID] = state
+			t.typingMu.Unlock()
+			return nil
 		}
-		t.typingStop[channelID] = cancel
+		ctx, cancel := context.WithCancel(context.Background())
+		t.typingStop[channelID] = telegramTypingState{cancel: cancel, refs: 1}
 		t.typingMu.Unlock()
 		go func() {
 			for {
@@ -267,8 +299,14 @@ func (t *TelegramChannel) SendTyping(channelID string, typing bool) error {
 		}()
 	} else {
 		t.typingMu.Lock()
-		if cancel, ok := t.typingStop[channelID]; ok {
-			cancel()
+		if state, ok := t.typingStop[channelID]; ok {
+			if state.refs > 1 {
+				state.refs--
+				t.typingStop[channelID] = state
+				t.typingMu.Unlock()
+				return nil
+			}
+			state.cancel()
 			delete(t.typingStop, channelID)
 		}
 		t.typingMu.Unlock()

@@ -2,6 +2,7 @@ package channel
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -13,33 +14,47 @@ import (
 
 // MatrixChannel connects to a Matrix homeserver via Client-Server API.
 type MatrixChannel struct {
-	Homeserver    string   // e.g., "https://matrix.org"
-	UserID        string   // e.g., "@bot:matrix.org"
-	Token         string   // Access token
-	RoomIDs       []string // Rooms to monitor; empty = all joined rooms
-	AllowedUsers  []string // Matrix user IDs allowed to interact; empty = allow all
-	Options       ChannelOptions
-	client        *http.Client
-	stopCh        chan struct{}
-	since         string              // Sync token for /sync
-	groupRooms    map[string]bool     // roomID → true if multi-user (group), false if DM
-	directMap     map[string][]string // peerID → []roomID
-	directFetched time.Time
-	mu            sync.RWMutex
+	Homeserver            string   // e.g., "https://matrix.org"
+	UserID                string   // e.g., "@bot:matrix.org"
+	Token                 string   // Access token
+	RoomIDs               []string // Rooms to monitor; empty = all joined rooms
+	AllowedUsers          []string // Matrix user IDs allowed to interact; empty = allow all
+	Options               ChannelOptions
+	client                *http.Client
+	stopCh                chan struct{}
+	stopOnce              sync.Once
+	stopErr               error
+	since                 string              // Sync token for /sync
+	groupRooms            map[string]bool     // roomID → true if multi-user (group), false if DM
+	directMap             map[string][]string // peerID → []roomID
+	directFetched         time.Time
+	mu                    sync.RWMutex
+	typingMu              sync.Mutex
+	typing                map[string]matrixTypingState
+	typingSeq             uint64
+	typingRefreshInterval time.Duration
+}
+
+type matrixTypingState struct {
+	cancel     context.CancelFunc
+	generation uint64
+	refs       int
 }
 
 // NewMatrix creates a new Matrix channel.
 func NewMatrix(homeserver, userID, accessToken string, roomIDs []string, allowedUsers []string, opts ChannelOptions) *MatrixChannel {
 	return &MatrixChannel{
-		Homeserver:   strings.TrimRight(homeserver, "/"),
-		UserID:       userID,
-		Token:        accessToken,
-		RoomIDs:      roomIDs,
-		AllowedUsers: allowedUsers,
-		Options:      opts,
-		client:       &http.Client{Timeout: 60 * time.Second},
-		stopCh:       make(chan struct{}),
-		groupRooms:   make(map[string]bool),
+		Homeserver:            strings.TrimRight(homeserver, "/"),
+		UserID:                userID,
+		Token:                 accessToken,
+		RoomIDs:               roomIDs,
+		AllowedUsers:          allowedUsers,
+		Options:               opts,
+		client:                &http.Client{Timeout: 60 * time.Second},
+		stopCh:                make(chan struct{}),
+		groupRooms:            make(map[string]bool),
+		typing:                make(map[string]matrixTypingState),
+		typingRefreshInterval: 20 * time.Second,
 	}
 }
 
@@ -373,8 +388,23 @@ func (m *MatrixChannel) Start(handler MessageHandler) error {
 }
 
 func (m *MatrixChannel) Stop() error {
-	close(m.stopCh)
-	return nil
+	m.stopOnce.Do(func() {
+		close(m.stopCh)
+		m.typingMu.Lock()
+		roomIDs := make([]string, 0, len(m.typing))
+		for roomID, state := range m.typing {
+			state.cancel()
+			roomIDs = append(roomIDs, roomID)
+			delete(m.typing, roomID)
+		}
+		m.typingMu.Unlock()
+		for _, roomID := range roomIDs {
+			if err := m.putTyping(context.Background(), roomID, false); err != nil && m.stopErr == nil {
+				m.stopErr = err
+			}
+		}
+	})
+	return m.stopErr
 }
 
 // Send sends a Markdown-formatted message to a Matrix room, splitting long
@@ -494,13 +524,80 @@ func (m *MatrixChannel) Reply(roomID, replyToID, text string) error {
 // SendTyping sends or clears a typing indicator in a room.
 // Implements the TypingIndicator interface.
 func (m *MatrixChannel) SendTyping(channelID string, typing bool) error {
+	if !typing {
+		m.typingMu.Lock()
+		if state, ok := m.typing[channelID]; ok {
+			if state.refs > 1 {
+				state.refs--
+				m.typing[channelID] = state
+				m.typingMu.Unlock()
+				return nil
+			}
+			state.cancel()
+			delete(m.typing, channelID)
+		}
+		m.typingMu.Unlock()
+		return m.putTyping(context.Background(), channelID, false)
+	}
+
+	m.typingMu.Lock()
+	if state, ok := m.typing[channelID]; ok {
+		state.refs++
+		m.typing[channelID] = state
+		m.typingMu.Unlock()
+		return nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	m.typingSeq++
+	generation := m.typingSeq
+	m.typing[channelID] = matrixTypingState{cancel: cancel, generation: generation, refs: 1}
+	interval := m.typingRefreshInterval
+	if interval <= 0 {
+		interval = 20 * time.Second
+	}
+	m.typingMu.Unlock()
+
+	if err := m.putTyping(ctx, channelID, true); err != nil {
+		m.clearTyping(channelID, generation)
+		return err
+	}
+	go m.refreshTyping(ctx, channelID, generation, interval)
+	return nil
+}
+
+func (m *MatrixChannel) putTyping(ctx context.Context, channelID string, typing bool) error {
 	path := fmt.Sprintf("/_matrix/client/v3/rooms/%s/typing/%s", channelID, m.UserID)
 	payload := map[string]any{"typing": typing}
 	if typing {
 		payload["timeout"] = 30000
 	}
-	_, err := m.doRequest("PUT", path, payload)
+	_, err := m.doRequestContext(ctx, "PUT", path, payload)
 	return err
+}
+
+func (m *MatrixChannel) refreshTyping(ctx context.Context, channelID string, generation uint64, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := m.putTyping(ctx, channelID, true); err != nil {
+				m.clearTyping(channelID, generation)
+				return
+			}
+		}
+	}
+}
+
+func (m *MatrixChannel) clearTyping(channelID string, generation uint64) {
+	m.typingMu.Lock()
+	defer m.typingMu.Unlock()
+	if state, ok := m.typing[channelID]; ok && state.generation == generation {
+		state.cancel()
+		delete(m.typing, channelID)
+	}
 }
 
 // SendReadReceipt marks an event as read.
@@ -600,6 +697,10 @@ func (m *MatrixChannel) sendEvent(roomID, eventType string, content map[string]a
 }
 
 func (m *MatrixChannel) doRequest(method, path string, body interface{}) ([]byte, error) {
+	return m.doRequestContext(context.Background(), method, path, body)
+}
+
+func (m *MatrixChannel) doRequestContext(ctx context.Context, method, path string, body interface{}) ([]byte, error) {
 	var reqBody io.Reader
 	if body != nil {
 		data, _ := json.Marshal(body)
@@ -608,7 +709,7 @@ func (m *MatrixChannel) doRequest(method, path string, body interface{}) ([]byte
 
 	url := m.Homeserver + path
 
-	req, err := http.NewRequest(method, url, reqBody)
+	req, err := http.NewRequestWithContext(ctx, method, url, reqBody)
 	if err != nil {
 		return nil, err
 	}

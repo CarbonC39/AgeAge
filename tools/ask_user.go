@@ -17,6 +17,9 @@ import (
 type AskUserTool struct {
 	// ChannelID is the IM channel (or "" for CLI) used as the request key.
 	ChannelID string
+	// Scope binds the request to the originating channel/thread/session/user.
+	// ChannelID is retained for CLI and older factory callers.
+	Scope InteractionScope
 	// Manager handles the request/response lifecycle.
 	Manager *UserInputManager
 	// NotifyFuncPtr points to the agent's AskUserNotify field. Dereferenced at
@@ -71,7 +74,11 @@ func (t *AskUserTool) Execute(ctx context.Context, args json.RawMessage) (string
 
 	// Register the pending request BEFORE notifying the user to avoid the
 	// race where the user replies before RequestInput is called.
-	respCh := t.Manager.RequestInput(t.ChannelID)
+	scope := t.Scope
+	if scope.ChannelID == "" {
+		scope = LegacyInteractionScope(t.ChannelID)
+	}
+	requestID, respCh := t.Manager.RequestInputScoped(scope)
 
 	// Send the question to the user.
 	notifyFn := t.resolveNotifyFunc()
@@ -98,7 +105,7 @@ func (t *AskUserTool) Execute(ctx context.Context, args json.RawMessage) (string
 		}
 		return answer, nil
 	case <-ctx.Done():
-		t.Manager.Cancel(t.ChannelID) // clean up pending entry
+		t.Manager.CancelByID(requestID, scope) // clean up this request only
 		return "", fmt.Errorf("user input cancelled: %w", ctx.Err())
 	}
 }

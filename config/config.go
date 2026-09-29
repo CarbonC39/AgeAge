@@ -11,28 +11,29 @@ import (
 
 // Config is the top-level configuration for AgeAge.
 type Config struct {
-	Workspace  string           `toml:"workspace"` // Working content directory (where the agent reads/writes files)
-	WorkDir    string           `toml:"-"`         // Effective working dir for file ops; defaults to Workspace, overridden in CLI mode
-	configDir  string           // Dir containing config.toml; AgeAge data (AGENT.md, memories, skills) lives here
-	LLM        LLMConfig        `toml:"llm"`
-	Agent      AgentConfig      `toml:"agent"`
-	SubAgent   SubAgentConfig   `toml:"subagent"`
-	Pipeline   PipelineConfig   `toml:"pipeline"`
-	Planner    PlannerConfig    `toml:"planner"`
-	Router     RouterConfig     `toml:"router"`
-	Cron       CronConfig       `toml:"cron"`
-	Summarize  SummarizeConfig  `toml:"summarize"`
-	History    HistoryConfig    `toml:"history"`
-	Security   SecurityConfig   `toml:"security"`
-	Bash       BashConfig       `toml:"bash"`
-	WebSearch  WebSearchConfig  `toml:"web_search"`
-	WebFetch   WebFetchConfig   `toml:"web_fetch"`
-	Browser    BrowserConfig    `toml:"browser"`
-	Multimodal MultimodalConfig `toml:"multimodal"`
-	MCP        MCPConfig        `toml:"mcp"`
-	Channels   ChannelConfig    `toml:"channels"`
-	Server     ServerConfig     `toml:"server"`
-	Eval       EvalConfig       `toml:"eval"`
+	Workspace     string             `toml:"workspace"` // Working content directory (where the agent reads/writes files)
+	WorkDir       string             `toml:"-"`         // Effective working dir for file ops; defaults to Workspace, overridden in CLI mode
+	configDir     string             // Dir containing config.toml; AgeAge data (AGENT.md, memories, skills) lives here
+	LLM           LLMConfig          `toml:"llm"`
+	Agent         AgentConfig        `toml:"agent"`
+	SubAgent      SubAgentConfig     `toml:"subagent"`
+	Pipeline      PipelineConfig     `toml:"pipeline"`
+	Planner       PlannerConfig      `toml:"planner"`
+	Router        RouterConfig       `toml:"router"`
+	Cron          CronConfig         `toml:"cron"`
+	Summarize     SummarizeConfig    `toml:"summarize"`
+	History       HistoryConfig      `toml:"history"`
+	Notifications NotificationConfig `toml:"notifications"`
+	Security      SecurityConfig     `toml:"security"`
+	Bash          BashConfig         `toml:"bash"`
+	WebSearch     WebSearchConfig    `toml:"web_search"`
+	WebFetch      WebFetchConfig     `toml:"web_fetch"`
+	Browser       BrowserConfig      `toml:"browser"`
+	Multimodal    MultimodalConfig   `toml:"multimodal"`
+	MCP           MCPConfig          `toml:"mcp"`
+	Channels      ChannelConfig      `toml:"channels"`
+	Server        ServerConfig       `toml:"server"`
+	Eval          EvalConfig         `toml:"eval"`
 }
 
 // PlannerConfig holds settings for the automatic skill/pipeline creator.
@@ -51,6 +52,13 @@ type CronConfig struct {
 	// MaxOutput caps how many characters of the last run's output are persisted
 	// on the entry for auditing. Defaults to 2000.
 	MaxOutput int `toml:"max_output"`
+	// SessionIntegration enables the optional continue_current_session field
+	// for Agent-created tasks. It is disabled by default for compatibility and
+	// safety; runtime session-registry wiring is supplied by the scheduler.
+	SessionIntegration bool `toml:"session_integration"`
+	// Timeout is the maximum duration of one scheduled or manual Agent run.
+	// Values <= 0 use the safe default of five minutes.
+	Timeout int `toml:"timeout"`
 }
 
 // PipelineModels maps pipeline node model tiers to specific model configs.
@@ -193,6 +201,8 @@ type WebSearchConfig struct {
 	BraveAPIKey      string   `toml:"brave_api_key"`   // Brave Search API key; falls back to BRAVE_API_KEY env var
 	MaxSearchResults int      `toml:"max_results"`     // Maximum number of search results to return
 	BlockedDomains   []string `toml:"blocked_domains"` // List of domains to exclude from search results
+	AllowPrivate     bool     `toml:"allow_private"`   // Allow private/loopback/link-local search endpoints (trusted environments only)
+	AllowedDomains   []string `toml:"allowed_domains"` // Optional host/domain allowlist for search requests
 }
 
 // ResolveSearchAPIKeys fills empty API key fields from environment variables.
@@ -208,10 +218,12 @@ func (c *WebSearchConfig) ResolveSearchAPIKeys() {
 
 // WebFetchConfig holds web fetch tool settings.
 type WebFetchConfig struct {
-	Backend       string `toml:"backend"`        // "native", "jina", or "crawl4ai"
-	JinaAPIKey    string `toml:"jina_api_key"`   // Jina Reader API key (optional)
-	Crawl4AICmd   string `toml:"crawl4ai_cmd"`   // Python command for Crawl4AI (e.g., "python" or "python3")
-	MaxCharacters int    `toml:"max_characters"` // Maximum characters to return for native backend
+	Backend        string   `toml:"backend"`         // "native", "jina", or "crawl4ai"
+	JinaAPIKey     string   `toml:"jina_api_key"`    // Jina Reader API key (optional)
+	Crawl4AICmd    string   `toml:"crawl4ai_cmd"`    // Python command for Crawl4AI (e.g., "python" or "python3")
+	MaxCharacters  int      `toml:"max_characters"`  // Maximum characters to return for native backend
+	AllowPrivate   bool     `toml:"allow_private"`   // Allow private/loopback/link-local targets (trusted environments only)
+	AllowedDomains []string `toml:"allowed_domains"` // Optional host/domain allowlist; empty allows public hosts
 }
 
 // ConverterConfig defines a command-line tool that converts a file format to plain text.
@@ -243,11 +255,13 @@ func (c *Config) FindConverter(ext string) *ConverterConfig {
 
 // BrowserConfig holds browser automation tool settings.
 type BrowserConfig struct {
-	Backend     string `toml:"backend"`      // "playwright" or "agent-browser"
-	Headless    bool   `toml:"headless"`     // Run browser in headless mode (default true)
-	BrowserType string `toml:"browser_type"` // "chromium", "firefox", or "webkit" (playwright only)
-	AgentBin    string `toml:"agent_bin"`    // Path to agent-browser binary (default "agent-browser")
-	Timeout     int    `toml:"timeout"`      // Seconds per browser action (default 30)
+	Backend        string   `toml:"backend"`         // "playwright" or "agent-browser"
+	Headless       bool     `toml:"headless"`        // Run browser in headless mode (default true)
+	BrowserType    string   `toml:"browser_type"`    // "chromium", "firefox", or "webkit" (playwright only)
+	AgentBin       string   `toml:"agent_bin"`       // Path to agent-browser binary (default "agent-browser")
+	Timeout        int      `toml:"timeout"`         // Seconds per browser action (default 30)
+	AllowPrivate   bool     `toml:"allow_private"`   // Allow private/loopback/link-local targets (trusted environments only)
+	AllowedDomains []string `toml:"allowed_domains"` // Optional host/domain allowlist; empty allows public hosts
 }
 
 // ChannelConfig holds settings for IM channel connectors.
@@ -287,6 +301,22 @@ type MatrixConfig struct {
 type ServerConfig struct {
 	Host string `toml:"host"`
 	Port int    `toml:"port"`
+	// APIKey enables Bearer authentication for /v1/* when non-empty. Keep this
+	// separate from the LLM key: it authenticates callers of the local API.
+	APIKey string `toml:"api_key"`
+	// HealthAuth controls whether /health requires the API key. Health is
+	// public by default so local process probes keep working unchanged.
+	HealthAuth bool `toml:"health_auth"`
+	// CORSOrigins is the list of browser origins allowed to call the API. An
+	// empty list preserves the historical permissive CORS behavior when the API
+	// is unauthenticated; with APIKey set, no wildcard is emitted.
+	CORSOrigins []string `toml:"cors_origins"`
+	// MaxBodyBytes limits a chat completion request body. Values <= 0 are
+	// normalized to the default by the HTTP server.
+	MaxBodyBytes int64 `toml:"max_body_bytes"`
+	// MaxConcurrent limits in-flight /v1 requests. Values <= 0 are normalized
+	// to the default by the HTTP server.
+	MaxConcurrent int `toml:"max_concurrent"`
 }
 
 // DefaultConfig returns a Config with sensible defaults.
@@ -333,6 +363,7 @@ func DefaultConfig() *Config {
 		Cron: CronConfig{
 			CatchUp:   false,
 			MaxOutput: 2000,
+			Timeout:   300,
 		},
 		Summarize: SummarizeConfig{
 			Enabled:    false,
@@ -344,6 +375,7 @@ func DefaultConfig() *Config {
 			CompressToolTurns: true,
 			KeepRecentTurns:   2,
 		},
+		Notifications: DefaultNotificationConfig(),
 		Bash: BashConfig{
 			AutoAllowCommands: []string{},
 			MaxOutputBytes:    4 * 1024 * 1024, // 4 MB
@@ -371,8 +403,10 @@ func DefaultConfig() *Config {
 			Converters:    []ConverterConfig{},
 		},
 		Server: ServerConfig{
-			Host: "127.0.0.1",
-			Port: 8080,
+			Host:          "127.0.0.1",
+			Port:          8080,
+			MaxBodyBytes:  4 * 1024 * 1024,
+			MaxConcurrent: 8,
 		},
 		Eval: EvalConfig{
 			SuccessThreshold: 3,

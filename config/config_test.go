@@ -17,6 +17,9 @@ func TestDefaultConfigSafetyAndHistoryDefaults(t *testing.T) {
 	if cfg.Server.Host != "127.0.0.1" {
 		t.Fatalf("server should bind localhost by default: %#v", cfg.Server)
 	}
+	if cfg.Server.MaxBodyBytes <= 0 || cfg.Server.MaxConcurrent <= 0 {
+		t.Fatalf("server safety limits should be enabled by default: %#v", cfg.Server)
+	}
 	if cfg.Bash.MaxOutputBytes <= 0 {
 		t.Fatalf("bash output cap disabled: %#v", cfg.Bash)
 	}

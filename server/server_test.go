@@ -1,11 +1,13 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	"ageage/agent"
@@ -86,6 +88,204 @@ func TestWriteJSONErrorShape(t *testing.T) {
 	}
 	if body.Error.Message != "bad input" || body.Error.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("error body = %#v", body)
+	}
+}
+
+func TestConfiguredAuthenticationAndHealthPolicy(t *testing.T) {
+	cfg := config.DefaultConfig().Server
+	cfg.APIKey = "test-api-key"
+	cfg.HealthAuth = true
+	cfg.CORSOrigins = []string{"https://client.example"}
+	s := NewServerWithConfig(nil, cfg)
+
+	for _, tc := range []struct {
+		name   string
+		path   string
+		auth   string
+		status int
+	}{
+		{name: "missing api key", path: "/v1/models", status: http.StatusUnauthorized},
+		{name: "wrong api key", path: "/v1/models", auth: "Bearer wrong", status: http.StatusUnauthorized},
+		{name: "valid api key", path: "/v1/models", auth: "Bearer test-api-key", status: http.StatusOK},
+		{name: "health also protected", path: "/health", status: http.StatusUnauthorized},
+		{name: "health valid api key", path: "/health", auth: "Bearer test-api-key", status: http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, tc.path, nil)
+			if tc.auth != "" {
+				req.Header.Set("Authorization", tc.auth)
+			}
+			rec := httptest.NewRecorder()
+			s.Handler().ServeHTTP(rec, req)
+			if rec.Code != tc.status {
+				t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+			}
+			if tc.status == http.StatusUnauthorized && !strings.Contains(rec.Body.String(), `"error"`) {
+				t.Fatalf("unauthorized response is not OpenAI JSON: %s", rec.Body.String())
+			}
+		})
+	}
+	unauthorizedHealth := httptest.NewRecorder()
+	healthReq := httptest.NewRequest(http.MethodGet, "/health", nil)
+	healthReq.Header.Set("Origin", "https://client.example")
+	s.Handler().ServeHTTP(unauthorizedHealth, healthReq)
+	if got := unauthorizedHealth.Header().Get("Access-Control-Allow-Origin"); got != "https://client.example" {
+		t.Fatalf("authenticated health error origin = %q", got)
+	}
+}
+
+func TestCORSConfigurationDoesNotEmitWildcardForAuthenticatedAPI(t *testing.T) {
+	cfg := config.DefaultConfig().Server
+	cfg.APIKey = "secret"
+	cfg.CORSOrigins = []string{"https://allowed.example"}
+	s := NewServerWithConfig(nil, cfg)
+
+	allowed := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	req.Header.Set("Origin", "https://allowed.example")
+	s.Handler().ServeHTTP(allowed, req)
+	if got := allowed.Header().Get("Access-Control-Allow-Origin"); got != "https://allowed.example" {
+		t.Fatalf("allowed origin = %q", got)
+	}
+	if got := allowed.Header().Get("Access-Control-Allow-Origin"); got == "*" {
+		t.Fatal("authenticated CORS response must not use wildcard")
+	}
+	if got := allowed.Header().Get("Access-Control-Allow-Credentials"); got != "true" {
+		t.Fatalf("authenticated CORS credentials header = %q", got)
+	}
+
+	disallowed := httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodOptions, "/v1/models", nil)
+	req.Header.Set("Origin", "https://evil.example")
+	s.Handler().ServeHTTP(disallowed, req)
+	if disallowed.Code != http.StatusForbidden {
+		t.Fatalf("disallowed preflight status = %d", disallowed.Code)
+	}
+
+	// Even in compatibility mode, a caller-supplied credential must not be
+	// paired with the wildcard response.
+	compat := NewServerWithConfig(nil, config.DefaultConfig().Server)
+	withCredential := httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req.Header.Set("Origin", "https://client.example")
+	req.Header.Set("Authorization", "Bearer caller-supplied")
+	compat.Handler().ServeHTTP(withCredential, req)
+	if got := withCredential.Header().Get("Access-Control-Allow-Origin"); got == "*" {
+		t.Fatal("wildcard CORS must not be emitted with credentials")
+	}
+	if got := withCredential.Header().Get("Access-Control-Allow-Credentials"); got != "" {
+		t.Fatalf("disallowed origin received credentials header %q", got)
+	}
+}
+
+func TestChatCompletionRequestBodyLimit(t *testing.T) {
+	cfg := config.DefaultConfig().Server
+	cfg.MaxBodyBytes = 16
+	s := NewServerWithConfig(nil, cfg)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(strings.Repeat("x", 32)))
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized body status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "request body too large") {
+		t.Fatalf("oversized body error = %s", rec.Body.String())
+	}
+}
+
+func TestConcurrentRequestLimitReleasesAfterCompletion(t *testing.T) {
+	cfg := config.DefaultConfig().Server
+	cfg.MaxConcurrent = 1
+	s := NewServerWithConfig(nil, cfg)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	handler := s.limitConcurrent(func(w http.ResponseWriter, _ *http.Request) {
+		once.Do(func() { close(entered) })
+		<-release
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	firstDone := make(chan struct{})
+	go func() {
+		handler(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+		close(firstDone)
+	}()
+	<-entered
+
+	second := httptest.NewRecorder()
+	handler(second, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+	if second.Code != http.StatusTooManyRequests {
+		t.Fatalf("second request status = %d", second.Code)
+	}
+
+	close(release)
+	<-firstDone
+	third := httptest.NewRecorder()
+	handler(third, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+	// The test handler blocks every accepted request; release it so the test
+	// can verify the token was acquired again and then complete.
+	select {
+	case <-firstDone:
+	default:
+	}
+	if third.Code != http.StatusNoContent {
+		t.Fatalf("third request status = %d", third.Code)
+	}
+}
+
+func TestConcurrentRequestLimitReleasesAfterPanic(t *testing.T) {
+	cfg := config.DefaultConfig().Server
+	cfg.MaxConcurrent = 1
+	s := NewServerWithConfig(nil, cfg)
+	panicking := s.limitConcurrent(func(http.ResponseWriter, *http.Request) {
+		panic("test handler failure")
+	})
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("expected handler panic")
+			}
+		}()
+		panicking(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+	}()
+
+	released := httptest.NewRecorder()
+	s.limitConcurrent(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})(released, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+	if released.Code != http.StatusNoContent {
+		t.Fatalf("request after panic status = %d", released.Code)
+	}
+}
+
+func TestConcurrentRequestLimitReleasesWhenContextCancels(t *testing.T) {
+	cfg := config.DefaultConfig().Server
+	cfg.MaxConcurrent = 1
+	s := NewServerWithConfig(nil, cfg)
+	started := make(chan struct{})
+	done := make(chan struct{})
+	handler := s.limitConcurrent(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-r.Context().Done()
+		w.WriteHeader(http.StatusRequestTimeout)
+		close(done)
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil).WithContext(ctx)
+	go handler(httptest.NewRecorder(), req)
+	<-started
+	cancel()
+	<-done
+
+	released := httptest.NewRecorder()
+	s.limitConcurrent(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})(released, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+	if released.Code != http.StatusNoContent {
+		t.Fatalf("request after context cancellation status = %d", released.Code)
 	}
 }
 

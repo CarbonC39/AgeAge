@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"ageage/llm"
 )
@@ -18,6 +19,44 @@ type Tool interface {
 	Execute(ctx context.Context, args json.RawMessage) (string, error)
 }
 
+// RiskLevel describes the potential impact of invoking a tool.  Metadata is a
+// policy hint, not a security boundary: tools supplied by an untrusted
+// extension should still be treated as capable of doing what their
+// implementation permits.
+type RiskLevel string
+
+const (
+	RiskLow      RiskLevel = "low"
+	RiskMedium   RiskLevel = "medium"
+	RiskHigh     RiskLevel = "high"
+	RiskCritical RiskLevel = "critical"
+)
+
+// ToolMetadata describes execution characteristics used by the agent's
+// scheduler and policy/audit layers.  It is deliberately separate from Tool
+// so existing third-party tools continue to satisfy the small Tool interface.
+type ToolMetadata struct {
+	ReadOnly       bool          `json:"read_only"`
+	Idempotent     bool          `json:"idempotent"`
+	Risk           RiskLevel     `json:"risk"`
+	DefaultTimeout time.Duration `json:"default_timeout"`
+	NetworkAccess  bool          `json:"network_access"`
+	ConcurrencyKey string        `json:"concurrency_key"`
+}
+
+// MetadataProvider is an optional interface implemented by tools that can
+// describe their own execution characteristics.
+type MetadataProvider interface {
+	Metadata() ToolMetadata
+}
+
+// DefaultToolMetadata is intentionally conservative.  A tool that does not
+// implement MetadataProvider is assumed to have side effects, to be
+// non-idempotent, and to carry medium risk.
+func DefaultToolMetadata() ToolMetadata {
+	return ToolMetadata{Risk: RiskMedium}
+}
+
 // Registry manages all registered tools.
 // Tools are stored in a map for O(1) lookup, with a parallel insertion-ordered
 // name slice. All listing functions iterate the slice so that tool order is
@@ -25,14 +64,16 @@ type Tool interface {
 // tool list keeps prompts byte-identical across requests, which matters for
 // KV-cache reuse and reproducible model behavior.
 type Registry struct {
-	tools map[string]Tool
-	order []string // tool names in registration order
+	tools    map[string]Tool
+	order    []string                // tool names in registration order
+	metadata map[string]ToolMetadata // explicit descriptors, when provided
 }
 
 // NewRegistry creates an empty tool registry.
 func NewRegistry() *Registry {
 	return &Registry{
-		tools: make(map[string]Tool),
+		tools:    make(map[string]Tool),
+		metadata: make(map[string]ToolMetadata),
 	}
 }
 
@@ -42,10 +83,55 @@ func (r *Registry) Register(t Tool) {
 	name := t.Name()
 	if _, ok := r.tools[name]; ok {
 		r.tools[name] = t
+		// A plain replacement must not inherit an explicit descriptor from the
+		// previous implementation. Falling back to the replacement's provider
+		// (or conservative defaults) is safer than retaining stale policy data.
+		delete(r.metadata, name)
 		return
 	}
 	r.tools[name] = t
 	r.order = append(r.order, name)
+}
+
+// RegisterWithMetadata registers a tool and an explicit descriptor.  This is
+// useful for adapters (such as MCP) whose metadata is supplied separately
+// from the Tool implementation.
+func (r *Registry) RegisterWithMetadata(t Tool, metadata ToolMetadata) {
+	if t == nil {
+		return
+	}
+	r.Register(t)
+	if r.metadata == nil {
+		r.metadata = make(map[string]ToolMetadata)
+	}
+	r.metadata[t.Name()] = metadata
+}
+
+// Metadata returns the descriptor for a registered tool.  Missing metadata is
+// never treated as safe: callers receive conservative defaults.  The boolean
+// reports whether a tool with that name is registered.
+func (r *Registry) Metadata(name string) (ToolMetadata, bool) {
+	t, ok := r.tools[name]
+	if !ok {
+		return DefaultToolMetadata(), false
+	}
+	if metadata, exists := r.metadata[name]; exists {
+		return metadata, true
+	}
+	if provider, ok := t.(MetadataProvider); ok {
+		metadata := provider.Metadata()
+		if metadata.Risk == "" {
+			metadata.Risk = RiskMedium
+		}
+		return metadata, true
+	}
+	return DefaultToolMetadata(), true
+}
+
+// GetMetadata is an alias for Metadata for callers that prefer Get-style
+// registry APIs.
+func (r *Registry) GetMetadata(name string) (ToolMetadata, bool) {
+	return r.Metadata(name)
 }
 
 // Unregister removes a tool from the registry by name. No-op if not present.
@@ -54,6 +140,7 @@ func (r *Registry) Unregister(name string) {
 		return
 	}
 	delete(r.tools, name)
+	delete(r.metadata, name)
 	for i, n := range r.order {
 		if n == name {
 			r.order = append(r.order[:i], r.order[i+1:]...)

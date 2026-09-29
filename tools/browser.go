@@ -23,13 +23,19 @@ import (
 // browserBackend is the internal interface both backends implement.
 type browserBackend interface {
 	// Navigate opens the given URL and returns the page title and readable text.
-	Navigate(url, waitUntil string, timeout time.Duration) (title, text string, err error)
+	Navigate(ctx context.Context, url, waitUntil string, timeout time.Duration) (title, text string, err error)
 	// Action performs a single interaction on the page.
-	Action(action, selector, value string, timeout time.Duration) (string, error)
+	Action(ctx context.Context, action, selector, value string, timeout time.Duration) (string, error)
 	// Content returns the current page content in the requested format.
-	Content(format, selector string, timeout time.Duration) (string, error)
+	Content(ctx context.Context, format, selector string, timeout time.Duration) (string, error)
 	// Close releases all browser resources.
 	Close()
+}
+
+// contextAwareBackend lets a session update the context used by asynchronous
+// browser request routes for each tool call.
+type contextAwareBackend interface {
+	setNetworkContext(context.Context)
 }
 
 // ── BrowserSession ───────────────────────────────────────────────────────────
@@ -39,6 +45,7 @@ type browserBackend interface {
 // closed by the agent's deferred cleanup block.
 type BrowserSession struct {
 	cfg     *config.BrowserConfig
+	policy  *networkPolicy
 	backend browserBackend
 	mu      sync.Mutex
 	once    sync.Once
@@ -48,22 +55,26 @@ type BrowserSession struct {
 // NewBrowserSession creates a session bound to the given config.
 // The browser is NOT opened yet; it opens on the first tool call.
 func NewBrowserSession(cfg *config.BrowserConfig) *BrowserSession {
-	return &BrowserSession{cfg: cfg}
+	policy := defaultNetworkPolicy
+	if cfg != nil {
+		policy = configuredNetworkPolicy(cfg.AllowPrivate, cfg.AllowedDomains)
+	}
+	return &BrowserSession{cfg: cfg, policy: policy}
 }
 
 // open initialises the backend exactly once. Subsequent calls are no-ops.
-func (s *BrowserSession) open() error {
+func (s *BrowserSession) open(ctx context.Context) error {
 	s.once.Do(func() {
 		switch s.cfg.Backend {
 		case "agent-browser":
-			b, err := newAgentBrowserBackend(s.cfg)
+			b, err := newAgentBrowserBackend(s.cfg, s.policy)
 			if err != nil {
 				s.openErr = err
 				return
 			}
 			s.backend = b
 		default: // "playwright"
-			b, err := newPlaywrightBackend(s.cfg)
+			b, err := newPlaywrightBackend(s.cfg, s.policy)
 			if err != nil {
 				s.openErr = err
 				return
@@ -88,31 +99,49 @@ func (s *BrowserSession) Close() {
 	s.once = sync.Once{}
 }
 
-func (s *BrowserSession) navigate(url, waitUntil string, timeout time.Duration) (string, string, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if err := s.open(); err != nil {
+func (s *BrowserSession) navigate(ctx context.Context, url, waitUntil string, timeout time.Duration) (string, string, error) {
+	if err := ctx.Err(); err != nil {
 		return "", "", err
 	}
-	return s.backend.Navigate(url, waitUntil, timeout)
-}
-
-func (s *BrowserSession) action(action, selector, value string, timeout time.Duration) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := s.open(); err != nil {
-		return "", err
+	if err := s.open(ctx); err != nil {
+		return "", "", err
 	}
-	return s.backend.Action(action, selector, value, timeout)
+	s.setNetworkContext(ctx)
+	return s.backend.Navigate(ctx, url, waitUntil, timeout)
 }
 
-func (s *BrowserSession) content(format, selector string, timeout time.Duration) (string, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if err := s.open(); err != nil {
+func (s *BrowserSession) action(ctx context.Context, action, selector, value string, timeout time.Duration) (string, error) {
+	if err := ctx.Err(); err != nil {
 		return "", err
 	}
-	return s.backend.Content(format, selector, timeout)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.open(ctx); err != nil {
+		return "", err
+	}
+	s.setNetworkContext(ctx)
+	return s.backend.Action(ctx, action, selector, value, timeout)
+}
+
+func (s *BrowserSession) content(ctx context.Context, format, selector string, timeout time.Duration) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.open(ctx); err != nil {
+		return "", err
+	}
+	s.setNetworkContext(ctx)
+	return s.backend.Content(ctx, format, selector, timeout)
+}
+
+func (s *BrowserSession) setNetworkContext(ctx context.Context) {
+	if backend, ok := s.backend.(contextAwareBackend); ok {
+		backend.setNetworkContext(ctx)
+	}
 }
 
 func (s *BrowserSession) timeout() time.Duration {
@@ -130,9 +159,44 @@ type playwrightBackend struct {
 	context     playwright.BrowserContext
 	page        playwright.Page
 	userDataDir string
+	policy      *networkPolicy
+	contextMu   sync.RWMutex
+	activeCtx   context.Context
 }
 
-func newPlaywrightBackend(cfg *config.BrowserConfig) (*playwrightBackend, error) {
+func (b *playwrightBackend) setNetworkContext(ctx context.Context) {
+	b.contextMu.Lock()
+	b.activeCtx = ctx
+	b.contextMu.Unlock()
+}
+
+func (b *playwrightBackend) networkContext() context.Context {
+	b.contextMu.RLock()
+	ctx := b.activeCtx
+	b.contextMu.RUnlock()
+	if ctx == nil {
+		return context.TODO()
+	}
+	return ctx
+}
+
+// watchPlaywrightContext interrupts an in-flight Playwright operation when
+// the caller cancels its context. Playwright's Go API exposes per-operation
+// timeouts but no context parameter, so closing the page is the only reliable
+// way to interrupt a navigation or locator wait immediately.
+func watchPlaywrightContext(ctx context.Context, page playwright.Page) func() {
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = page.Close()
+		case <-done:
+		}
+	}()
+	return func() { close(done) }
+}
+
+func newPlaywrightBackend(cfg *config.BrowserConfig, policy *networkPolicy) (*playwrightBackend, error) {
 	runOpts := &playwright.RunOptions{SkipInstallBrowsers: true}
 	pw, err := playwright.Run(runOpts)
 	if err != nil {
@@ -151,14 +215,14 @@ func newPlaywrightBackend(cfg *config.BrowserConfig) (*playwrightBackend, error)
 		Headless: playwright.Bool(cfg.Headless),
 	}
 
-	var context playwright.BrowserContext
+	var browserContext playwright.BrowserContext
 	switch cfg.BrowserType {
 	case "firefox":
-		context, err = pw.Firefox.LaunchPersistentContext(userDataDir, launchOpts)
+		browserContext, err = pw.Firefox.LaunchPersistentContext(userDataDir, launchOpts)
 	case "webkit":
-		context, err = pw.WebKit.LaunchPersistentContext(userDataDir, launchOpts)
+		browserContext, err = pw.WebKit.LaunchPersistentContext(userDataDir, launchOpts)
 	default: // "chromium"
-		context, err = pw.Chromium.LaunchPersistentContext(userDataDir, launchOpts)
+		browserContext, err = pw.Chromium.LaunchPersistentContext(userDataDir, launchOpts)
 	}
 	if err != nil {
 		os.RemoveAll(userDataDir) //nolint:errcheck
@@ -166,24 +230,49 @@ func newPlaywrightBackend(cfg *config.BrowserConfig) (*playwrightBackend, error)
 		return nil, fmt.Errorf("playwright: failed to launch browser context: %w", err)
 	}
 
-	pages := context.Pages()
+	pages := browserContext.Pages()
 	var page playwright.Page
 	if len(pages) > 0 {
 		page = pages[0]
 	} else {
-		page, err = context.NewPage()
+		page, err = browserContext.NewPage()
 		if err != nil {
-			context.Close()           //nolint:errcheck
+			browserContext.Close()    //nolint:errcheck
 			os.RemoveAll(userDataDir) //nolint:errcheck
 			pw.Stop()                 //nolint:errcheck
 			return nil, fmt.Errorf("playwright: failed to create page: %w", err)
 		}
 	}
+	backend := &playwrightBackend{pw: pw, context: browserContext, page: page, userDataDir: userDataDir, policy: policy}
+	// Intercept every browser request, including redirects and subresources.
+	// The initial navigation is checked by BrowserNavigateTool as well; this
+	// route closes the gap where a public page embeds a private URL.
+	if err := browserContext.Route("**/*", func(route playwright.Route) {
+		rawURL := route.Request().URL()
+		if strings.HasPrefix(rawURL, "http://") || strings.HasPrefix(rawURL, "https://") {
+			if _, err := policy.validateURL(backend.networkContext(), rawURL); err != nil {
+				_ = route.Abort("blockedbyclient")
+				return
+			}
+		}
+		_ = route.Continue()
+	}); err != nil {
+		page.Close()              //nolint:errcheck
+		browserContext.Close()    //nolint:errcheck
+		os.RemoveAll(userDataDir) //nolint:errcheck
+		pw.Stop()                 //nolint:errcheck
+		return nil, fmt.Errorf("playwright: failed to install network policy: %w", err)
+	}
 
-	return &playwrightBackend{pw: pw, context: context, page: page, userDataDir: userDataDir}, nil
+	return backend, nil
 }
 
-func (b *playwrightBackend) Navigate(rawURL, waitUntil string, timeout time.Duration) (string, string, error) {
+func (b *playwrightBackend) Navigate(ctx context.Context, rawURL, waitUntil string, timeout time.Duration) (string, string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", "", err
+	}
+	stopWatch := watchPlaywrightContext(ctx, b.page)
+	defer stopWatch()
 	waitEvent := playwright.WaitUntilStateLoad
 	switch waitUntil {
 	case "networkidle":
@@ -200,6 +289,9 @@ func (b *playwrightBackend) Navigate(rawURL, waitUntil string, timeout time.Dura
 		Timeout:   &ms,
 	})
 	if err != nil {
+		if ctx.Err() != nil {
+			return "", "", ctx.Err()
+		}
 		return "", "", fmt.Errorf("navigate to %s: %w", rawURL, err)
 	}
 
@@ -212,7 +304,12 @@ func (b *playwrightBackend) Navigate(rawURL, waitUntil string, timeout time.Dura
 	return title, text, nil
 }
 
-func (b *playwrightBackend) Action(action, selector, value string, timeout time.Duration) (string, error) {
+func (b *playwrightBackend) Action(ctx context.Context, action, selector, value string, timeout time.Duration) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	stopWatch := watchPlaywrightContext(ctx, b.page)
+	defer stopWatch()
 	ms := float64(timeout.Milliseconds())
 
 	loc := func() playwright.Locator {
@@ -284,7 +381,12 @@ func (b *playwrightBackend) Action(action, selector, value string, timeout time.
 	}
 }
 
-func (b *playwrightBackend) Content(format, selector string, timeout time.Duration) (string, error) {
+func (b *playwrightBackend) Content(ctx context.Context, format, selector string, timeout time.Duration) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	stopWatch := watchPlaywrightContext(ctx, b.page)
+	defer stopWatch()
 	switch format {
 	case "html":
 		if selector != "" {
@@ -337,6 +439,9 @@ type agentBrowserBackend struct {
 	binArgs []string // any prefix args from agent_bin (e.g. ["agent-browser"] when bin="npx")
 	session string   // unique session name for this BrowserSession
 	headed  bool     // true = show browser window
+	policy  *networkPolicy
+	stateMu sync.Mutex
+	closed  bool
 }
 
 // abData is the "data" object returned by agent-browser --json.
@@ -355,7 +460,7 @@ type abResp struct {
 	Error   string `json:"error"`
 }
 
-func newAgentBrowserBackend(cfg *config.BrowserConfig) (*agentBrowserBackend, error) {
+func newAgentBrowserBackend(cfg *config.BrowserConfig, policy *networkPolicy) (*agentBrowserBackend, error) {
 	agentBin := cfg.AgentBin
 	if agentBin == "" {
 		agentBin = "agent-browser"
@@ -367,11 +472,18 @@ func newAgentBrowserBackend(cfg *config.BrowserConfig) (*agentBrowserBackend, er
 		binArgs: parts[1:],
 		session: fmt.Sprintf("ageage-%d", time.Now().UnixNano()),
 		headed:  !cfg.Headless,
+		policy:  policy,
 	}, nil
 }
 
 // run executes a single agent-browser command and returns the parsed data object.
-func (b *agentBrowserBackend) run(timeout time.Duration, args ...string) (abData, error) {
+func (b *agentBrowserBackend) run(parent context.Context, timeout time.Duration, args ...string) (abData, error) {
+	b.stateMu.Lock()
+	closed := b.closed
+	b.stateMu.Unlock()
+	if closed && (len(args) == 0 || args[0] != "close") {
+		return abData{}, fmt.Errorf("agent-browser session is closed")
+	}
 	// Build: <bin> [binArgs...] [--headed] --session <s> --json <args...>
 	cmdArgs := append([]string{}, b.binArgs...)
 	if b.headed {
@@ -380,7 +492,7 @@ func (b *agentBrowserBackend) run(timeout time.Duration, args ...string) (abData
 	cmdArgs = append(cmdArgs, "--session", b.session, "--json")
 	cmdArgs = append(cmdArgs, args...)
 
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, b.bin, cmdArgs...)
@@ -429,16 +541,60 @@ func (b *agentBrowserBackend) run(timeout time.Duration, args ...string) (abData
 	return resp.Data, nil
 }
 
-func (b *agentBrowserBackend) Navigate(rawURL, _ string, timeout time.Duration) (string, string, error) {
-	data, err := b.run(timeout, "open", rawURL)
+// validateCurrentURL asks the CLI for the URL that is actually loaded. This
+// catches navigations caused by clicks/forms, which are not visible in the
+// original action arguments.
+func (b *agentBrowserBackend) validateCurrentURL(ctx context.Context, timeout time.Duration) error {
+	data, err := b.run(ctx, timeout, "get", "url")
 	if err != nil {
+		return err
+	}
+	if data.URL == "" {
+		return fmt.Errorf("agent-browser returned an empty current URL")
+	}
+	if b.policy == nil {
+		return nil
+	}
+	if _, err := b.policy.validateURL(ctx, data.URL); err != nil {
+		return fmt.Errorf("current browser URL is blocked: %w", err)
+	}
+	return nil
+}
+
+// quarantine closes a session after a policy violation. The closed flag is
+// set before invoking the CLI so later tool calls cannot read from the page
+// even if the external process fails to close cleanly.
+func (b *agentBrowserBackend) quarantine() {
+	b.stateMu.Lock()
+	if b.closed {
+		b.stateMu.Unlock()
+		return
+	}
+	b.closed = true
+	b.stateMu.Unlock()
+	b.run(context.TODO(), 30*time.Second, "close") //nolint:errcheck
+}
+
+func (b *agentBrowserBackend) Navigate(ctx context.Context, rawURL, _ string, timeout time.Duration) (string, string, error) {
+	data, err := b.run(ctx, timeout, "open", rawURL)
+	if err != nil {
+		return "", "", err
+	}
+	if err := b.validateCurrentURL(ctx, timeout); err != nil {
+		b.quarantine()
 		return "", "", err
 	}
 	// snapshot is the documented AI-friendly content command; it returns the
 	// accessibility tree which works reliably on SPAs and auth-gated pages.
-	snapData, err := b.run(timeout, "snapshot")
+	snapData, err := b.run(ctx, timeout, "snapshot")
 	if err != nil {
 		return data.Title, "", fmt.Errorf("get page content: %w", err)
+	}
+	// Recheck after reading: a page can navigate asynchronously between the
+	// pre-snapshot check and the CLI response.
+	if err := b.validateCurrentURL(ctx, timeout); err != nil {
+		b.quarantine()
+		return "", "", err
 	}
 	content := snapData.Snapshot
 	if content == "" {
@@ -447,7 +603,7 @@ func (b *agentBrowserBackend) Navigate(rawURL, _ string, timeout time.Duration) 
 	return data.Title, content, nil
 }
 
-func (b *agentBrowserBackend) Action(action, selector, value string, timeout time.Duration) (string, error) {
+func (b *agentBrowserBackend) Action(ctx context.Context, action, selector, value string, timeout time.Duration) (string, error) {
 	var args []string
 	switch action {
 	case "click":
@@ -475,45 +631,60 @@ func (b *agentBrowserBackend) Action(action, selector, value string, timeout tim
 	default:
 		return "", fmt.Errorf("unknown action %q; supported: click, type, fill, hover, scroll, select, press, check, uncheck", action)
 	}
-	if _, err := b.run(timeout, args...); err != nil {
+	if _, err := b.run(ctx, timeout, args...); err != nil {
+		return "", err
+	}
+	if err := b.validateCurrentURL(ctx, timeout); err != nil {
+		b.quarantine()
 		return "", err
 	}
 	return fmt.Sprintf("%s done", action), nil
 }
 
-func (b *agentBrowserBackend) Content(format, selector string, timeout time.Duration) (string, error) {
+func (b *agentBrowserBackend) Content(ctx context.Context, format, selector string, timeout time.Duration) (string, error) {
+	if err := b.validateCurrentURL(ctx, timeout); err != nil {
+		b.quarantine()
+		return "", err
+	}
+	validateAfterContent := func(content string) (string, error) {
+		if err := b.validateCurrentURL(ctx, timeout); err != nil {
+			b.quarantine()
+			return "", err
+		}
+		return content, nil
+	}
 	switch format {
 	case "html":
 		target := "body"
 		if selector != "" {
 			target = selector
 		}
-		data, err := b.run(timeout, "get", "html", target)
+		data, err := b.run(ctx, timeout, "get", "html", target)
 		if err != nil {
 			return "", err
 		}
-		return data.HTML, nil
+		return validateAfterContent(data.HTML)
 	case "snapshot":
-		data, err := b.run(timeout, "snapshot", "-i")
+		data, err := b.run(ctx, timeout, "snapshot", "-i")
 		if err != nil {
 			return "", err
 		}
-		return data.Snapshot, nil
+		return validateAfterContent(data.Snapshot)
 	default: // "text"
 		target := "body"
 		if selector != "" {
 			target = selector
 		}
-		data, err := b.run(timeout, "get", "text", target)
+		data, err := b.run(ctx, timeout, "get", "text", target)
 		if err != nil {
 			return "", err
 		}
-		return data.Text, nil
+		return validateAfterContent(data.Text)
 	}
 }
 
 func (b *agentBrowserBackend) Close() {
-	b.run(30*time.Second, "close") //nolint:errcheck
+	b.quarantine()
 }
 
 // ── HTML → readable text helper ──────────────────────────────────────────────
@@ -568,7 +739,7 @@ func (t *BrowserNavigateTool) Parameters() map[string]interface{} {
 	}
 }
 
-func (t *BrowserNavigateTool) Execute(_ context.Context, args json.RawMessage) (string, error) {
+func (t *BrowserNavigateTool) Execute(ctx context.Context, args json.RawMessage) (string, error) {
 	var p struct {
 		URL       string `json:"url"`
 		WaitUntil string `json:"wait_until"`
@@ -582,8 +753,15 @@ func (t *BrowserNavigateTool) Execute(_ context.Context, args json.RawMessage) (
 	if !strings.HasPrefix(p.URL, "http://") && !strings.HasPrefix(p.URL, "https://") {
 		p.URL = "https://" + p.URL
 	}
+	policy := defaultNetworkPolicy
+	if t.Session != nil && t.Session.policy != nil {
+		policy = t.Session.policy
+	}
+	if _, err := policy.validateURL(ctx, p.URL); err != nil {
+		return "", fmt.Errorf("blocked URL: %w", err)
+	}
 
-	title, text, err := t.Session.navigate(p.URL, p.WaitUntil, t.Session.timeout())
+	title, text, err := t.Session.navigate(ctx, p.URL, p.WaitUntil, t.Session.timeout())
 	if err != nil {
 		return "", err
 	}
@@ -629,7 +807,7 @@ func (t *BrowserActionTool) Parameters() map[string]interface{} {
 	}
 }
 
-func (t *BrowserActionTool) Execute(_ context.Context, args json.RawMessage) (string, error) {
+func (t *BrowserActionTool) Execute(ctx context.Context, args json.RawMessage) (string, error) {
 	var p struct {
 		Action   string `json:"action"`
 		Selector string `json:"selector"`
@@ -641,7 +819,7 @@ func (t *BrowserActionTool) Execute(_ context.Context, args json.RawMessage) (st
 	if p.Action == "" {
 		return "", fmt.Errorf("action is required")
 	}
-	return t.Session.action(p.Action, p.Selector, p.Value, t.Session.timeout())
+	return t.Session.action(ctx, p.Action, p.Selector, p.Value, t.Session.timeout())
 }
 
 // BrowserContentTool retrieves content from the current browser page.
@@ -672,7 +850,7 @@ func (t *BrowserContentTool) Parameters() map[string]interface{} {
 	}
 }
 
-func (t *BrowserContentTool) Execute(_ context.Context, args json.RawMessage) (string, error) {
+func (t *BrowserContentTool) Execute(ctx context.Context, args json.RawMessage) (string, error) {
 	var p struct {
 		Format   string `json:"format"`
 		Selector string `json:"selector"`
@@ -680,5 +858,5 @@ func (t *BrowserContentTool) Execute(_ context.Context, args json.RawMessage) (s
 	if err := json.Unmarshal(args, &p); err != nil {
 		return "", fmt.Errorf("invalid arguments: %w", err)
 	}
-	return t.Session.content(p.Format, p.Selector, t.Session.timeout())
+	return t.Session.content(ctx, p.Format, p.Selector, t.Session.timeout())
 }

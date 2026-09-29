@@ -29,6 +29,16 @@ func NewToolDispatcher(registry *tools.Registry, credMgr *creds.Manager) *ToolDi
 	return &ToolDispatcher{Registry: registry, CredMgr: credMgr}
 }
 
+// Metadata exposes the same descriptor used by Execute.  Keeping this query
+// on the dispatcher gives future policy and audit layers one place to inspect
+// a tool before invoking it.
+func (d *ToolDispatcher) Metadata(name string) (tools.ToolMetadata, bool) {
+	if d == nil || d.Registry == nil {
+		return tools.DefaultToolMetadata(), false
+	}
+	return d.Registry.Metadata(name)
+}
+
 // Execute invokes a tool through the shared dispatch policy.
 func (d *ToolDispatcher) Execute(
 	ctx context.Context,
@@ -61,7 +71,19 @@ func (d *ToolDispatcher) Execute(
 	if hooks.Start != nil {
 		hooks.Start(name, displayArgs)
 	}
-	result, err := d.Registry.Execute(ctx, name, execArgs)
+
+	// Tool implementations may be old-style Tools with no metadata.  Their
+	// descriptor intentionally has no timeout, preserving historical behavior.
+	// Metadata-aware tools can opt into a default timeout without changing the
+	// caller's context or cancellation semantics.
+	execCtx := ctx
+	metadata, _ := d.Registry.Metadata(name)
+	var cancel context.CancelFunc
+	if metadata.DefaultTimeout > 0 {
+		execCtx, cancel = context.WithTimeout(ctx, metadata.DefaultTimeout)
+		defer cancel()
+	}
+	result, err := d.Registry.Execute(execCtx, name, execArgs)
 	if hooks.End != nil {
 		hooks.End(name)
 	}

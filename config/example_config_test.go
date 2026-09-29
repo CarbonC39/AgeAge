@@ -27,6 +27,9 @@ func TestExampleConfigParses(t *testing.T) {
 	if cfg.Cron.MaxOutput != 2000 || cfg.Cron.CatchUp {
 		t.Fatalf("example [cron] not loaded: %#v", cfg.Cron)
 	}
+	if cfg.Notifications.Preset != ProgressPresetBalanced || cfg.Notifications.ThrottleMS != 750 {
+		t.Fatalf("example [notifications] not loaded: %#v", cfg.Notifications)
+	}
 	if cfg.Security.ForbidRM {
 		t.Fatalf("example forbid_rm should default to false: %#v", cfg.Security)
 	}

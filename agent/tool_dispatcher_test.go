@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"ageage/config"
 	"ageage/creds"
@@ -23,6 +24,21 @@ type dispatchStubTool struct {
 	result string
 	err    error
 	calls  int
+}
+
+type timeoutDispatchTool struct{}
+
+func (timeoutDispatchTool) Name() string        { return "timeout" }
+func (timeoutDispatchTool) Description() string { return "waits for cancellation" }
+func (timeoutDispatchTool) Parameters() map[string]interface{} {
+	return map[string]interface{}{"type": "object"}
+}
+func (timeoutDispatchTool) Metadata() tools.ToolMetadata {
+	return tools.ToolMetadata{Risk: tools.RiskMedium, DefaultTimeout: 10 * time.Millisecond}
+}
+func (timeoutDispatchTool) Execute(ctx context.Context, _ json.RawMessage) (string, error) {
+	<-ctx.Done()
+	return "", ctx.Err()
 }
 
 func (s *dispatchStubTool) Name() string        { return "capture" }
@@ -125,6 +141,17 @@ func TestToolDispatcherPreservesCancellationIdentity(t *testing.T) {
 	)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("cancellation identity lost: %v", err)
+	}
+}
+
+func TestToolDispatcherAppliesMetadataDefaultTimeout(t *testing.T) {
+	registry := tools.NewRegistry()
+	registry.Register(timeoutDispatchTool{})
+	result, err := NewToolDispatcher(registry, nil).Execute(
+		context.Background(), "timeout", json.RawMessage(`{}`), ToolDispatchHooks{},
+	)
+	if result != "" || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("timeout execution = (%q, %v)", result, err)
 	}
 }
 

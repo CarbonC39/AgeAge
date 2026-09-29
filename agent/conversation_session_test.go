@@ -1,10 +1,14 @@
 package agent
 
 import (
+	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"ageage/llm"
 )
@@ -120,5 +124,358 @@ func TestSanitizeSessionIDAndDerivedPaths(t *testing.T) {
 	sm := NewSessionManager("/tmp/ageage-test")
 	if filepath.Base(sm.ContextPath("one")) != "CONTEXT.md" || filepath.Base(sm.HistoryPath("one")) != "history.jsonl" {
 		t.Fatal("derived session paths are incorrect")
+	}
+}
+
+func TestSessionHistoryConcurrentSavesArePrivateAndValid(t *testing.T) {
+	ageageDir := t.TempDir()
+	smA := NewSessionManager(ageageDir)
+	smB := NewSessionManager(ageageDir)
+	var wg sync.WaitGroup
+	for i := 0; i < 24; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			sm := smA
+			if i%2 == 1 {
+				sm = smB
+			}
+			if err := sm.SaveHistory("shared", []llm.Message{
+				{Role: "user", Content: "writer"},
+				{Role: "assistant", Content: strings.Repeat("x", i+1)},
+			}); err != nil {
+				t.Errorf("save %d: %v", i, err)
+			}
+		}(i)
+	}
+	wg.Wait()
+	loaded, err := smA.LoadHistory("shared")
+	if err != nil || len(loaded) != 2 || loaded[0].Role != "user" || loaded[1].Role != "assistant" {
+		t.Fatalf("loaded concurrent history = %#v, err=%v", loaded, err)
+	}
+	info, err := os.Stat(smA.HistoryPath("shared"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("history mode = %o, want 600", got)
+	}
+}
+
+func TestSessionTransactionCanLoadAndSaveUnderOneLock(t *testing.T) {
+	sm := NewSessionManager(t.TempDir())
+	if err := sm.SaveHistory("transaction", []llm.Message{{Role: "user", Content: "before"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := sm.WithSessionTransaction("transaction", func(tx *SessionTransaction) error {
+		messages, err := tx.LoadHistory()
+		if err != nil {
+			return err
+		}
+		messages = append(messages, llm.Message{Role: "assistant", Content: "after"})
+		return tx.SaveHistory(messages)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := sm.LoadHistory("transaction")
+	if err != nil || len(loaded) != 2 || loaded[1].Content != "after" {
+		t.Fatalf("transaction history = %#v, err=%v", loaded, err)
+	}
+}
+
+func TestSessionRegistryPersistsBindingsAndIsMigrationSafe(t *testing.T) {
+	ageageDir := t.TempDir()
+	registry, err := OpenSessionRegistry(ageageDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding := SessionBinding{
+		SessionID:   "matrix-room-thread",
+		ChannelType: "matrix",
+		ChannelID:   "!room:example.org",
+		ThreadID:    "$event",
+		OwnerID:     "@alice:example.org",
+		Kind:        "thread",
+	}
+	if err := registry.Bind(binding); err != nil {
+		t.Fatal(err)
+	}
+	key := KeyForBinding(binding)
+	if got, ok := registry.Get(key); !ok || got.SessionID != binding.SessionID {
+		t.Fatalf("binding = %#v, found=%v", got, ok)
+	}
+	reloaded, err := OpenSessionRegistry(ageageDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := reloaded.Get(key); !ok || got.ChannelID != binding.ChannelID {
+		t.Fatalf("reloaded binding = %#v, found=%v", got, ok)
+	}
+	if err := reloaded.RemoveSession(binding.SessionID); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := reloaded.Get(key); ok {
+		t.Fatal("removed session binding still present")
+	}
+	info, err := os.Stat(reloaded.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("registry mode = %o, want 600", got)
+	}
+}
+
+func TestSessionRegistryMissingFileStartsEmpty(t *testing.T) {
+	registry, err := OpenSessionRegistry(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(registry.List()) != 0 {
+		t.Fatalf("new registry = %#v", registry.List())
+	}
+}
+
+func TestSessionRegistryInstancesMergeBindingsUnderFileLock(t *testing.T) {
+	ageageDir := t.TempDir()
+	first, err := OpenSessionRegistry(ageageDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := OpenSessionRegistry(ageageDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := SessionBinding{SessionID: "room-a", ChannelType: "matrix", ChannelID: "!a:example.org", Kind: "room"}
+	b := SessionBinding{SessionID: "room-b", ChannelType: "matrix", ChannelID: "!b:example.org", Kind: "room"}
+	if err := first.Bind(a); err != nil {
+		t.Fatal(err)
+	}
+	if err := second.Bind(b); err != nil {
+		t.Fatal(err)
+	}
+	third, err := OpenSessionRegistry(ageageDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(third.List()) != 2 {
+		t.Fatalf("merged bindings = %#v", third.List())
+	}
+}
+
+func TestCreateSessionRejectsExistingAndListHidesCronSessions(t *testing.T) {
+	sm := NewSessionManager(t.TempDir())
+	if err := sm.CreateSession("named"); err != nil {
+		t.Fatal(err)
+	}
+	if err := sm.CreateSession("named"); err == nil {
+		t.Fatal("creating an existing session succeeded")
+	}
+	if err := sm.EnsureSession("cron-internal"); err != nil {
+		t.Fatal(err)
+	}
+	if err := sm.CreateSession("cron-user"); err == nil {
+		t.Fatal("creating a reserved cron session succeeded")
+	}
+	if err := sm.Rename("named", "cron-renamed"); err == nil {
+		t.Fatal("renaming into the reserved cron namespace succeeded")
+	}
+	infos, err := sm.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(infos) != 1 || infos[0].ID != "named" {
+		t.Fatalf("user session list = %#v", infos)
+	}
+	if exact, matches, err := sm.FindByPrefix("cron"); err != nil || exact != nil || len(matches) != 0 {
+		t.Fatalf("cron session leaked through prefix lookup: exact=%#v matches=%#v err=%v", exact, matches, err)
+	}
+}
+
+func TestSessionTransactionsDoNotLoseConcurrentUpdates(t *testing.T) {
+	smA := NewSessionManager(t.TempDir())
+	smB := NewSessionManager(filepath.Dir(smA.sessionsDir))
+	if err := smA.EnsureSession("shared"); err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			sm := smA
+			if i%2 == 1 {
+				sm = smB
+			}
+			if err := sm.WithSessionTransaction("shared", func(tx *SessionTransaction) error {
+				messages, err := tx.LoadHistory()
+				if err != nil {
+					return err
+				}
+				messages = append(messages, llm.Message{Role: "user", Content: fmt.Sprintf("%d", i)})
+				return tx.SaveHistory(messages)
+			}); err != nil {
+				t.Errorf("transaction %d: %v", i, err)
+			}
+		}(i)
+	}
+	wg.Wait()
+	messages, err := smA.LoadHistory("shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(messages) != 20 {
+		t.Fatalf("history has %d messages, want 20", len(messages))
+	}
+}
+
+func TestRenameUsesDeterministicDualSessionLocks(t *testing.T) {
+	sm := NewSessionManager(t.TempDir())
+	if err := sm.CreateSession("alpha"); err != nil {
+		t.Fatal(err)
+	}
+	if err := sm.CreateSession("beta"); err != nil {
+		t.Fatal(err)
+	}
+	start := make(chan struct{})
+	done := make(chan struct{}, 2)
+	for _, ids := range [][2]string{{"alpha", "gamma"}, {"beta", "alpha"}} {
+		go func(oldID, newID string) {
+			<-start
+			_ = sm.Rename(oldID, newID)
+			done <- struct{}{}
+		}(ids[0], ids[1])
+	}
+	close(start)
+	for range 2 {
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("concurrent renames deadlocked")
+		}
+	}
+}
+
+func TestSessionRegistryRejectsDuplicateMutableAttachment(t *testing.T) {
+	registry, err := OpenSessionRegistry(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := SessionBinding{SessionID: "shared", ChannelType: "matrix", ChannelID: "!one", Kind: "room"}
+	second := SessionBinding{SessionID: "shared", ChannelType: "matrix", ChannelID: "!two", Kind: "room"}
+	if err := registry.Bind(first); err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.Bind(second); err == nil {
+		t.Fatal("duplicate session attachment succeeded")
+	}
+	if err := registry.RenameSession("shared", "renamed"); err != nil {
+		t.Fatal(err)
+	}
+	bindings := registry.GetForSession("renamed")
+	if len(bindings) != 1 || bindings[0].ChannelID != "!one" {
+		t.Fatalf("renamed bindings = %#v", bindings)
+	}
+}
+
+func TestCreateSessionConcurrentCollisionHasOneWinner(t *testing.T) {
+	smA := NewSessionManager(t.TempDir())
+	smB := NewSessionManager(filepath.Dir(smA.sessionsDir))
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	for _, sm := range []*SessionManager{smA, smB} {
+		go func(manager *SessionManager) {
+			<-start
+			results <- manager.CreateSession("same-name")
+		}(sm)
+	}
+	close(start)
+	successes := 0
+	for range 2 {
+		if err := <-results; err == nil {
+			successes++
+		}
+	}
+	if successes != 1 {
+		t.Fatalf("CreateSession successes = %d, want exactly one", successes)
+	}
+}
+
+func TestRenameWaitsForActiveSessionTransaction(t *testing.T) {
+	sm := NewSessionManager(t.TempDir())
+	if err := sm.CreateSession("source"); err != nil {
+		t.Fatal(err)
+	}
+	_, unlock := sm.BeginSessionTransaction("source")
+	done := make(chan error, 1)
+	go func() { done <- sm.Rename("source", "target") }()
+	select {
+	case err := <-done:
+		unlock()
+		t.Fatalf("Rename completed while transaction was active: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	unlock()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Rename did not continue after transaction released")
+	}
+}
+
+func TestDeleteWaitsForActiveSessionTransaction(t *testing.T) {
+	sm := NewSessionManager(t.TempDir())
+	if err := sm.CreateSession("source"); err != nil {
+		t.Fatal(err)
+	}
+	_, unlock := sm.BeginSessionTransaction("source")
+	done := make(chan error, 1)
+	go func() { done <- sm.Delete("source") }()
+	select {
+	case err := <-done:
+		unlock()
+		t.Fatalf("Delete completed while transaction was active: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	unlock()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Delete did not continue after transaction released")
+	}
+}
+
+func TestBeginSessionTransactionContextCancelsWhileQueued(t *testing.T) {
+	sm := NewSessionManager(t.TempDir())
+	if err := sm.CreateSession("source"); err != nil {
+		t.Fatal(err)
+	}
+	_, unlock := sm.BeginSessionTransaction("source")
+	defer unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	if _, queuedUnlock, err := sm.BeginSessionTransactionContext(ctx, "source"); err == nil {
+		queuedUnlock()
+		t.Fatal("queued transaction ignored cancellation")
+	} else if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("cancellation took %s", elapsed)
+	}
+}
+
+func TestBeginSessionTransactionContextRejectsAlreadyCanceledContext(t *testing.T) {
+	sm := NewSessionManager(t.TempDir())
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, unlock, err := sm.BeginSessionTransactionContext(ctx, "source"); err == nil {
+		unlock()
+		t.Fatal("transaction accepted an already canceled context")
 	}
 }

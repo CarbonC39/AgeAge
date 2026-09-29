@@ -27,8 +27,13 @@ type DiscordChannel struct {
 	groupChannels map[string]bool   // channelID → true if guild channel, false if DM
 	threadParent  map[string]string // thread channel ID → parent channel ID
 	mu            sync.Mutex
-	typingStop    map[string]context.CancelFunc // channelID → cancel func for keep-alive typing
+	typingStop    map[string]discordTypingState // channelID → active keep-alive state
 	typingMu      sync.Mutex
+}
+
+type discordTypingState struct {
+	cancel context.CancelFunc
+	refs   int
 }
 
 // NewDiscord creates a new Discord channel.
@@ -44,7 +49,7 @@ func NewDiscord(botToken string, channelIDs []string, allowedUsers []string, opt
 		lastMsgIDs:    make(map[string]string),
 		groupChannels: make(map[string]bool),
 		threadParent:  make(map[string]string),
-		typingStop:    make(map[string]context.CancelFunc),
+		typingStop:    make(map[string]discordTypingState),
 	}
 }
 
@@ -161,6 +166,12 @@ func (d *DiscordChannel) Start(handler MessageHandler) error {
 }
 
 func (d *DiscordChannel) Stop() error {
+	d.typingMu.Lock()
+	for channelID, state := range d.typingStop {
+		state.cancel()
+		delete(d.typingStop, channelID)
+	}
+	d.typingMu.Unlock()
 	close(d.stopCh)
 	return nil
 }
@@ -190,6 +201,12 @@ func (d *DiscordChannel) SendMessage(channelID, text string) (string, error) {
 		}
 	}
 	return firstID, nil
+}
+
+// SendMessageInThread sends an editable progress/todo message to a Discord
+// thread channel. Discord thread IDs are channel IDs. Implements ThreadEditable.
+func (d *DiscordChannel) SendMessageInThread(_ string, threadRootID, _ string, text string) (string, error) {
+	return d.SendMessage(threadRootID, text)
 }
 
 // EditMessage replaces a previously sent Discord message.
@@ -222,12 +239,15 @@ func (d *DiscordChannel) Reply(channelID, replyToID, text string) error {
 // called again with typing=false. Implements TypingIndicator.
 func (d *DiscordChannel) SendTyping(channelID string, typing bool) error {
 	if typing {
-		ctx, cancel := context.WithCancel(context.Background())
 		d.typingMu.Lock()
-		if old, ok := d.typingStop[channelID]; ok {
-			old()
+		if state, ok := d.typingStop[channelID]; ok {
+			state.refs++
+			d.typingStop[channelID] = state
+			d.typingMu.Unlock()
+			return nil
 		}
-		d.typingStop[channelID] = cancel
+		ctx, cancel := context.WithCancel(context.Background())
+		d.typingStop[channelID] = discordTypingState{cancel: cancel, refs: 1}
 		d.typingMu.Unlock()
 		go func() {
 			for {
@@ -242,8 +262,14 @@ func (d *DiscordChannel) SendTyping(channelID string, typing bool) error {
 		}()
 	} else {
 		d.typingMu.Lock()
-		if cancel, ok := d.typingStop[channelID]; ok {
-			cancel()
+		if state, ok := d.typingStop[channelID]; ok {
+			if state.refs > 1 {
+				state.refs--
+				d.typingStop[channelID] = state
+				d.typingMu.Unlock()
+				return nil
+			}
+			state.cancel()
 			delete(d.typingStop, channelID)
 		}
 		d.typingMu.Unlock()

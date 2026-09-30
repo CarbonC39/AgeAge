@@ -93,6 +93,9 @@ func newRootCommand() *cobra.Command {
 	// --- ageage config ---
 	rootCmd.AddCommand(configCommand())
 
+	// --- ageage memory ---
+	rootCmd.AddCommand(memoryCommand())
+
 	// --- ageage tools (compatibility alias) ---
 	toolsCmd := &cobra.Command{
 		Use:   "tools",

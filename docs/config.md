@@ -1,6 +1,32 @@
 # Configuration Reference
 
-AgeAge is configured through a single TOML file, typically `config.toml` in the workspace directory. Run `ageage init` to generate a starter file interactively.
+AgeAge is configured through a single TOML file, typically `config.toml` in the workspace directory. Run `ageage init` to create a workspace through keyboard-driven setup pages. Use `Back` to revisit earlier pages; Escape or Ctrl+C cancels without creating files. Setup displays a masked final review and writes only after explicit confirmation. Existing `config.toml` files are never replaced unless replacement is explicitly selected at the final prompt.
+
+When terminal forms are unavailable, `init` automatically uses its line-oriented mode. Pass `--plain` to select that mode explicitly and `--dir PATH` to set the target directory, for example `ageage init --plain --dir ./ageage`. Plain mode preserves the same defaults, validation, review, and final confirmation; its prompt order is linear rather than page-based. The final creation/replace answer defaults to No. Setup does not create the target directory or starter files until confirmation.
+
+## Configuration commands
+
+Use `ageage config` for the keyboard editor. It stages changes in memory and presents one review before saving. Escape or Ctrl+C leaves the file unchanged; when a draft exists, the editor asks whether to discard it. `ageage config tools` opens the tool allowlist directly, and `ageage tools` remains a compatibility alias. The tool selector distinguishes the default tool set (an empty `agent.tools` list) from a custom allowlist. An empty list means the default Agent tool set, with skill-only tools injected only when requested by a skill. A non-empty custom allowlist replaces that default set and may deliberately promote selected skill-only tools to global availability. It cannot be empty; select the default set to restore the default behavior. Configured MCP or unavailable tool names are retained until explicitly deselected.
+
+`ageage config validate` parses the resolved config file and reports its path. It works without a terminal. `ageage config edit` opens the file using `$VISUAL`, then `$EDITOR`, then `vi` (or Notepad on Windows); editor command arguments are split on whitespace and the config path is passed as one argument. Interactive forms require stdin and stdout terminals. Other piped invocations fail with guidance to use the raw editor or `validate`.
+
+The keyboard editor currently stages common model, Agent, router/planner/evaluator, web, tool, notification, and basic safety settings. Advanced or backend-specific settings remain available in the raw TOML editor. A save updates only the edited known keys, preserves unrelated TOML text and file permissions, and refuses to overwrite a file that changed while the editor was open.
+
+### Memory administration
+
+Use `ageage memory` for the interactive browse/search/add/edit/delete/export menu. The script-friendly commands are:
+
+```sh
+ageage memory list
+ageage memory search "project preference"
+ageage memory remove mem_123 --yes
+ageage memory export ./memory-backup.jsonl
+ageage memory export ./memory-backup.jsonl --force
+```
+
+`list`, `search`, and `export` do not require a terminal. `add` and `edit` require interactive forms. Removing IDs requires an interactive confirmation unless `--yes` is provided; the menu's multi-record delete always asks for a second confirmation. Export is an exact byte-for-byte JSONL snapshot, including malformed lines, and never changes the live memory file. It refuses an existing destination unless `--force` is explicit; interactive export also offers a replacement prompt whose default is No.
+
+Agent memory tools and `ageage memory` use the same repository and a process-local mutex plus an operating-system file lock on `MEMORY.jsonl.lock`. Locks are held only while reading or applying a change, never while the user fills in a form. A stale edit or delete is rejected if the selected entry changed, while unrelated concurrent appends are retained. Lock contention has a bounded timeout, and operations also honor cancellation. The memory file, lock file, and exported backups use mode `0600`; edits, removals, and exports use atomic replacement, while appends are locked and synced.
 
 > **Looking for a complete starting point?** The repo ships `example.config.toml` — a fully commented config covering the current feature set (including `[history]` compression, `[planner]`, `[cron]`, and `forbid_rm`). Copy it to your config directory and fill in the placeholders.
 
@@ -69,6 +95,7 @@ non_include_tools = []
 | `max_iterations`     | int          | `20`           | Hard limit on tool-call rounds per user turn. |
 | `mode`               | string       | `"supervised"` | `"full"` allows all tools without confirmation. `"supervised"` prompts the user before destructive actions (bash, file_write, file_edit). |
 | `non_include_tools`  | string list  | `[]`           | Tools to never register. Supports exact names (`"bash"`) and prefix matching (`"cron"` excludes all cron tools, `"memory_"` excludes all memory tools). `finish_task` cannot be excluded. |
+| `tools`               | string list  | `[]`           | Optional positive allowlist. Empty means the default tool set; skill-only tools are injected only when a skill requests them. A non-empty custom list may promote skill-only tools globally. |
 | `max_parallel_tools` | int          | `0`            | Maximum number of tool calls that may execute concurrently within a single LLM response. `0` or `1` = sequential (default). `>1` = parallel; when combined with streaming, tools whose JSON arguments complete during the stream are dispatched immediately without waiting for the full response. |
 
 ---

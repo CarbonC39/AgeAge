@@ -43,6 +43,8 @@ go build -o ageage .
 
 # 2. Create a workspace with a starter config
 ./ageage init
+# For pipes and automation, use line-oriented prompts and an explicit target:
+./ageage init --plain --dir ./ageage
 # or copy the fully commented example and fill it in:
 cp example.config.toml workspace/config.toml
 
@@ -70,7 +72,17 @@ After `./ageage init`, start a session with:
 ```sh
 ./ageage cli              # interactive terminal session
 ./ageage cli -c path/to/config.toml
+./ageage config            # staged keyboard configuration editor
+./ageage config tools      # edit the default or custom tool allowlist
+./ageage config edit       # open the resolved TOML file in $VISUAL / $EDITOR
+./ageage config validate   # validate config.toml (script friendly)
+./ageage memory            # interactive memory manager
+./ageage memory list       # script-friendly memory listing
+./ageage memory search "project preference"
+./ageage memory export ./memory-backup.jsonl
 ```
+
+`ageage tools` is retained as a compatibility alias for `ageage config tools`. An empty `agent.tools` value means the default tool set; skill-only tools are added only when a skill requests them. A non-empty custom allowlist can make selected skill-only tools available globally, and cannot be empty. See the [configuration reference](docs/config.md#configuration-commands) for editor and non-terminal behavior.
 
 ### Slash commands
 
@@ -117,7 +129,9 @@ You ▸ Summarise @report.pdf and check @screenshot.png for issues
 | IM channels (Telegram/Discord/Matrix) | `./ageage connect` |
 | HTTP API (OpenAI-compatible) | `./ageage serve <data-dir>` |
 | MCP server over stdio | `./ageage mcp` |
-| Inspect tools / skills / credentials / cron | `./ageage tools`, `./ageage skills`, `./ageage cred`, `./ageage cron` |
+| Configure / inspect tools | `./ageage config`, `./ageage config tools`, `./ageage tools` (compatibility alias) |
+| Manage memory | `./ageage memory`, `./ageage memory list`, `./ageage memory search <query>`, `./ageage memory export <path>` |
+| Inspect skills / credentials / scheduled tasks | `./ageage skills`, `./ageage cred`, `./ageage cron` |
 
 In IM mode, Matrix AgeAge commands use `!` (for example `!help` and `!session new`); Telegram and Discord commands continue to use `/`. IM progress visibility is configured with `[notifications]`, including per-channel overrides. See the [channel configuration](docs/config.md#channels) for details.
 

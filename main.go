@@ -5,12 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net/http"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -34,20 +31,25 @@ import (
 var debugFlag bool
 
 func main() {
+	if err := newRootCommand().Execute(); err != nil {
+		os.Exit(1)
+	}
+}
+
+func newRootCommand() *cobra.Command {
 	rootCmd := &cobra.Command{
 		Use:   "ageage",
 		Short: "AgeAge - A mini Golang Agent framework",
-		Long:  "AgeAge is a lightweight, modular AI agent framework with token optimization and enterprise-grade security.",
+		Long: "AgeAge is a lightweight, modular AI agent framework with token optimization and enterprise-grade security.\n\n" +
+			"Workspace setup: ageage init [--plain] [--dir PATH]\n" +
+			"Configuration:   ageage config [tools|edit|validate] (ageage tools is a compatibility alias)\n" +
+			"Memory:          ageage memory [list|search|add|edit|remove|export]",
 	}
 
 	rootCmd.PersistentFlags().BoolVar(&debugFlag, "debug", false, "Enable debug output (print model raw output and tool flow)")
 
 	// --- ageage init ---
-	initCmd := &cobra.Command{
-		Use:   "init",
-		Short: "Interactive setup: create workspace directory and config",
-		RunE:  runInit,
-	}
+	initCmd := initCommand()
 	rootCmd.AddCommand(initCmd)
 
 	// --- ageage serve ---
@@ -209,9 +211,7 @@ func main() {
 	cronCmd.AddCommand(cronListCmd, cronAddCmd, cronRemoveCmd, cronRunCmd, cronPauseCmd, cronResumeCmd)
 	rootCmd.AddCommand(cronCmd)
 
-	if err := rootCmd.Execute(); err != nil {
-		os.Exit(1)
-	}
+	return rootCmd
 }
 
 // findConfigFile locates the config file.
@@ -233,388 +233,14 @@ func findConfigFile(explicit string) string {
 
 // --- ageage init ---
 
-func runInit(cmd *cobra.Command, args []string) error {
-	reader := bufio.NewReader(os.Stdin)
-
-	fmt.Println("AgeAge Setup Wizard")
-	fmt.Println(strings.Repeat("═", 52))
-
-	// ─── 1/8  Storage ────────────────────────────────────────
-	printInitSection("1/8  Storage")
-	fmt.Println("AgeAge directory — one folder for config.toml, AGENT.md, SOUL.md,")
-	fmt.Println("memories, skills, and session data.")
-	fmt.Println("Launch with: ageage cli -c <dir>/config.toml")
-	fmt.Print("AgeAge directory (default: ./ageage): ")
-	ageageDir, _ := filepath.Abs(readLine(reader, "./ageage"))
-	cfgPath := filepath.Join(ageageDir, "config.toml")
-
-	fmt.Println()
-	fmt.Println("Workspace — the directory the agent reads and writes files in.")
-	fmt.Println("CLI mode always uses the shell's launch directory, regardless of this setting.")
-	fmt.Println("Channel/serve mode uses the workspace path below.")
-	fmt.Print("Workspace (default: . — runtime launch directory): ")
-	workspace := readLine(reader, ".")
-
-	// ─── 2/8  LLM Provider ───────────────────────────────────
-	printInitSection("2/8  LLM Provider")
-	fmt.Println("Base URL examples:")
-	fmt.Println("  OpenAI:    https://api.openai.com/v1")
-	fmt.Println("  Anthropic: https://api.anthropic.com/v1")
-	fmt.Println("  DeepSeek:  https://api.deepseek.com/v1")
-	fmt.Println("  Gemini:    https://generativelanguage.googleapis.com/v1beta/openai")
-	fmt.Println("  Mistral:   https://api.mistral.ai/v1")
-	fmt.Println("  Ollama:    http://localhost:11434/v1  (no API key needed)")
-	fmt.Print("Base URL (default: https://api.openai.com/v1): ")
-	baseURL := readLine(reader, "https://api.openai.com/v1")
-
-	envKey, envName := findEnvAPIKey()
-	if envKey != "" {
-		fmt.Printf("API Key (found %s — press Enter to use it): ", envName)
-	} else {
-		fmt.Print("API Key (press Enter to skip for keyless providers like Ollama): ")
-	}
-	apiKey := readLine(reader, envKey)
-	if apiKey == envKey && envKey != "" {
-		fmt.Printf("  Using %s.\n", envName)
-	}
-
-	model := pickModel(reader, baseURL, apiKey)
-
-	// ─── 3/8  Agent Behavior ─────────────────────────────────
-	printInitSection("3/8  Agent Behavior")
-	fmt.Println("Mode:")
-	fmt.Println("  1) supervised — pause for confirmation before every tool call")
-	fmt.Println("                  Recommended for CLI use; you review each action")
-	fmt.Println("  2) full       — fully autonomous, no confirmation prompts")
-	fmt.Println("                  Required for channel mode (Telegram/Discord/Matrix)")
-	fmt.Print("Select mode (default: 1): ")
-	agentMode := "supervised"
-	if readLine(reader, "1") == "2" {
-		agentMode = "full"
-	}
-
-	// ─── 4/8  Intent Router ──────────────────────────────────
-	printInitSection("4/8  Intent Router  (optional)")
-	fmt.Println("The router classifies each request by answering 3 factual checks")
-	fmt.Println("(needs tools? needs multiple steps? needs synthesis?) and routes to")
-	fmt.Println("the right model tier — base, medium, or strong.")
-	fmt.Println("Requires at least a cheap classifier model; strong model is optional.")
-	fmt.Println("Skip if you use a single model for everything.")
-	fmt.Print("Configure router? (y/N): ")
-	routerEnabled := strings.ToLower(readLine(reader, "n")) == "y"
-	var routerClassifier, routerMedium, routerStrong string
-	if routerEnabled {
-		classDefault := suggestModel(baseURL)
-		fmt.Printf("  Classifier model (cheap; used for intent classification; default: %s): ", classDefault)
-		routerClassifier = readLine(reader, classDefault)
-		fmt.Printf("  Medium model (single-tool tasks; default: %s): ", model)
-		routerMedium = readLine(reader, model)
-		strongDefault := getStrongModel(baseURL, model)
-		fmt.Printf("  Strong model (multi-step tasks; default: %s): ", strongDefault)
-		routerStrong = readLine(reader, strongDefault)
-	}
-
-	// ─── 5/8  Planner ─────────────────────────────────────────
-	printInitSection("5/8  Planner")
-	fmt.Println("The Planner auto-creates a reusable skill or pipeline when it")
-	fmt.Println("detects a recurring workflow with no matching skill.")
-	fmt.Println("Disable to keep skill/pipeline creation manual (via /build).")
-	fmt.Print("Auto-create skills for recurring workflows? (Y/n): ")
-	plannerEnabled := strings.ToLower(readLine(reader, "y")) != "n"
-
-	// ─── 6/8  Skill Quality  ─────────────────────────────────
-	printInitSection("6/8  Skill Quality  (optional)")
-	fmt.Println("The Evaluator reviews auto-generated skills after they run,")
-	fmt.Println("patching deficiencies in the background. It stops once a skill")
-	fmt.Println("passes N consecutive times (success threshold).")
-	fmt.Print("Enable Evaluator? (y/N): ")
-	evalEnabled := strings.ToLower(readLine(reader, "n")) == "y"
-	evalThreshold := 3
-	if evalEnabled {
-		fmt.Print("  Success threshold (default: 3): ")
-		if t := readLine(reader, "3"); t != "3" {
-			if _, err := fmt.Sscanf(t, "%d", &evalThreshold); err != nil || evalThreshold < 1 {
-				evalThreshold = 3
-			}
-		}
-	}
-
-	// ─── 7/8  Web Tools ──────────────────────────────────────
-	printInitSection("7/8  Web Tools")
-	fmt.Println("Search backend:")
-	fmt.Println("  1) DuckDuckGo  — no API key, works immediately")
-	fmt.Println("  2) Brave       — higher quality results (Brave Search API key required)")
-	fmt.Println("  3) Tavily      — optimized for LLM agents (Tavily API key required)")
-	fmt.Println("  4) SearXNG     — self-hosted, privacy-friendly")
-	fmt.Print("Select (default: 1): ")
-	searchBackend, searxngURL, tavilyKey, braveKey := parseSearchChoice(reader, readLine(reader, "1"))
-
-	fmt.Println("\nFetch backend (used when the agent reads web pages):")
-	fmt.Println("  1) Native   — built-in Go HTTP client, no setup")
-	fmt.Println("  2) Jina     — cleaner extraction; optional API key for higher rate limits")
-	fmt.Println("  3) Crawl4AI — best content quality; requires Python + crawl4ai package")
-	fmt.Print("Select (default: 1): ")
-	fetchBackend, jinaKey, pythonCmd := parseFetchChoice(reader, readLine(reader, "1"))
-
-	// ─── 8/8  Default Tools ───────────────────────────────────
-	printInitSection("8/8  Default Tools")
-	fmt.Println("All tools are enabled by default. An allowlist restricts the agent to")
-	fmt.Println("only the tools you name (useful for leaner or constrained deployments).")
-	fmt.Print("Customize tool allowlist? (y/N): ")
-	var selectedTools []string
-	if strings.ToLower(readLine(reader, "n")) == "y" {
-		selectedTools = selectTools(reader, nil)
-	}
-	toolsLine := toolsLineFromSlice(selectedTools)
-
-	// ─── Advanced Settings (optional) ─────────────────────────
-	// Optional extras that don't belong in the main flow. They default to the
-	// sensible value; answering "n" to the gate keeps all of them unchanged.
-	printInitSection("Advanced Settings  (optional)")
-	fmt.Println("These control destructive-action safety and context behaviour.")
-	fmt.Println("All default to safe values; skip unless you need to change them.")
-	fmt.Print("Configure advanced settings? (y/N): ")
-	advancedSet := strings.ToLower(readLine(reader, "n")) == "y"
-
-	forbidRM := false         // [security] forbid_rm
-	summarizeEnabled := false // [summarize] enabled
-	keepRawToolCalls := false // [history] compress_tool_turns = false
-
-	if advancedSet {
-		fmt.Println()
-		fmt.Print("  Block permanent deletion (rm)? The agent must then use the system trash (y/N): ")
-		forbidRM = strings.ToLower(readLine(reader, "n")) == "y"
-
-		fmt.Print("  Auto-compress long conversations with an LLM summary? (y/N): ")
-		summarizeEnabled = strings.ToLower(readLine(reader, "n")) == "y"
-
-		fmt.Print("  Preserve raw tool calls in history for KV-cache hits (disable compression)? (y/N): ")
-		keepRawToolCalls = strings.ToLower(readLine(reader, "n")) == "y"
-	}
-
-	// ─── Generate files ───────────────────────────────────────
-	for _, d := range []string{
-		filepath.Join(ageageDir, "data"),
-		filepath.Join(ageageDir, "skills"),
-	} {
-		if err := os.MkdirAll(d, 0o755); err != nil {
-			return fmt.Errorf("failed to create directory %s: %w", d, err)
-		}
-	}
-
-	writeConfig := true
-	if _, err := os.Stat(cfgPath); err == nil {
-		fmt.Printf("\n%s already exists. Overwrite? (y/N): ", cfgPath)
-		if strings.ToLower(readLine(reader, "n")) != "y" {
-			fmt.Println("  Skipped.")
-			writeConfig = false
-		}
-	}
-	if writeConfig {
-		content := buildInitConfig(workspace, apiKey, baseURL, model, agentMode, toolsLine,
-			routerEnabled, routerClassifier, routerMedium, routerStrong,
-			evalEnabled, evalThreshold,
-			searchBackend, searxngURL, tavilyKey, braveKey,
-			fetchBackend, jinaKey, pythonCmd,
-			forbidRM, plannerEnabled, summarizeEnabled, keepRawToolCalls)
-		if err := os.WriteFile(cfgPath, []byte(content), 0o644); err != nil {
-			return fmt.Errorf("failed to write config: %w", err)
-		}
-		fmt.Printf("Created %s\n", cfgPath)
-	}
-
-	writeFileMD(filepath.Join(ageageDir, "data", "AGENT.md"), `# AGENT
-
-## Execution Directives
-
-- Use tools to gather information and perform actions.
-- Call finish_task(status="success", summary=...) when done with a complete answer.
-- The summary field IS your only message to the user. It must contain the COMPLETE answer with all relevant data, files, and details. Never use status-only phrases like "completed", "已 完成", or "task done" as the summary. If the user asked for data, put the data in the summary.
-- Use status="failure" for early exit (missing information, unrecoverable error).
-- If you used update_todos, all todos must be done before calling status="success".
-- Think step by step for complex tasks; use delegate or escalate for heavy subtasks.
-- Never say "see above" or "refer to results" — always include the full answer inline.
-- Use memory_store and memory_recall to persist important context across sessions.
-- Minimize unnecessary tool calls; batch independent reads in a single response.
-- Stay honest about limitations and uncertainty.
-- Always respond in the same language the user uses.
-`)
-
-	writeFileMD(filepath.Join(ageageDir, "data", "SOUL.md"), `# SOUL
-
-You are a helpful, friendly, and knowledgeable AI assistant.
-
-## Communication Style
-
-- Match the user's language and tone.
-- Use clear markdown formatting when it aids readability.
-- Keep responses focused and avoid unnecessary verbosity.
-`)
-
-	fmt.Println()
-	fmt.Println(strings.Repeat("─", 52))
-	fmt.Println("Setup complete!")
-	fmt.Println()
-	fmt.Printf("  Start chatting:  ageage cli -c %s\n", cfgPath)
-	fmt.Printf("  Channel mode:    ageage connect -c %s\n", cfgPath)
-	fmt.Printf("  Tool select:     ageage tools -c %s\n", cfgPath)
-	fmt.Println()
-	fmt.Println("Useful commands once running:")
-	fmt.Println("  /build [description] — create a reusable skill or pipeline")
-	fmt.Println("  /session new [name]  — start a fresh named session")
-	fmt.Println("  /undo                — roll back the last turn")
-	fmt.Println("  /help                — list all commands")
-	fmt.Println("  ageage cron list     — manage scheduled tasks")
-	fmt.Println()
-	fmt.Println("More options in config.toml:")
-	fmt.Println("  [summarize]    — auto-compress long conversation history")
-	fmt.Println("  [history]      — toggle in-place tool-call compression (KV-cache)")
-	fmt.Println("  [planner]      — disable auto-creating skills/pipelines")
-	fmt.Println("  [cron]         — scheduled tasks (see: ageage cron list)")
-	fmt.Println("  [channels.*]   — Telegram, Discord, Matrix connectors")
-	fmt.Println("  [mcp.servers]  — connect external MCP tool servers")
-	fmt.Println("  [multimodal]   — vision and document converter settings")
-	fmt.Println("  [bash]         — auto-allow commands, env var passthrough")
-	fmt.Println("  [security]     — restrict paths, blocked commands, forbid_rm")
-	fmt.Println()
-	fmt.Println("Reference: example.config.toml in the repo root is a fully")
-	fmt.Println("           commented copy of every available option.")
-	fmt.Println()
-	return nil
-}
-
-// printInitSection prints a bold section header for the init wizard.
-func printInitSection(title string) {
-	fmt.Println()
-	fmt.Println("── " + title + " " + strings.Repeat("─", max(0, 48-len(title))))
-}
-
 // findEnvAPIKey returns the first API key found in known environment variables.
 func findEnvAPIKey() (key, name string) {
-	for _, n := range []string{"AGEAGE_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "DEEPSEEK_API_KEY", "GEMINI_API_KEY"} {
+	for _, n := range config.APIKeyEnvironmentNames() {
 		if v := os.Getenv(n); v != "" {
 			return v, n
 		}
 	}
 	return "", ""
-}
-
-// pickModel asks the user for a model, optionally fetching the list from the API.
-func pickModel(reader *bufio.Reader, baseURL, apiKey string) string {
-	suggested := suggestModel(baseURL)
-	fmt.Printf("Model (default: %s; press Enter to fetch list from API): ", suggested)
-	input := readLine(reader, "")
-	if input != "" {
-		return input
-	}
-	// Try fetching the model list.
-	fmt.Print("  Fetching models from API...")
-	models, err := fetchModels(baseURL, apiKey)
-	if err != nil || len(models) == 0 {
-		if err != nil {
-			fmt.Printf(" failed (%s)\n", err)
-		} else {
-			fmt.Println(" no models returned.")
-		}
-		fmt.Printf("  Enter model name (default: %s): ", suggested)
-		return readLine(reader, suggested)
-	}
-	fmt.Printf(" %d found.\n", len(models))
-	const maxShow = 40
-	for i, m := range models {
-		if i >= maxShow {
-			fmt.Printf("  ... and %d more (type name manually)\n", len(models)-maxShow)
-			break
-		}
-		fmt.Printf("  %3d. %s\n", i+1, m)
-	}
-	fmt.Printf("Select (number or name, default: %s): ", suggested)
-	choice := readLine(reader, "")
-	if choice == "" {
-		return suggested
-	}
-	var n int
-	if _, err := fmt.Sscanf(choice, "%d", &n); err == nil && n >= 1 && n <= len(models) {
-		return models[n-1]
-	}
-	return choice
-}
-
-// fetchModels calls the /models endpoint and returns sorted model IDs.
-func fetchModels(baseURL, apiKey string) ([]string, error) {
-	url := strings.TrimRight(baseURL, "/") + "/models"
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return nil, err
-	}
-	if apiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+apiKey)
-		req.Header.Set("x-api-key", apiKey) // Anthropic
-	}
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
-	}
-	var result struct {
-		Data []struct {
-			ID string `json:"id"`
-		} `json:"data"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, err
-	}
-	ids := make([]string, len(result.Data))
-	for i, d := range result.Data {
-		ids[i] = d.ID
-	}
-	sort.Strings(ids)
-	return ids, nil
-}
-
-// parseSearchChoice returns search config fields from the user's choice string.
-func parseSearchChoice(reader *bufio.Reader, choice string) (backend, searxngURL, tavilyKey, braveKey string) {
-	backend = "duckduckgo"
-	switch choice {
-	case "2":
-		backend = "brave"
-		fmt.Print("  Brave Search API Key: ")
-		braveKey = readLine(reader, "")
-	case "3":
-		backend = "tavily"
-		fmt.Print("  Tavily API Key: ")
-		tavilyKey = readLine(reader, "")
-	case "4":
-		backend = "searxng"
-		fmt.Print("  SearXNG instance URL (default: http://localhost:8888): ")
-		searxngURL = readLine(reader, "http://localhost:8888")
-	}
-	return
-}
-
-// parseFetchChoice returns fetch config fields from the user's choice string.
-func parseFetchChoice(reader *bufio.Reader, choice string) (backend, jinaKey, pythonCmd string) {
-	backend = "native"
-	switch choice {
-	case "2":
-		backend = "jina"
-		fmt.Print("  Jina API Key (optional — press Enter to skip): ")
-		jinaKey = readLine(reader, "")
-	case "3":
-		backend = "crawl4ai"
-		pythonCmd = detectPython()
-		if pythonCmd == "" {
-			fmt.Println("  Warning: Python not detected. Crawl4AI will need manual setup.")
-			pythonCmd = "python"
-		} else {
-			fmt.Printf("  Detected Python: %s\n", pythonCmd)
-		}
-	}
-	return
 }
 
 // buildInitConfig builds the config.toml content using a strings.Builder.
@@ -627,7 +253,7 @@ func buildInitConfig(
 	forbidRM, plannerEnabled, summarizeEnabled, keepRawToolCalls bool,
 ) string {
 	if pythonCmd == "" {
-		pythonCmd = "python"
+		pythonCmd = config.DefaultCrawl4AICommand
 	}
 	var b strings.Builder
 	p := func(format string, a ...any) { fmt.Fprintf(&b, format, a...) }
@@ -695,7 +321,7 @@ func buildInitConfig(
 		p("# max_history = 8\n")
 		p("# [router.classifier]\n# model    = \"gpt-4o-mini\"  # cheap intent classifier\n# api_key  = \"\"\n# base_url = \"\"\n")
 		p("# [router.medium]\n# model    = %q\n# api_key  = \"\"\n# base_url = \"\"\n", model)
-		p("# [router.strong]\n# model    = %q\n# api_key  = \"\"\n# base_url = \"\"\n\n", getStrongModel(baseURL, model))
+		p("# [router.strong]\n# model    = %q\n# api_key  = \"\"\n# base_url = \"\"\n\n", config.SuggestStrongModel(baseURL, model))
 	}
 
 	p("[eval]\n")
@@ -770,9 +396,9 @@ func buildInitConfig(
 
 	p("[browser]\n")
 	p("# Browser automation tools (browser_navigate, browser_click, etc.).\n")
-	p("# backend = \"playwright\"  # \"playwright\" or \"agent-browser\"\n")
+	p("# backend = %q  # browser automation backend\n", config.BrowserBackendPlaywright)
 	p("# headless    = true\n")
-	p("# browser_type = \"chromium\"  # \"chromium\", \"firefox\", or \"webkit\"\n")
+	p("# browser_type = %q  # Playwright browser engine\n", config.BrowserTypeChromium)
 	p("# timeout     = 30           # seconds per browser action\n\n")
 	p("# allow_private = false      # permit private targets only in trusted environments\n")
 	p("# allowed_domains = []       # optional host/domain allowlist\n\n")
@@ -839,77 +465,6 @@ func buildInitConfig(
 	p("# auto_thread  = true  # reply in a new thread per conversation\n")
 
 	return b.String()
-}
-
-// writeFileMD writes content to path only if path does not exist yet.
-func writeFileMD(path, content string) {
-	if _, err := os.Stat(path); !os.IsNotExist(err) {
-		return
-	}
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-		fmt.Printf("Warning: could not create %s: %s\n", path, err)
-	} else {
-		fmt.Printf("Created %s\n", path)
-	}
-}
-
-// suggestModel returns a sensible default model for the given API base URL.
-func suggestModel(baseURL string) string {
-	switch {
-	case strings.Contains(baseURL, "anthropic"):
-		return "claude-haiku-4-5"
-	case strings.Contains(baseURL, "deepseek"):
-		return "deepseek-chat"
-	case strings.Contains(baseURL, "generativelanguage") || strings.Contains(baseURL, "gemini"):
-		return "gemini-3.5-flash"
-	case strings.Contains(baseURL, "mistral"):
-		return "mistral-small-latest"
-	case strings.Contains(baseURL, "11434"): // Ollama
-		return "llama3.3"
-	default:
-		return "gpt-4o-mini"
-	}
-}
-
-func readLine(reader *bufio.Reader, defaultVal string) string {
-	input, _ := reader.ReadString('\n')
-	input = strings.TrimSpace(input)
-	if input == "" {
-		return defaultVal
-	}
-	return input
-}
-
-func getStrongModel(baseURL, baseModel string) string {
-	switch {
-	case strings.Contains(baseURL, "anthropic"):
-		return "claude-opus-4-7"
-	case strings.Contains(baseURL, "mistral"):
-		return "mistral-large-latest"
-	case strings.Contains(baseURL, "generativelanguage") || strings.Contains(baseURL, "gemini"):
-		return "gemini-3.1-pro"
-	case strings.Contains(baseURL, "deepseek"):
-		return "deepseek-reasoner"
-	case strings.Contains(baseModel, "gpt-4o-mini"):
-		return "gpt-4o"
-	default:
-		return baseModel
-	}
-}
-
-func checkCommand(name string) bool {
-	_, err := exec.LookPath(name)
-	return err == nil
-}
-
-func detectPython() string {
-	if checkCommand("python3") {
-		return "python3"
-	}
-	if checkCommand("python") {
-		return "python"
-	}
-	return ""
 }
 
 // startChannels registers and starts channel connectors based on config.
@@ -1126,7 +681,7 @@ func startChannels(factory *agent.AgentFactory) (*channel.Manager, int, func(too
 				cID := channelID
 				tID := threadID
 				editChannelID := cID
-				if channelType == "discord" && tID != "" {
+				if channelType == config.ChannelDiscord && tID != "" {
 					editChannelID = tID
 				}
 				threadEditable, hasThreadEditable := ch.(channel.ThreadEditable)
@@ -1454,11 +1009,11 @@ func startChannels(factory *agent.AgentFactory) (*channel.Manager, int, func(too
 		// allowlist is empty.
 		var confirmationAllowlist []string
 		switch msg.ChannelType {
-		case "telegram":
+		case config.ChannelTelegram:
 			confirmationAllowlist = factory.Config.Channels.Telegram.AllowedUsers
-		case "discord":
+		case config.ChannelDiscord:
 			confirmationAllowlist = factory.Config.Channels.Discord.AllowedUsers
-		case "matrix":
+		case config.ChannelMatrix:
 			confirmationAllowlist = factory.Config.Channels.Matrix.AllowedUsers
 		}
 		confirmMgr.SetAllowedRespondersForScope(tools.InteractionScope{
@@ -1634,7 +1189,7 @@ func startChannels(factory *agent.AgentFactory) (*channel.Manager, int, func(too
 			// Matrix: session new in the main chat creates a thread-backed session.
 			// The user's command event becomes the thread root; replies go inside it.
 			// Session ID follows the room-prefix scheme: roomPrefix + "-" + sanitize(threadID).
-			if sub == "new" && msg.ChannelType == "matrix" && msg.ThreadID == "" {
+			if sub == "new" && msg.ChannelType == config.ChannelMatrix && msg.ThreadID == "" {
 				if msg.ReplyTo == "" {
 					return respond(msg, "❌ Matrix did not provide a thread root for this command.")
 				}
@@ -1658,7 +1213,7 @@ func startChannels(factory *agent.AgentFactory) (*channel.Manager, int, func(too
 				chatKeyBySessionID[newFullID] = threadChatKey
 				agentMu.Unlock()
 
-				if mx, ok := channelsByType["matrix"].(*channel.MatrixChannel); ok {
+				if mx, ok := channelsByType[config.ChannelMatrix].(*channel.MatrixChannel); ok {
 					_ = mx.SendInThread(msg.ChannelID, msg.ReplyTo, msg.ReplyTo, "✅ New session started. Continue in this thread.")
 				}
 				return ""
@@ -1890,14 +1445,14 @@ func startChannels(factory *agent.AgentFactory) (*channel.Manager, int, func(too
 				// Inline answers are bound to the active session in this room and
 				// the callback sender; do not route by channel alone.
 				agentMu.Lock()
-				chatKey := "telegram:" + channelID
+				chatKey := config.ChannelTelegram + ":" + channelID
 				if threadID != "" {
 					chatKey += ":t:" + threadID
 				}
 				sessionID := activeSessions[chatKey]
 				agentMu.Unlock()
 				scope := tools.InteractionScope{
-					ChannelType: "telegram",
+					ChannelType: config.ChannelTelegram,
 					ChannelID:   channelID,
 					ThreadID:    threadID,
 					SessionID:   sessionID,
@@ -1906,7 +1461,7 @@ func startChannels(factory *agent.AgentFactory) (*channel.Manager, int, func(too
 				factory.UserInputMgr.RespondForScope(scope, answer)
 			}
 			manager.Register(tg)
-			channelsByType["telegram"] = tg
+			channelsByType[config.ChannelTelegram] = tg
 			fmt.Println("  ✓  Telegram")
 			registered++
 		}
@@ -1920,7 +1475,7 @@ func startChannels(factory *agent.AgentFactory) (*channel.Manager, int, func(too
 		} else {
 			dc := channel.NewDiscord(cfg.Channels.Discord.BotToken, cfg.Channels.Discord.ChannelIDs, cfg.Channels.Discord.AllowedUsers, opts)
 			manager.Register(dc)
-			channelsByType["discord"] = dc
+			channelsByType[config.ChannelDiscord] = dc
 			fmt.Println("  ✓  Discord")
 			registered++
 		}
@@ -1939,7 +1494,7 @@ func startChannels(factory *agent.AgentFactory) (*channel.Manager, int, func(too
 				opts,
 			)
 			manager.Register(mx)
-			channelsByType["matrix"] = mx
+			channelsByType[config.ChannelMatrix] = mx
 			fmt.Println("  ✓  Matrix")
 			registered++
 		}
@@ -2970,7 +2525,7 @@ func handleCredChanCmd(_ channel.IncomingMessage, mgr *creds.Manager, rawInput s
 // Discord snowflakes, etc.) are stripped so the agent sees a short human name.
 func senderDisplayName(channelType, senderID, senderName string) string {
 	switch channelType {
-	case "matrix":
+	case config.ChannelMatrix:
 		// @localpart:homeserver.org → localpart
 		if strings.HasPrefix(senderID, "@") {
 			if i := strings.Index(senderID, ":"); i > 1 {
@@ -3474,107 +3029,6 @@ func setCronEnabled(cmd *cobra.Command, id string, enabled bool, verb string) er
 	}
 	fmt.Printf("Cron task %s %s.\n", id, verb)
 	return nil
-}
-
-// toolEntry describes a tool available for selection.
-type toolEntry struct {
-	name      string
-	desc      string
-	skillOnly bool
-}
-
-var knownTools = []toolEntry{
-	{"bash", "Execute shell commands", false},
-	{"file_read", "Read files", false},
-	{"file_write", "Create/overwrite files", false},
-	{"file_edit", "Edit files (diff-based)", false},
-	{"web_fetch", "Fetch web pages", false},
-	{"web_search", "Search the web", false},
-	{"memory_store", "Store memories", false},
-	{"memory_recall", "Recall memories", false},
-	{"memory_forget", "Delete memories", false},
-	{"cron_add", "Schedule cron tasks", false},
-	{"cron_remove", "Remove cron tasks", false},
-	{"cron_list", "List cron tasks", false},
-	{"cron_run", "Run a cron task immediately", false},
-	{"cron_pause", "Pause a cron task", false},
-	{"cron_resume", "Resume a cron task", false},
-	{"delegate", "Delegate to a sub-agent", false},
-	{"grep", "Search file content", true},
-	{"glob", "Find files by pattern", true},
-	{"tree", "Show directory tree", true},
-	{"ask_user", "Ask the user a question", true},
-	{"escalate", "Escalate task to user", true},
-	{"browser_navigate", "Browser navigation", true},
-	{"browser_action", "Browser click/type/scroll actions", true},
-	{"browser_content", "Get browser page content", true},
-	{"update_todos", "Manage todo list", true},
-}
-
-// selectTools presents the legacy interactive checklist used by init.
-func selectTools(reader *bufio.Reader, initialSelected []string) []string {
-	selected := make([]bool, len(knownTools))
-	if len(initialSelected) == 0 {
-		for i := range selected {
-			selected[i] = true
-		}
-	} else {
-		for i, t := range knownTools {
-			selected[i] = slices.Contains(initialSelected, t.name)
-		}
-	}
-	for {
-		fmt.Println()
-		fmt.Println("   Tools  ([x] = enabled   [ ] = disabled)")
-		fmt.Println("   " + strings.Repeat("─", 54))
-		for i, t := range knownTools {
-			mark := "[ ]"
-			if selected[i] {
-				mark = "[x]"
-			}
-			note := ""
-			if t.skillOnly {
-				note = "  (skill-only by default)"
-			}
-			fmt.Printf("   %2d. %s  %-22s %s%s\n", i+1, mark, t.name, t.desc, note)
-		}
-		fmt.Println()
-		fmt.Print("   Toggle (e.g. 1,3,5), 'a' = all, 'd' = none, Enter = confirm: ")
-		line := strings.TrimSpace(readLine(reader, ""))
-		if line == "" {
-			break
-		}
-		switch line {
-		case "a":
-			for i := range selected {
-				selected[i] = true
-			}
-		case "d":
-			for i := range selected {
-				selected[i] = false
-			}
-		default:
-			for part := range strings.SplitSeq(line, ",") {
-				var n int
-				if _, err := fmt.Sscanf(strings.TrimSpace(part), "%d", &n); err == nil && n >= 1 && n <= len(knownTools) {
-					selected[n-1] = !selected[n-1]
-				}
-			}
-		}
-	}
-	result := make([]string, 0, len(knownTools))
-	allOn := true
-	for i, t := range knownTools {
-		if selected[i] {
-			result = append(result, t.name)
-		} else {
-			allOn = false
-		}
-	}
-	if allOn {
-		return nil
-	}
-	return result
 }
 
 // toolsLineFromSlice formats a tools slice as a TOML config line.

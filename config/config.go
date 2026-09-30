@@ -324,14 +324,14 @@ func DefaultConfig() *Config {
 	return &Config{
 		Workspace: ".",
 		LLM: LLMConfig{
-			BaseURL:     "https://api.openai.com/v1",
-			Model:       "gpt-4o-mini",
+			BaseURL:     DefaultLLMBaseURL,
+			Model:       DefaultLLMModel,
 			Temperature: 0.7,
 			MaxTokens:   8192,
 		},
 		Agent: AgentConfig{
 			MaxIterations:   20,
-			Mode:            "supervised",
+			Mode:            AgentModeSupervised,
 			NonIncludeTools: []string{},
 		},
 		SubAgent: SubAgentConfig{
@@ -381,20 +381,20 @@ func DefaultConfig() *Config {
 			MaxOutputBytes:    4 * 1024 * 1024, // 4 MB
 		},
 		WebSearch: WebSearchConfig{
-			Backend:          "duckduckgo",
+			Backend:          WebSearchBackendDuckDuckGo,
 			MaxSearchResults: 10,
 			BlockedDomains:   []string{},
 		},
 		WebFetch: WebFetchConfig{
-			Backend:       "native",
-			Crawl4AICmd:   "python",
+			Backend:       WebFetchBackendNative,
+			Crawl4AICmd:   DefaultCrawl4AICommand,
 			MaxCharacters: 15000,
 		},
 		Browser: BrowserConfig{
-			Backend:     "playwright",
+			Backend:     BrowserBackendPlaywright,
 			Headless:    true,
-			BrowserType: "chromium",
-			AgentBin:    "agent-browser",
+			BrowserType: BrowserTypeChromium,
+			AgentBin:    DefaultAgentBrowserCommand,
 			Timeout:     30,
 		},
 		Multimodal: MultimodalConfig{

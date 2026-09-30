@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"ageage/config"
 )
 
 // TelegramChannel connects to Telegram via Bot API (long polling).
@@ -74,7 +76,7 @@ func (t *TelegramChannel) isAllowedUser(candidates ...string) bool {
 	return false
 }
 
-func (t *TelegramChannel) Name() string { return "telegram" }
+func (t *TelegramChannel) Name() string { return config.ChannelTelegram }
 
 // Start begins long-polling for Telegram updates.
 func (t *TelegramChannel) Start(handler MessageHandler) error {
@@ -185,7 +187,7 @@ func (t *TelegramChannel) Start(handler MessageHandler) error {
 			}
 
 			incoming := IncomingMessage{
-				ChannelType:  "telegram",
+				ChannelType:  config.ChannelTelegram,
 				ChannelID:    chatID,
 				SenderID:     senderID,
 				SenderName:   update.Message.From.FirstName,

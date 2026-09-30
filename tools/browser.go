@@ -66,14 +66,14 @@ func NewBrowserSession(cfg *config.BrowserConfig) *BrowserSession {
 func (s *BrowserSession) open(ctx context.Context) error {
 	s.once.Do(func() {
 		switch s.cfg.Backend {
-		case "agent-browser":
+		case config.BrowserBackendAgentBrowser:
 			b, err := newAgentBrowserBackend(s.cfg, s.policy)
 			if err != nil {
 				s.openErr = err
 				return
 			}
 			s.backend = b
-		default: // "playwright"
+		default: // Playwright
 			b, err := newPlaywrightBackend(s.cfg, s.policy)
 			if err != nil {
 				s.openErr = err
@@ -217,11 +217,11 @@ func newPlaywrightBackend(cfg *config.BrowserConfig, policy *networkPolicy) (*pl
 
 	var browserContext playwright.BrowserContext
 	switch cfg.BrowserType {
-	case "firefox":
+	case config.BrowserTypeFirefox:
 		browserContext, err = pw.Firefox.LaunchPersistentContext(userDataDir, launchOpts)
-	case "webkit":
+	case config.BrowserTypeWebKit:
 		browserContext, err = pw.WebKit.LaunchPersistentContext(userDataDir, launchOpts)
-	default: // "chromium"
+	default: // Chromium
 		browserContext, err = pw.Chromium.LaunchPersistentContext(userDataDir, launchOpts)
 	}
 	if err != nil {
@@ -463,7 +463,7 @@ type abResp struct {
 func newAgentBrowserBackend(cfg *config.BrowserConfig, policy *networkPolicy) (*agentBrowserBackend, error) {
 	agentBin := cfg.AgentBin
 	if agentBin == "" {
-		agentBin = "agent-browser"
+		agentBin = config.DefaultAgentBrowserCommand
 	}
 	// Support multi-word agent_bin like "npx agent-browser" or "npx --yes agent-browser".
 	parts := strings.Fields(agentBin)

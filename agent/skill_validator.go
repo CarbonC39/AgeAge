@@ -24,21 +24,9 @@ func (e ValidationError) Error() string {
 // varsRefRE matches $vars.<identifier> inside prompt text.
 var varsRefRE = regexp.MustCompile(`\$vars\.([a-zA-Z_][a-zA-Z0-9_]*)`)
 
-// standardToolNames is the baseline set of tool names available to agents.
-// Used by ValidateSkillFile to detect unknown tool references in pipeline nodes.
-var standardToolNames = []string{
-	"bash", "file_read", "file_write", "file_edit",
-	"glob", "grep", "tree",
-	"web_fetch", "web_search",
-	"memory_store", "memory_recall", "memory_forget",
-	"cron_add", "cron_remove", "cron_list", "cron_run",
-	"delegate", "ask_user", "update_todos",
-	"finish_task", "node_complete", "next_step",
-}
-
 // ValidateSkillFile loads a skill file at path and checks it for common errors.
 // knownTools overrides the baseline tool list for pipeline tool-name checks;
-// pass nil to use standardToolNames.
+// pass nil to use the Agent-owned tool catalog.
 // Returns a (possibly empty) slice of ValidationError.
 func ValidateSkillFile(path string, knownTools []string) []ValidationError {
 	skill, err := skills.LoadSkillByPath(path)
@@ -78,7 +66,7 @@ func ValidateSkillFile(path string, knownTools []string) []ValidationError {
 	// Build effective known-tool set.
 	toolList := knownTools
 	if len(toolList) == 0 {
-		toolList = standardToolNames
+		toolList = knownToolNames()
 	}
 	knownSet := make(map[string]bool, len(toolList)+2)
 	for _, t := range toolList {

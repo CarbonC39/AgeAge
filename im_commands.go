@@ -4,6 +4,7 @@ import (
 	"strings"
 
 	"ageage/agent"
+	"ageage/config"
 	"ageage/skills"
 )
 
@@ -21,7 +22,7 @@ type imCommand struct {
 // ! so Matrix-native slash commands remain ordinary user text; existing
 // Telegram and Discord integrations retain their documented slash syntax.
 func imCommandPrefix(channelType string) string {
-	if strings.EqualFold(channelType, "matrix") {
+	if strings.EqualFold(channelType, config.ChannelMatrix) {
 		return "!"
 	}
 	return "/"
@@ -41,7 +42,7 @@ func parseIMCommand(channelType, input string) imCommand {
 	if !strings.HasPrefix(input, prefix) {
 		return result
 	}
-	if strings.EqualFold(channelType, "matrix") && strings.HasPrefix(input, "!!") {
+	if strings.EqualFold(channelType, config.ChannelMatrix) && strings.HasPrefix(input, "!!") {
 		result.Escaped = true
 		return result
 	}

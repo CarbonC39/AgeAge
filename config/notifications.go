@@ -22,6 +22,28 @@ const (
 
 const defaultProgressThrottleMS = 750
 
+var progressPresetChoices = []Choice{
+	{Value: ProgressPresetQuiet, Label: "Quiet", Description: "Only scheduled-task outcomes."},
+	{Value: ProgressPresetBalanced, Label: "Balanced", Description: "Plans and scheduled-task outcomes without per-tool noise."},
+	{Value: ProgressPresetVerbose, Label: "Verbose", Description: "All supported progress categories."},
+}
+
+var progressCategoryChoices = []Choice{
+	{Value: ProgressLifecycle, Label: "Lifecycle", Description: "Run lifecycle events."},
+	{Value: ProgressPlan, Label: "Plan", Description: "Plan and pipeline milestones."},
+	{Value: ProgressWaiting, Label: "Waiting", Description: "Requests that require user input."},
+	{Value: ProgressTool, Label: "Tool", Description: "Selected tool activity."},
+	{Value: ProgressSubagent, Label: "Sub-agent", Description: "Delegated-agent activity."},
+	{Value: ProgressCron, Label: "Scheduled task", Description: "Scheduled-task outcomes."},
+}
+
+// ProgressPresetChoices returns display metadata for supported notification
+// presets without exposing the package's backing slice.
+func ProgressPresetChoices() []Choice { return cloneChoices(progressPresetChoices) }
+
+// ProgressCategoryChoices returns the stable progress event categories.
+func ProgressCategoryChoices() []Choice { return cloneChoices(progressCategoryChoices) }
+
 // NotificationConfig controls structured progress events delivered through IM
 // channels. Include and Exclude contain stable category names (for example
 // "tool" or "plan"); an empty Include lets the selected preset decide.

@@ -50,6 +50,15 @@ type MetadataProvider interface {
 	Metadata() ToolMetadata
 }
 
+// ToolDescriptor is the stable, read-only description of a registered tool.
+// The tool implementation remains the source of its name and description;
+// execution metadata is resolved through Registry.Metadata.
+type ToolDescriptor struct {
+	Name        string
+	Description string
+	Metadata    ToolMetadata
+}
+
 // DefaultToolMetadata is intentionally conservative.  A tool that does not
 // implement MetadataProvider is assumed to have side effects, to be
 // non-idempotent, and to carry medium risk.
@@ -245,6 +254,26 @@ func (r *Registry) ListAll() []Tool {
 		}
 	}
 	return list
+}
+
+// Descriptors returns registered tool descriptions in deterministic registry
+// order. It deliberately derives display data from each Tool instead of
+// maintaining a parallel presentation catalog.
+func (r *Registry) Descriptors() []ToolDescriptor {
+	descriptors := make([]ToolDescriptor, 0, len(r.order))
+	for _, name := range r.order {
+		t, ok := r.tools[name]
+		if !ok {
+			continue
+		}
+		metadata, _ := r.Metadata(name)
+		descriptors = append(descriptors, ToolDescriptor{
+			Name:        t.Name(),
+			Description: t.Description(),
+			Metadata:    metadata,
+		})
+	}
+	return descriptors
 }
 
 // Execute executes a tool by name with the given arguments.

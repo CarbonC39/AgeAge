@@ -18,29 +18,30 @@ import (
 	"ageage/tools"
 )
 
-// skillOnlyToolFactories is the registry of all skill-only tools.
-// Factory signature: func(deps AgentDeps, registry, agent) Tool
-// The agent pointer is provided so tools can read/write per-run agent state
-// (e.g. todoStore) and access Callbacks.
-// A factory may return nil if it requires capabilities beyond AgentDeps
-// (e.g. escalate needs a full *AgentFactory for model selection).
-var skillOnlyToolFactories = map[string]func(AgentDeps, *tools.Registry, *Agent) tools.Tool{
-	"next_step": func(_ AgentDeps, _ *tools.Registry, a *Agent) tools.Tool {
+type skillOnlyToolSpec struct {
+	catalog toolCatalogSpec
+	factory func(AgentDeps, *tools.Registry, *Agent) tools.Tool
+}
+
+// skillOnlyToolSpecs keeps lifecycle metadata beside each runtime constructor.
+// Its slice order is the stable catalog and prompt order.
+var skillOnlyToolSpecs = []skillOnlyToolSpec{
+	{catalog: toolCatalogSpec{prototype: func() tools.Tool { return &NextStepTool{} }, availability: ToolInternal}, factory: func(_ AgentDeps, _ *tools.Registry, a *Agent) tools.Tool {
 		return &NextStepTool{agent: a}
-	},
-	"grep": func(f AgentDeps, _ *tools.Registry, _ *Agent) tools.Tool {
+	}},
+	{catalog: toolCatalogSpec{prototype: func() tools.Tool { return &tools.GrepTool{} }, availability: ToolSkillOnly, configurable: true}, factory: func(f AgentDeps, _ *tools.Registry, _ *Agent) tools.Tool {
 		return &tools.GrepTool{Security: f.GetSecurity()}
-	},
-	"glob": func(f AgentDeps, _ *tools.Registry, _ *Agent) tools.Tool {
+	}},
+	{catalog: toolCatalogSpec{prototype: func() tools.Tool { return &tools.GlobTool{} }, availability: ToolSkillOnly, configurable: true}, factory: func(f AgentDeps, _ *tools.Registry, _ *Agent) tools.Tool {
 		return &tools.GlobTool{Security: f.GetSecurity(), Workspace: f.GetConfig().EffectiveWorkDir()}
-	},
-	"tree": func(f AgentDeps, _ *tools.Registry, _ *Agent) tools.Tool {
+	}},
+	{catalog: toolCatalogSpec{prototype: func() tools.Tool { return &tools.TreeTool{} }, availability: ToolSkillOnly, configurable: true}, factory: func(f AgentDeps, _ *tools.Registry, _ *Agent) tools.Tool {
 		return &tools.TreeTool{
 			WorkDir:  f.GetConfig().EffectiveWorkDir(),
 			Security: f.GetSecurity(),
 		}
-	},
-	"update_todos": func(_ AgentDeps, _ *tools.Registry, a *Agent) tools.Tool {
+	}},
+	{catalog: toolCatalogSpec{prototype: func() tools.Tool { return &tools.UpdateTodosTool{} }, availability: ToolSkillOnly, configurable: true}, factory: func(_ AgentDeps, _ *tools.Registry, a *Agent) tools.Tool {
 		store := &tools.TodoStore{}
 		if a.Callbacks.TodoSend != nil {
 			store.SendFunc = a.Callbacks.TodoSend
@@ -53,42 +54,50 @@ var skillOnlyToolFactories = map[string]func(AgentDeps, *tools.Registry, *Agent)
 			return store.IsComplete(), store.PendingList()
 		}
 		return &tools.UpdateTodosTool{Store: store}
-	},
-	"ask_user": func(f AgentDeps, _ *tools.Registry, a *Agent) tools.Tool {
+	}},
+	{catalog: toolCatalogSpec{prototype: func() tools.Tool { return &tools.AskUserTool{} }, availability: ToolSkillOnly, configurable: true}, factory: func(f AgentDeps, _ *tools.Registry, a *Agent) tools.Tool {
 		return &tools.AskUserTool{
 			ChannelID:     a.GetChannelID(),
 			Scope:         a.GetInteractionScope(),
 			Manager:       f.GetUserInputMgr(),
 			NotifyFuncPtr: &a.Callbacks.AskUser,
 		}
-	},
-	"escalate": func(f AgentDeps, r *tools.Registry, _ *Agent) tools.Tool {
+	}},
+	{catalog: toolCatalogSpec{prototype: func() tools.Tool { return &EscalateTool{} }, availability: ToolSkillOnly, configurable: true}, factory: func(f AgentDeps, r *tools.Registry, _ *Agent) tools.Tool {
 		// EscalateTool needs LLM client and debug flag, which require a full factory.
 		factory, ok := f.(*AgentFactory)
 		if !ok {
 			return nil
 		}
 		return &EscalateTool{factory: factory, registry: r}
-	},
-	"browser_navigate": func(f AgentDeps, _ *tools.Registry, a *Agent) tools.Tool {
+	}},
+	{catalog: toolCatalogSpec{prototype: func() tools.Tool { return &tools.BrowserNavigateTool{} }, availability: ToolSkillOnly, configurable: true}, factory: func(f AgentDeps, _ *tools.Registry, a *Agent) tools.Tool {
 		if a.browserSess == nil {
 			a.browserSess = tools.NewBrowserSession(&f.GetConfig().Browser)
 		}
 		return &tools.BrowserNavigateTool{Session: a.browserSess}
-	},
-	"browser_action": func(f AgentDeps, _ *tools.Registry, a *Agent) tools.Tool {
+	}},
+	{catalog: toolCatalogSpec{prototype: func() tools.Tool { return &tools.BrowserActionTool{} }, availability: ToolSkillOnly, configurable: true}, factory: func(f AgentDeps, _ *tools.Registry, a *Agent) tools.Tool {
 		if a.browserSess == nil {
 			a.browserSess = tools.NewBrowserSession(&f.GetConfig().Browser)
 		}
 		return &tools.BrowserActionTool{Session: a.browserSess}
-	},
-	"browser_content": func(f AgentDeps, _ *tools.Registry, a *Agent) tools.Tool {
+	}},
+	{catalog: toolCatalogSpec{prototype: func() tools.Tool { return &tools.BrowserContentTool{} }, availability: ToolSkillOnly, configurable: true}, factory: func(f AgentDeps, _ *tools.Registry, a *Agent) tools.Tool {
 		if a.browserSess == nil {
 			a.browserSess = tools.NewBrowserSession(&f.GetConfig().Browser)
 		}
 		return &tools.BrowserContentTool{Session: a.browserSess}
-	},
+	}},
 }
+
+var skillOnlyToolFactories = func() map[string]func(AgentDeps, *tools.Registry, *Agent) tools.Tool {
+	factories := make(map[string]func(AgentDeps, *tools.Registry, *Agent) tools.Tool, len(skillOnlyToolSpecs))
+	for _, spec := range skillOnlyToolSpecs {
+		factories[descriptorFromPrototype(spec.catalog.prototype).Name] = spec.factory
+	}
+	return factories
+}()
 
 // delegateToolParams returns the shared OpenAI-compatible parameter schema
 // used by both DelegateFastTool and DelegateExpertTool.

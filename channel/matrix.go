@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"ageage/config"
 )
 
 // MatrixChannel connects to a Matrix homeserver via Client-Server API.
@@ -74,7 +76,7 @@ func (m *MatrixChannel) isAllowedUser(userID string) bool {
 	return false
 }
 
-func (m *MatrixChannel) Name() string { return "matrix" }
+func (m *MatrixChannel) Name() string { return config.ChannelMatrix }
 
 // isGroupRoom reports whether roomID is a multi-user room (not a DM).
 func (m *MatrixChannel) isGroupRoom(roomID string) bool {
@@ -335,7 +337,7 @@ func (m *MatrixChannel) Start(handler MessageHandler) error {
 				capturedThreadID := threadID
 
 				incoming := IncomingMessage{
-					ChannelType:  "matrix",
+					ChannelType:  config.ChannelMatrix,
 					ChannelID:    roomID,
 					SenderID:     event.Sender,
 					SenderName:   event.Sender,

@@ -11,6 +11,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"ageage/config"
 )
 
 // DiscordChannel connects to Discord via Bot API (REST polling).
@@ -76,7 +78,7 @@ func (d *DiscordChannel) isAllowedUser(candidates ...string) bool {
 	return false
 }
 
-func (d *DiscordChannel) Name() string { return "discord" }
+func (d *DiscordChannel) Name() string { return config.ChannelDiscord }
 
 // getChannelType returns the Discord channel type integer (0=guild text, 1=DM, etc.).
 func (d *DiscordChannel) getChannelType(channelID string) (int, error) {
@@ -547,7 +549,7 @@ func (d *DiscordChannel) pollChannel(channelID string, handler MessageHandler) {
 		capturedSendChannelID := sendChannelID
 
 		incoming := IncomingMessage{
-			ChannelType:  "discord",
+			ChannelType:  config.ChannelDiscord,
 			ChannelID:    effectiveChannelID,
 			SenderID:     msg.Author.ID,
 			SenderName:   msg.Author.Username,

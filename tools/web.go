@@ -133,11 +133,11 @@ func (t *WebFetchTool) Execute(ctx context.Context, args json.RawMessage) (strin
 	}
 
 	switch t.Cfg.Backend {
-	case "jina":
+	case config.WebFetchBackendJina:
 		return t.fetchViaJina(ctx, rawURL)
-	case "crawl4ai":
+	case config.WebFetchBackendCrawl4AI:
 		return t.fetchViaCrawl4AI(ctx, rawURL)
-	default: // "native"
+	default: // native
 		return t.fetchNative(ctx, rawURL, policy)
 	}
 }
@@ -343,7 +343,7 @@ func (t *WebSearchTool) Execute(ctx context.Context, args json.RawMessage) (stri
 	}
 
 	switch t.Cfg.Backend {
-	case "tavily":
+	case config.WebSearchBackendTavily:
 		if t.Cfg.TavilyAPIKey == "" {
 			fmt.Println("  ⚠  web_search: tavily_api_key not set, falling back to DuckDuckGo")
 			return t.searchViaDuckDuckGo(ctx, query)
@@ -354,7 +354,7 @@ func (t *WebSearchTool) Execute(ctx context.Context, args json.RawMessage) (stri
 			return t.searchViaDuckDuckGo(ctx, query)
 		}
 		return result, nil
-	case "brave":
+	case config.WebSearchBackendBrave:
 		if t.Cfg.BraveAPIKey == "" {
 			fmt.Println("  ⚠  web_search: brave_api_key not set, falling back to DuckDuckGo")
 			return t.searchViaDuckDuckGo(ctx, query)
@@ -365,14 +365,14 @@ func (t *WebSearchTool) Execute(ctx context.Context, args json.RawMessage) (stri
 			return t.searchViaDuckDuckGo(ctx, query)
 		}
 		return result, nil
-	case "searxng":
+	case config.WebSearchBackendSearXNG:
 		result, err := t.searchViaSearXNG(ctx, query)
 		if err != nil {
 			// Fallback to DuckDuckGo when SearXNG is unavailable or misconfigured.
 			return t.searchViaDuckDuckGo(ctx, query)
 		}
 		return result, nil
-	default: // "duckduckgo"
+	default: // DuckDuckGo
 		return t.searchViaDuckDuckGo(ctx, query)
 	}
 }

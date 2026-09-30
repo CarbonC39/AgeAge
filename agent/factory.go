@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -46,6 +47,35 @@ type AgentFactory struct {
 	cronAgentBuilder func() *Agent
 }
 
+type namedMCPSession struct {
+	name    string
+	session *mcp.ClientSession
+}
+
+func sortedMCPServerNames(servers map[string]config.MCPServer) []string {
+	names := make([]string, 0, len(servers))
+	for name := range servers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func sortedMCPSessions(sessions map[string]*mcp.ClientSession) []namedMCPSession {
+	result := make([]namedMCPSession, 0, len(sessions))
+	for name, session := range sessions {
+		result = append(result, namedMCPSession{name: name, session: session})
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].name < result[j].name })
+	return result
+}
+
+func sortedMCPTools(source []*mcp.Tool) []*mcp.Tool {
+	result := append([]*mcp.Tool(nil), source...)
+	sort.SliceStable(result, func(i, j int) bool { return result[i].Name < result[j].Name })
+	return result
+}
+
 // GetSkills returns the current skill list (thread-safe; supports hot reload).
 func (f *AgentFactory) GetSkills() []skills.Skill {
 	f.skillsMu.RLock()
@@ -73,37 +103,18 @@ func (f *AgentFactory) GetStandardToolNames() []string {
 		}
 		names = append(names, n)
 	}
-	add("bash")
-	add("file_read")
-	add("file_write")
-	add("file_edit")
-	add("memory_store")
-	add("memory_recall")
-	add("memory_forget")
-	add("web_fetch")
-	add("web_search")
-	add("delegate")
-	add("cron_add")
-	add("cron_remove")
-	add("cron_list")
-	add("cron_run")
-	add("cron_pause")
-	add("cron_resume")
-	add("glob")
-	add("grep")
-	add("tree")
-	add("update_todos")
-	add("ask_user")
-	add("escalate")
-	add("browser_navigate")
-	add("browser_action")
-	add("browser_content")
-	for _, s := range f.MCPSessions {
-		resp, err := s.ListTools(context.Background(), nil)
+	for _, option := range ConfigurableToolOptions() {
+		add(option.Descriptor.Name)
+	}
+	f.mcpMu.RLock()
+	mcpSessions := sortedMCPSessions(f.MCPSessions)
+	f.mcpMu.RUnlock()
+	for _, entry := range mcpSessions {
+		resp, err := entry.session.ListTools(context.Background(), nil)
 		if err != nil {
 			continue
 		}
-		for _, t := range resp.Tools {
+		for _, t := range sortedMCPTools(resp.Tools) {
 			add(t.Name)
 		}
 	}
@@ -209,7 +220,8 @@ func NewFactory(configPath string, debug bool) (*AgentFactory, error) {
 	// Initialize MCP Sessions.
 	mcpSessions := make(map[string]*mcp.ClientSession)
 	if cfg.MCP.Enabled {
-		for name, srv := range cfg.MCP.Servers {
+		for _, name := range sortedMCPServerNames(cfg.MCP.Servers) {
+			srv := cfg.MCP.Servers[name]
 			if debug {
 				fmt.Printf("🔌 Connecting to MCP Server: %s (%s %s)...\n", name, srv.Command, strings.Join(srv.Args, " "))
 			}
@@ -296,7 +308,8 @@ func (f *AgentFactory) ensureMCPSessions() {
 		f.MCPSessions = make(map[string]*mcp.ClientSession)
 	}
 
-	for name, srv := range f.Config.MCP.Servers {
+	for _, name := range sortedMCPServerNames(f.Config.MCP.Servers) {
+		srv := f.Config.MCP.Servers[name]
 		existing, ok := f.MCPSessions[name]
 		if ok && existing != nil {
 			// Basic connectivity check: try to list tools with a very short timeout.
@@ -353,7 +366,7 @@ func (f *AgentFactory) CreateAgentFiltered(confirmMgr *tools.ConfirmationManager
 	finishTool := &tools.FinishTool{}
 	registry.Register(finishTool)
 
-	isSupervised := f.Config.Agent.Mode == "supervised"
+	isSupervised := f.Config.Agent.Mode == config.AgentModeSupervised
 	autoAllowAll := false
 
 	var currentAgent *Agent
@@ -431,31 +444,6 @@ func (f *AgentFactory) CreateAgentFiltered(confirmMgr *tools.ConfirmationManager
 		}
 		return true
 	}
-
-	bashTool := &tools.BashTool{
-		Security:           f.SecurityChecker,
-		Timeout:            30 * time.Second,
-		Supervised:         isSupervised,
-		AutoAllowCommands:  f.Config.Bash.AutoAllowCommands,
-		MaxOutputBytes:     f.Config.Bash.MaxOutputBytes,
-		WorkDir:            f.Config.EffectiveWorkDir(),
-		PassthroughEnvVars: f.Config.Bash.PassthroughEnvVars,
-		ConfirmFunc:        confirmFunc,
-		RedactFunc: func(text string) string {
-			if f.CredMgr == nil {
-				return text
-			}
-			return f.CredMgr.Scrub(text)
-		},
-	}
-	if shouldRegisterTool("bash") {
-		registry.Register(bashTool)
-	}
-
-	if shouldRegisterTool("file_read") {
-		registry.Register(&tools.FileReadTool{Security: f.SecurityChecker, DocsDir: f.DocsDir})
-	}
-
 	// fileConfirmFunc auto-approves writes/edits targeting any session's CONTEXT.md.
 	// Operation string formats:
 	//   FileWriteTool: "Write N bytes to `<abs-path>`"
@@ -471,114 +459,30 @@ func (f *AgentFactory) CreateAgentFiltered(confirmMgr *tools.ConfirmationManager
 		return confirmFunc(operation)
 	}
 
-	if shouldRegisterTool("file_write") {
-		registry.Register(&tools.FileWriteTool{
-			Security:    f.SecurityChecker,
-			Supervised:  isSupervised,
-			ConfirmFunc: fileConfirmFunc,
-		})
+	buildContext := toolBuildContext{
+		factory:      f,
+		registry:     registry,
+		supervised:   isSupervised,
+		confirm:      confirmFunc,
+		confirmFile:  fileConfirmFunc,
+		currentAgent: func() *Agent { return currentAgent },
 	}
-	if shouldRegisterTool("file_edit") {
-		registry.Register(&tools.FileEditTool{
-			Security:    f.SecurityChecker,
-			Supervised:  isSupervised,
-			ConfirmFunc: fileConfirmFunc,
-		})
-	}
-
-	// Memory tools.
-	memoryPath := f.Config.MemoryPath()
-
-	if shouldRegisterTool("memory_store") {
-		registry.Register(&tools.MemoryStoreTool{
-			MemoryPath:  memoryPath,
-			Supervised:  isSupervised,
-			ConfirmFunc: confirmFunc,
-		})
-	}
-
-	if shouldRegisterTool("memory_recall") {
-		registry.Register(&tools.MemoryRecallTool{MemoryPath: memoryPath})
-	}
-	if shouldRegisterTool("memory_forget") {
-		registry.Register(&tools.MemoryForgetTool{
-			MemoryPath:  memoryPath,
-			Supervised:  isSupervised,
-			ConfirmFunc: confirmFunc,
-		})
-	}
-
-	// Web tools.
-	if shouldRegisterTool("web_fetch") {
-		registry.Register(&tools.WebFetchTool{Cfg: &f.Config.WebFetch})
-	}
-	if shouldRegisterTool("web_search") {
-		registry.Register(&tools.WebSearchTool{Cfg: &f.Config.WebSearch})
-	}
-
-	// Cron tools.
-	if shouldRegisterTool("cron_add") {
-		registry.Register(&tools.CronAddTool{
-			Store:              f.CronStore,
-			Service:            f.CronService,
-			ScopeFunc:          func() tools.InteractionScope { return currentAgent.GetInteractionScope() },
-			SessionIntegration: f.Config.Cron.SessionIntegration,
-			Supervised:         isSupervised,
-			ConfirmFunc:        confirmFunc,
-		})
-	}
-	if shouldRegisterTool("cron_remove") {
-		registry.Register(&tools.CronRemoveTool{
-			Store:       f.CronStore,
-			Service:     f.CronService,
-			ScopeFunc:   func() tools.InteractionScope { return currentAgent.GetInteractionScope() },
-			Supervised:  isSupervised,
-			ConfirmFunc: confirmFunc,
-		})
-	}
-	if shouldRegisterTool("cron_list") {
-		registry.Register(&tools.CronListTool{
-			Store:     f.CronStore,
-			Service:   f.CronService,
-			ScopeFunc: func() tools.InteractionScope { return currentAgent.GetInteractionScope() },
-		})
-	}
-	if shouldRegisterTool("cron_run") {
-		registry.Register(&tools.CronRunTool{
-			Store:     f.CronStore,
-			Service:   f.CronService,
-			ScopeFunc: func() tools.InteractionScope { return currentAgent.GetInteractionScope() },
-		})
-	}
-	if shouldRegisterTool("cron_pause") {
-		registry.Register(&tools.CronPauseTool{
-			Store:     f.CronStore,
-			Service:   f.CronService,
-			ScopeFunc: func() tools.InteractionScope { return currentAgent.GetInteractionScope() },
-		})
-	}
-	if shouldRegisterTool("cron_resume") {
-		registry.Register(&tools.CronResumeTool{
-			Store:     f.CronStore,
-			Service:   f.CronService,
-			ScopeFunc: func() tools.InteractionScope { return currentAgent.GetInteractionScope() },
-		})
-	}
-
-	// Delegation tool.
-	if shouldRegisterTool("delegate") {
-		registry.Register(&DelegateTool{factory: f, registry: registry})
+	for _, spec := range coreToolCatalog {
+		if spec.availability != ToolDefault || spec.runtime == nil {
+			continue
+		}
+		tool := spec.runtime(buildContext)
+		if shouldRegisterTool(tool.Name()) {
+			registry.Register(tool)
+		}
 	}
 
 	// MCP Tools (external).
 	f.mcpMu.RLock()
-	mcpSessions := make([]*mcp.ClientSession, 0, len(f.MCPSessions))
-	for _, s := range f.MCPSessions {
-		mcpSessions = append(mcpSessions, s)
-	}
+	mcpSessions := sortedMCPSessions(f.MCPSessions)
 	f.mcpMu.RUnlock()
-	for _, mcpSession := range mcpSessions {
-		resp, err := mcpSession.ListTools(context.Background(), &mcp.ListToolsParams{})
+	for _, entry := range mcpSessions {
+		resp, err := entry.session.ListTools(context.Background(), &mcp.ListToolsParams{})
 		if err != nil {
 			if f.Debug {
 				fmt.Printf("⚠️  Warning: failed to list MCP tools: %s\n", err)
@@ -586,10 +490,10 @@ func (f *AgentFactory) CreateAgentFiltered(confirmMgr *tools.ConfirmationManager
 			continue
 		}
 
-		for _, tInfo := range resp.Tools {
+		for _, tInfo := range sortedMCPTools(resp.Tools) {
 			if shouldRegisterTool(tInfo.Name) {
 				registry.Register(&tools.MCPTool{
-					Session: mcpSession,
+					Session: entry.session,
 					Tool:    tInfo,
 				})
 			}

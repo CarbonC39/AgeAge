@@ -117,6 +117,23 @@ func TestRegistryMetadataIsOptionalAndConservative(t *testing.T) {
 	}
 }
 
+func TestRegistryDescriptorsUseToolOwnedDataInOrder(t *testing.T) {
+	r := NewRegistry()
+	r.Register(&stubTool{name: "first"})
+	r.Register(&metadataStubTool{stubTool: stubTool{name: "second"}})
+
+	descriptors := r.Descriptors()
+	if len(descriptors) != 2 || descriptors[0].Name != "first" || descriptors[1].Name != "second" {
+		t.Fatalf("descriptor order = %#v", descriptors)
+	}
+	if descriptors[0].Description != "stub" || descriptors[0].Metadata.Risk != RiskMedium {
+		t.Fatalf("legacy descriptor = %#v", descriptors[0])
+	}
+	if !descriptors[1].Metadata.ReadOnly || descriptors[1].Metadata.ConcurrencyKey != "test" {
+		t.Fatalf("provided descriptor = %#v", descriptors[1])
+	}
+}
+
 func TestMCPToolMetadataMapsAnnotationsConservatively(t *testing.T) {
 	legacy := &MCPTool{Tool: &mcp.Tool{Name: "legacy"}}
 	metadata := legacy.Metadata()

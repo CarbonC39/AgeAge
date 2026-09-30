@@ -50,7 +50,7 @@ func newIMProgressReporter(cfg config.NotificationConfig, ch channel.Channel, ms
 	var edit func(string, string) error
 	if editable, ok := ch.(channel.Editable); ok {
 		editChannelID := msg.ChannelID
-		if msg.ChannelType == "discord" && msg.ThreadID != "" {
+		if msg.ChannelType == config.ChannelDiscord && msg.ThreadID != "" {
 			// Discord threads are channels in their own right.
 			editChannelID = msg.ThreadID
 		}
@@ -186,7 +186,7 @@ type imRunFeedback struct {
 
 func beginIMRunFeedback(ch channel.Channel, msg channel.IncomingMessage) *imRunFeedback {
 	f := &imRunFeedback{roomID: msg.ChannelID, typingID: msg.ChannelID, messageID: msg.ReplyTo}
-	if msg.ChannelType == "discord" && msg.ThreadID != "" {
+	if msg.ChannelType == config.ChannelDiscord && msg.ThreadID != "" {
 		f.roomID = msg.ThreadID
 		f.typingID = msg.ThreadID
 	}

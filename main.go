@@ -88,11 +88,14 @@ func main() {
 	skillsCmd.Flags().StringP("config", "c", "", "Path to config.toml")
 	rootCmd.AddCommand(skillsCmd)
 
-	// --- ageage tools ---
+	// --- ageage config ---
+	rootCmd.AddCommand(configCommand())
+
+	// --- ageage tools (compatibility alias) ---
 	toolsCmd := &cobra.Command{
 		Use:   "tools",
-		Short: "Interactively select which tools the agent uses by default",
-		RunE:  runTools,
+		Short: "Edit the tool allowlist (compatibility alias for `ageage config tools`)",
+		RunE:  runConfigTools,
 	}
 	toolsCmd.Flags().StringP("config", "c", "", "Path to config.toml")
 	rootCmd.AddCommand(toolsCmd)
@@ -3473,13 +3476,11 @@ func setCronEnabled(cmd *cobra.Command, id string, enabled bool, verb string) er
 	return nil
 }
 
-// --- ageage tools ---
-
 // toolEntry describes a tool available for selection.
 type toolEntry struct {
 	name      string
 	desc      string
-	skillOnly bool // normally registered only when a skill requires it
+	skillOnly bool
 }
 
 var knownTools = []toolEntry{
@@ -3510,13 +3511,10 @@ var knownTools = []toolEntry{
 	{"update_todos", "Manage todo list", true},
 }
 
-// selectTools presents an interactive checklist and returns the selected tool names.
-// Pass nil for initialSelected to start with all tools enabled.
-// Returns nil when all tools are selected (empty config = all tools).
+// selectTools presents the legacy interactive checklist used by init.
 func selectTools(reader *bufio.Reader, initialSelected []string) []string {
 	selected := make([]bool, len(knownTools))
 	if len(initialSelected) == 0 {
-		// nil or empty → all enabled
 		for i := range selected {
 			selected[i] = true
 		}
@@ -3525,7 +3523,6 @@ func selectTools(reader *bufio.Reader, initialSelected []string) []string {
 			selected[i] = slices.Contains(initialSelected, t.name)
 		}
 	}
-
 	for {
 		fmt.Println()
 		fmt.Println("   Tools  ([x] = enabled   [ ] = disabled)")
@@ -3565,7 +3562,6 @@ func selectTools(reader *bufio.Reader, initialSelected []string) []string {
 			}
 		}
 	}
-
 	result := make([]string, 0, len(knownTools))
 	allOn := true
 	for i, t := range knownTools {
@@ -3576,7 +3572,7 @@ func selectTools(reader *bufio.Reader, initialSelected []string) []string {
 		}
 	}
 	if allOn {
-		return nil // empty config means all tools enabled
+		return nil
 	}
 	return result
 }
@@ -3599,77 +3595,29 @@ func updateConfigTools(configPath, toolsLine string) error {
 	if err != nil {
 		return err
 	}
-	lines := strings.Split(string(data), "\n")
-
-	agentIdx := -1
-	toolsIdx := -1
-	for i, line := range lines {
-		stripped := strings.TrimSpace(line)
-		if stripped == "[agent]" {
-			agentIdx = i
-			continue
-		}
-		if agentIdx >= 0 && toolsIdx < 0 {
-			// Stop at the next section header.
-			if strings.HasPrefix(stripped, "[") {
-				break
-			}
-			isTools := strings.HasPrefix(stripped, "# tools") ||
-				(strings.HasPrefix(stripped, "tools") && len(stripped) > 5 && (stripped[5] == ' ' || stripped[5] == '='))
-			if isTools {
-				toolsIdx = i
-			}
-		}
+	info, err := os.Stat(configPath)
+	if err != nil {
+		return err
 	}
-
-	if toolsIdx >= 0 {
-		lines[toolsIdx] = toolsLine
-	} else if agentIdx >= 0 {
-		// Insert after the [agent] line.
-		newLines := make([]string, 0, len(lines)+1)
-		newLines = append(newLines, lines[:agentIdx+1]...)
-		newLines = append(newLines, toolsLine)
-		newLines = append(newLines, lines[agentIdx+1:]...)
-		lines = newLines
+	value := strings.TrimSpace(toolsLine)
+	if before, after, ok := strings.Cut(value, "="); ok && strings.TrimSpace(before) == "tools" {
+		value = strings.TrimSpace(after)
+	} else if strings.HasPrefix(value, "#") {
+		return fmt.Errorf("commented tool defaults cannot be written; use an empty allowlist")
 	} else {
-		// No [agent] section — append one.
-		lines = append(lines, "", "[agent]", toolsLine)
+		return fmt.Errorf("invalid tools assignment")
 	}
-
-	return os.WriteFile(configPath, []byte(strings.Join(lines, "\n")), 0o644)
+	change := configChange{section: "agent", key: "tools", value: value}
+	replacement, err := applyTOMLChanges(data, []configChange{change})
+	if err != nil {
+		return err
+	}
+	if err := validateConfigBytes(replacement); err != nil {
+		return err
+	}
+	return writeTOMLBatch(configPath, data, info.Mode().Perm(), replacement)
 }
 
 func runTools(cmd *cobra.Command, args []string) error {
-	configPath, _ := cmd.Flags().GetString("config")
-	configPath = findConfigFile(configPath)
-
-	cfg, err := config.LoadConfig(configPath)
-	if err != nil {
-		return fmt.Errorf("failed to load config: %w", err)
-	}
-
-	reader := bufio.NewReader(os.Stdin)
-
-	fmt.Println("\n🔧 Tool Selection")
-	fmt.Println(strings.Repeat("─", 40))
-	if len(cfg.Agent.Tools) == 0 {
-		fmt.Println("Current: all tools enabled (no allowlist set)")
-	} else {
-		fmt.Printf("Current allowlist: %s\n", strings.Join(cfg.Agent.Tools, ", "))
-	}
-
-	selected := selectTools(reader, cfg.Agent.Tools)
-	newLine := toolsLineFromSlice(selected)
-
-	fmt.Printf("\nNew setting: %s\n", newLine)
-	fmt.Print("Write to config? (Y/n): ")
-	if strings.ToLower(readLine(reader, "y")) == "n" {
-		fmt.Println("Aborted — config not changed.")
-		return nil
-	}
-	if err := updateConfigTools(configPath, newLine); err != nil {
-		return fmt.Errorf("failed to update config: %w", err)
-	}
-	fmt.Printf("Updated %s\n", configPath)
-	return nil
+	return runConfigTools(cmd, args)
 }

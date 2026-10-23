@@ -302,11 +302,14 @@ func newIMRuntime(factory *agent.AgentFactory, channelsByType map[string]channel
 				if cmd.is("cred") || cmd.is("build") || cmd.is("clear") || cmd.is("summarize") || cmd.is("undo") || cmd.is("retry") {
 					return respond(msg, "A run is active here. Send a regular message to steer it, or stop it before using that command.")
 				}
+				var warningReply string
 				accepted := run.Prepare(func(ctx context.Context) agent.UserInput {
-					return normalizeIMInput(ctx, msg, factory.Config, ag.TmpManager())
+					input := normalizeIMInput(ctx, msg, factory.Config, ag.TmpManager())
+					warningReply = imInputWarnings(input)
+					return input
 				})
 				if accepted {
-					return ""
+					return respond(msg, warningReply)
 				}
 				// The run sealed its inbox while this message was being normalized.
 				// Wait until its history transaction has been released, then retry as

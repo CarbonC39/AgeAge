@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -27,12 +28,13 @@ import (
 
 // runtimeTestChannel records semantic channel operations without a real IM.
 type runtimeTestChannel struct {
-	mu        sync.Mutex
-	threads   int
-	questions []string
-	replies   []string
-	sends     []string
-	edits     []string
+	mu           sync.Mutex
+	threads      int
+	questions    []string
+	replies      []string
+	replyTargets []conversation.Target
+	sends        []string
+	edits        []string
 }
 
 func (*runtimeTestChannel) Name() string                       { return config.ChannelMatrix }
@@ -65,10 +67,11 @@ func (c *runtimeTestChannel) EditMessage(_, _, text string) error {
 func (c *runtimeTestChannel) SendMessageInThread(_, _, _, text string) (string, error) {
 	return c.SendMessage("", text)
 }
-func (c *runtimeTestChannel) ReplyMessage(_ conversation.Target, text string) (string, error) {
+func (c *runtimeTestChannel) ReplyMessage(target conversation.Target, text string) (string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.replies = append(c.replies, text)
+	c.replyTargets = append(c.replyTargets, target)
 	return "reply", nil
 }
 func (c *runtimeTestChannel) AskInConversation(_ conversation.Target, question string, _ []string) error {
@@ -279,7 +282,8 @@ func TestIMRuntimeSteeringInputJoinsActiveRunAndPersistsAfterToolBatch(t *testin
 	cfg.MCP.Enabled = false
 	cfg.Notifications.Preset = config.ProgressPresetQuiet
 	factory := &agent.AgentFactory{Config: cfg, LLMClient: llm.NewClient("test-key", llmServer.URL, "test-model", false, 0), UserInputMgr: tools.NewUserInputManager()}
-	runtime := newIMRuntime(factory, map[string]channel.Channel{config.ChannelMatrix: &runtimeTestChannel{}})
+	ch := &runtimeTestChannel{}
+	runtime := newIMRuntime(factory, map[string]channel.Channel{config.ChannelMatrix: ch})
 	target := conversation.Target{ChannelType: config.ChannelMatrix, ChannelID: "steering-room", SenderID: "user-1"}
 	initialDone := make(chan string, 1)
 	go func() {
@@ -346,6 +350,17 @@ func TestIMRuntimeSteeringInputJoinsActiveRunAndPersistsAfterToolBatch(t *testin
 	if count := bytes.Count(messages[steering], []byte("data:image/png;base64,")); count != 1 {
 		t.Fatalf("steering image parts = %d, want exactly one", count)
 	}
+	ch.mu.Lock()
+	var gotWarning bool
+	for _, reply := range ch.replies {
+		if strings.Contains(reply, "⚠️") {
+			gotWarning = true
+		}
+	}
+	ch.mu.Unlock()
+	if gotWarning {
+		t.Fatal("successful steering sent an unnecessary warning reply")
+	}
 	sessionID := runtime.Sessions.Current(target)
 	history, err := agent.NewSessionManager(cfg.AgeAgeDirPath()).LoadHistory(sessionID)
 	if err != nil {
@@ -359,6 +374,144 @@ func TestIMRuntimeSteeringInputJoinsActiveRunAndPersistsAfterToolBatch(t *testin
 	}
 	if !persistedSteering {
 		t.Fatal("steering message was not persisted in session history")
+	}
+}
+
+func TestIMRuntimeActiveSteeringAttachmentWarningsAreRepliedAndRetained(t *testing.T) {
+	openCount := &atomic.Int32{}
+	tests := []struct {
+		name       string
+		attachment attachment.Attachment
+		configure  func(*config.Config)
+		warning    string
+	}{
+		{
+			name: "oversize",
+			attachment: attachment.Attachment{Filename: "large.pdf", MIMEType: "application/pdf", Size: 128, Open: func(context.Context) (io.ReadCloser, error) {
+				openCount.Add(1)
+				return io.NopCloser(strings.NewReader("unused")), nil
+			}},
+			configure: func(cfg *config.Config) { cfg.Multimodal.MaxAttachmentBytes = 1 },
+			warning:   "too large",
+		},
+		{
+			name: "converter failure",
+			attachment: attachment.Attachment{Filename: "broken.pdf", MIMEType: "application/pdf", Size: 9, Open: func(context.Context) (io.ReadCloser, error) {
+				openCount.Add(1)
+				return io.NopCloser(strings.NewReader("%PDF-1.4\n")), nil
+			}},
+			configure: func(cfg *config.Config) {
+				cfg.Multimodal.Converters = []config.ConverterConfig{{Extensions: []string{"pdf"}, Command: "false {input} {output}"}}
+			},
+			warning: "conversion failed",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			openCount.Store(0)
+			firstRequest, releaseFirst := make(chan struct{}), make(chan struct{})
+			var releaseOnce sync.Once
+			release := func() { releaseOnce.Do(func() { close(releaseFirst) }) }
+			secondRequest := make(chan []json.RawMessage, 1)
+			var calls atomic.Int32
+			llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, _ := io.ReadAll(r.Body)
+				n := calls.Add(1)
+				if n == 1 {
+					close(firstRequest)
+					select {
+					case <-releaseFirst:
+					case <-r.Context().Done():
+						return
+					}
+				} else if n == 2 {
+					var req struct {
+						Messages []json.RawMessage `json:"messages"`
+					}
+					_ = json.Unmarshal(body, &req)
+					secondRequest <- req.Messages
+				}
+				w.Header().Set("Content-Type", "application/json")
+				if n == 1 {
+					_, _ = io.WriteString(w, `{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"read-1","type":"function","function":{"name":"file_read","arguments":"{\"path\":\"details.txt\"}"}}]},"finish_reason":"tool_calls"}]}`)
+				} else {
+					_, _ = io.WriteString(w, `{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"finish-1","type":"function","function":{"name":"finish_task","arguments":"{\"status\":\"success\",\"summary\":\"Done\"}"}}]},"finish_reason":"tool_calls"}]}`)
+				}
+			}))
+			defer func() {
+				release()
+				llmServer.Close()
+			}()
+			work := t.TempDir()
+			_ = os.WriteFile(filepath.Join(work, "details.txt"), []byte("detail"), 0o600)
+			cfg := config.DefaultConfig()
+			cfg.Workspace, cfg.WorkDir = work, work
+			cfg.Agent.Mode, cfg.Agent.Tools = config.AgentModeFull, []string{"file_read"}
+			cfg.Router.Enabled, cfg.MCP.Enabled = false, false
+			cfg.Notifications.Preset = config.ProgressPresetQuiet
+			tt.configure(cfg)
+			factory := &agent.AgentFactory{Config: cfg, LLMClient: llm.NewClient("test-key", llmServer.URL, "test-model", false, 0), UserInputMgr: tools.NewUserInputManager()}
+			ch := &runtimeTestChannel{}
+			runtime := newIMRuntime(factory, map[string]channel.Channel{config.ChannelMatrix: ch})
+			target := conversation.Target{ChannelType: config.ChannelMatrix, ChannelID: "warning-room", SenderID: "user-1", ThreadID: "thread-1"}
+			initialDone := make(chan string, 1)
+			go func() {
+				initialDone <- runtime.Handler(channel.IncomingMessage{Conversation: target, Text: "Read details"})
+			}()
+			select {
+			case <-firstRequest:
+			case <-time.After(5 * time.Second):
+				t.Fatal("initial model request did not start")
+			}
+			steeringDone := make(chan string, 1)
+			go func() {
+				steeringDone <- runtime.Handler(channel.IncomingMessage{Conversation: target, Text: "Use this file", Attachments: []attachment.Attachment{tt.attachment}})
+			}()
+			select {
+			case fallback := <-steeringDone:
+				if fallback != "" {
+					t.Fatalf("warning reply fallback = %q", fallback)
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatal("active steering waited for the run")
+			}
+			release()
+			var messages []json.RawMessage
+			select {
+			case messages = <-secondRequest:
+			case <-time.After(5 * time.Second):
+				t.Fatal("active run did not make follow-up model request")
+			}
+			select {
+			case <-initialDone:
+			case <-time.After(5 * time.Second):
+				t.Fatal("active run did not complete")
+			}
+			payload := marshalMessages(messages)
+			if !strings.Contains(payload, tt.warning) || !strings.Contains(payload, "Use this file") {
+				t.Fatalf("follow-up model request missing steering warning/text: %s", payload)
+			}
+			ch.mu.Lock()
+			gotWarning := false
+			for _, reply := range ch.replies {
+				gotWarning = gotWarning || strings.Contains(reply, tt.warning)
+			}
+			ch.mu.Unlock()
+			if !gotWarning {
+				t.Fatalf("Surface.Reply did not deliver warning %q", tt.warning)
+			}
+			if tt.name == "oversize" && openCount.Load() != 0 {
+				t.Fatalf("oversized attachment opened %d times, want no download", openCount.Load())
+			}
+			if tt.name == "converter failure" && openCount.Load() != 1 {
+				t.Fatalf("converter failure opened %d times, want exactly one download", openCount.Load())
+			}
+			ch.mu.Lock()
+			defer ch.mu.Unlock()
+			if len(ch.replyTargets) == 0 || ch.replyTargets[0].ChannelID != target.ChannelID || ch.replyTargets[0].ThreadID != target.ThreadID {
+				t.Fatalf("warning reply target = %#v, want original room/thread %#v", ch.replyTargets, target)
+			}
+		})
 	}
 }
 

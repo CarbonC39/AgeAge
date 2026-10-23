@@ -76,6 +76,14 @@ already executing finish normally. An atomic inbox check closes admission before
 run completion, and the session claim remains held through history persistence.
 Messages arriving after admission closes wait for release before starting a run.
 
+Consuming steering invalidates the cached execution plan. The next model decision
+uses a plan rebuilt from the Agent's registered tools rather than the old router
+subset, retaining configured tool restrictions. Updates received during routing
+also invalidate its selected workflow and prevent an automatic planner from
+starting work for the obsolete request. IM attachment warnings are replied to in
+the originating conversation for steering inputs as well as initial inputs and
+`ask_user` answers.
+
 The CLI accepts steering and `@path` attachments while a run is active, using
 the same inbox. Ctrl+C stops the active run; stdin EOF waits for it to finish
 and persist. Commands that modify session history are rejected during a run.

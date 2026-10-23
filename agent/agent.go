@@ -88,6 +88,8 @@ type Agent struct {
 	cancelMu      sync.Mutex
 	runAskUser    func(string, []string) // Original transport callback, before the event bridge wraps it.
 
+	steeringVersion uint64 // Incremented by the runner whenever steering enters history.
+
 	// Mode and Callbacks are set after construction by the factory or caller.
 	Mode      AgentMode
 	Callbacks AgentCallbacks
@@ -518,6 +520,7 @@ func (a *Agent) RunWithParts(ctx context.Context, userInput string, parts []llm.
 		return "", fmt.Errorf("agent already has an active run; submit input to its inbox")
 	}
 	defer a.runMu.Unlock()
+	a.steeringVersion = 0
 	a.inbox = nil
 	if !a.Mode.IsSubAgent {
 		a.inbox = runHandleFromContext(ctx)
@@ -595,6 +598,7 @@ func (a *Agent) runWithParts(ctx context.Context, userInput string, parts []llm.
 			}
 		}
 	}
+	explicitSkill := matchedSkill != nil
 
 	// Add user message. Use actualInput so the /skill-name prefix is stripped.
 	userMsg := llm.Message{Role: "user", Content: actualInput}
@@ -628,7 +632,7 @@ func (a *Agent) runWithParts(ctx context.Context, userInput string, parts []llm.
 	// the first-turn system prompt.
 	var routerResult *RouterResult
 
-	if a.router != nil && !a.Mode.IsSubAgent {
+	if a.router != nil && !a.Mode.IsSubAgent && a.steeringVersion == 0 {
 		if matchedSkill != nil {
 			tc := normalizeTier(matchedSkill.Tier)
 			if tc == "" {
@@ -669,13 +673,26 @@ func (a *Agent) runWithParts(ctx context.Context, userInput string, parts []llm.
 			}
 		}
 	}
+	// A route can finish after the user has changed the task. Consume those
+	// updates before any automatic planner or selected workflow can start.
+	refreshSetupPlan := func() bool {
+		a.consumeInbox(ctx)
+		if a.steeringVersion > 0 {
+			routerResult = nil
+			if !explicitSkill {
+				matchedSkill = nil
+			}
+		}
+		return a.steeringVersion > 0
+	}
+	refreshSetupPlan()
 
 	// --- Planner: create a skill only for explicitly recurring workflows with no match ---
 	if a.router != nil && !a.Mode.IsSubAgent && a.cfg.Planner.Enabled &&
 		routerResult != nil && routerResult.Tier == TierStrong &&
 		routerResult.Skill == "" && matchedSkill == nil &&
 		routerResult.Checks.IsRecurringWorkflow {
-		if factory, ok := a.deps.(*AgentFactory); ok {
+		if factory, ok := a.deps.(*AgentFactory); ok && !refreshSetupPlan() {
 			docsDir := filepath.Join(factory.Config.AgeAgeDirPath(), "docs")
 			planner := NewPlanner(factory, docsDir, factory.GetStandardToolNames())
 			if skill, err := planner.CreateSkill(ctx, actualInput, nil); err == nil && skill != nil {
@@ -709,6 +726,7 @@ func (a *Agent) runWithParts(ctx context.Context, userInput string, parts []llm.
 			}
 		}
 	}
+	refreshSetupPlan()
 
 	// --- Segmented skill state ---
 	// Track the active segmented skill and reset segment progress for this run.
@@ -745,7 +763,7 @@ func (a *Agent) runWithParts(ctx context.Context, userInput string, parts []llm.
 	}
 
 	// --- Pipeline skill handling ---
-	if matchedSkill != nil && matchedSkill.IsPipeline() {
+	if matchedSkill != nil && matchedSkill.IsPipeline() && a.steeringVersion == 0 {
 		result, nodeSummary, err := a.runPipelineSkill(ctx, matchedSkill, actualInput)
 		if errors.Is(err, errRunSteering) {
 			a.conv.Append(llm.Message{Role: "assistant", Content: "Pipeline paused for your update. " + nodeSummary + "\n" + err.Error()})
@@ -912,6 +930,7 @@ func (a *Agent) buildExecPlan(rr *RouterResult, skill *skills.Skill) (toolDefs [
 func (a *Agent) runLoop(ctx context.Context, streamCb llm.StreamCallback, toolDefs []llm.ToolDef, activeClient ChatClient, upgradeUsed bool) (string, error) {
 	fallbackUsed := false
 	textOnlyStreak := 0 // consecutive responses with no tool calls and no finish_task
+	var planVersion uint64
 
 	// Determine the finish tool name for hint messages.
 	hintFinishName := "finish_task"
@@ -926,6 +945,15 @@ func (a *Agent) runLoop(ctx context.Context, streamCb llm.StreamCallback, toolDe
 		a.consumeInbox(ctx)
 		if ctx.Err() != nil {
 			return "(Task stopped by user)", nil
+		}
+		if planVersion != a.steeringVersion {
+			// Steering invalidates routing hints, including the selected model.
+			// Rebuild from the tools actually registered for this Agent; registry
+			// configuration and sub-agent allowlists remain the permission boundary.
+			toolDefs, activeClient, upgradeUsed = a.buildExecPlan(nil, nil)
+			fallbackUsed = false
+			textOnlyStreak = 0
+			planVersion = a.steeringVersion
 		}
 
 		a.debugSeparator(i + 1)

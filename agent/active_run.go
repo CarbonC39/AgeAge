@@ -230,6 +230,7 @@ func (a *Agent) consumeInbox(ctx context.Context) int {
 		a.conv.Append(llm.Message{Role: "user", Content: value.Text, Parts: value.Parts})
 	}
 	if len(values) > 0 {
+		a.steeringVersion++
 		a.finishTool.Reset()
 		a.hintOnNextCall = "The user supplied updates during this run. Reconsider the remaining plan using the latest user messages before continuing. Tools with deferred results have not executed."
 	}

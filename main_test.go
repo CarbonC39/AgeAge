@@ -53,6 +53,13 @@ func TestBuildInitConfigProducesValidToml(t *testing.T) {
 	if cfg.Security.ForbidRM {
 		t.Fatal("init config forbid_rm should default to false")
 	}
+	perFile, perTurn := cfg.Multimodal.AttachmentLimits()
+	if perFile != 10*1024*1024 || perTurn != 40*1024*1024 {
+		t.Fatalf("init config attachment limits = (%d, %d)", perFile, perTurn)
+	}
+	if strings.Contains(content, "max_image_bytes") || !strings.Contains(content, "max_attachment_bytes") || !strings.Contains(content, "max_turn_attachment_bytes") {
+		t.Fatalf("init template attachment keys are stale:\n%s", content)
+	}
 	if !cfg.Router.Enabled || cfg.Router.ClassifierModel.Model != "gemini-flash" {
 		t.Fatalf("init config router = %#v", cfg.Router)
 	}

@@ -25,6 +25,67 @@ func TestDefaultConfigSafetyAndHistoryDefaults(t *testing.T) {
 	}
 }
 
+func TestAttachmentLimitsDefaultsAndDirectCompatibility(t *testing.T) {
+	cfg := DefaultConfig()
+	if cfg.Multimodal.MaxAttachmentBytes != 10*1024*1024 || cfg.Multimodal.MaxTurnAttachmentBytes != 40*1024*1024 || cfg.Multimodal.MaxImageBytes != 0 {
+		t.Fatalf("attachment defaults = %#v", cfg.Multimodal)
+	}
+	perFile, perTurn := cfg.Multimodal.AttachmentLimits()
+	if perFile != 10*1024*1024 || perTurn != 40*1024*1024 {
+		t.Fatalf("effective attachment defaults = (%d, %d)", perFile, perTurn)
+	}
+	legacyDirect := MultimodalConfig{MaxImageBytes: 6 * 1024 * 1024}
+	perFile, perTurn = legacyDirect.AttachmentLimits()
+	if perFile != 6*1024*1024 || perTurn != 40*1024*1024 {
+		t.Fatalf("direct legacy compatibility limits = (%d, %d)", perFile, perTurn)
+	}
+}
+
+func TestLoadConfigAttachmentLimitsLegacyAndNewPrecedence(t *testing.T) {
+	load := func(t *testing.T, content string) *Config {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "config.toml")
+		if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := LoadConfig(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return cfg
+	}
+
+	legacy := load(t, "[multimodal]\nmax_image_bytes = 6291456\n")
+	perFile, perTurn := legacy.Multimodal.AttachmentLimits()
+	if perFile != 6*1024*1024 || perTurn != 40*1024*1024 {
+		t.Fatalf("legacy config limits = (%d, %d)", perFile, perTurn)
+	}
+
+	newConfig := load(t, "[multimodal]\nmax_image_bytes = 6291456\nmax_attachment_bytes = 8388608\nmax_turn_attachment_bytes = 50331648\n")
+	perFile, perTurn = newConfig.Multimodal.AttachmentLimits()
+	if perFile != 8*1024*1024 || perTurn != 48*1024*1024 {
+		t.Fatalf("new config limits = (%d, %d)", perFile, perTurn)
+	}
+
+	// An explicitly configured zero means default; it still takes precedence
+	// over an older key in the same file.
+	zeroOverride := load(t, "[multimodal]\nmax_image_bytes = 6291456\nmax_attachment_bytes = 0\n")
+	perFile, perTurn = zeroOverride.Multimodal.AttachmentLimits()
+	if perFile != 10*1024*1024 || perTurn != 40*1024*1024 {
+		t.Fatalf("zero new key did not override legacy value: (%d, %d)", perFile, perTurn)
+	}
+}
+
+func TestAttachmentLimitsPerFileAndTurnAreIndependent(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Multimodal.MaxAttachmentBytes = 6 * 1024 * 1024
+	cfg.Multimodal.MaxTurnAttachmentBytes = 40 * 1024 * 1024
+	perFile, perTurn := cfg.Multimodal.AttachmentLimits()
+	if perFile != 6*1024*1024 || perTurn != 40*1024*1024 {
+		t.Fatalf("independent limits = (%d, %d)", perFile, perTurn)
+	}
+}
+
 func TestLoadConfigMergesDefaultsAndResolvesWorkspace(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.toml")

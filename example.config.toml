@@ -167,7 +167,8 @@ allowed_domains = []          # optional host/domain allowlist; empty permits pu
 # ── Multimodal attachments ───────────────────────────────────────────────────
 [multimodal]
 vision          = true        # false if your model does not support images
-max_image_bytes = 10485760    # 10 MB per file and per turn (CLI and IM attachments)
+max_attachment_bytes = 10485760      # 10 MiB maximum size per file
+max_turn_attachment_bytes = 41943040 # 40 MiB total successfully downloaded per turn
 
 # [[multimodal.converters]]
 # extensions = ["pdf"]

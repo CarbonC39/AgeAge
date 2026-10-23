@@ -485,7 +485,8 @@ Controls file attachment processing for both the CLI (`@path` syntax) and the HT
 ```toml
 [multimodal]
 vision         = true
-max_image_bytes = 10485760   # 10 MB
+max_attachment_bytes = 10485760      # 10 MiB per file
+max_turn_attachment_bytes = 41943040 # 40 MiB total per turn
 
 # Converters turn non-image files into plain text before sending to the LLM.
 # {input} is replaced with the source file path; {output} with a managed .md tmp path.
@@ -498,10 +499,18 @@ extensions = ["docx", "odt"]
 command    = "libreoffice --headless --convert-to txt:Text {input} --outdir {output}"
 ```
 
-| Key               | Type   | Default    | Description |
-|-------------------|--------|------------|-------------|
-| `vision`          | bool   | `true`     | When `true`, images are base64-encoded and sent as `image_url` content parts directly to the LLM. When `false`, image parts are stripped and a placeholder is inserted; converters may still be used for image formats if configured. |
-| `max_image_bytes` | int    | `10485760` | Maximum file size for image attachments in bytes (default 10 MB). Attachments exceeding this limit are rejected with an error. |
+| Key                        | Type | Default      | Description |
+|----------------------------|------|--------------|-------------|
+| `vision`                   | bool | `true`       | When `true`, verified images are base64-encoded and sent as `image_url` content parts directly to the LLM. When `false`, configured converters may extract text from image formats. |
+| `max_attachment_bytes`     | int  | `10485760`   | Maximum size of each incoming file in bytes (default 10 MiB). |
+| `max_turn_attachment_bytes`| int  | `41943040`   | Maximum total successfully downloaded attachment bytes in one turn (default 40 MiB). |
+| `max_image_bytes`          | int  | deprecated   | Deprecated alias for `max_attachment_bytes`, retained for old config files. It is used only when `max_attachment_bytes` is not specified. |
+
+The per-file and per-turn limits are independent. With defaults, two 6 MiB
+documents can be attached in the same turn. Values that are unset or nonpositive
+use the defaults. Existing configs that set only `max_image_bytes` keep that
+value as the per-file limit; when both old and new per-file keys are present,
+`max_attachment_bytes` takes precedence.
 
 ### `[[multimodal.converters]]`
 

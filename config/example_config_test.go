@@ -33,6 +33,10 @@ func TestExampleConfigParses(t *testing.T) {
 	if cfg.Security.ForbidRM {
 		t.Fatalf("example forbid_rm should default to false: %#v", cfg.Security)
 	}
+	perFile, perTurn := cfg.Multimodal.AttachmentLimits()
+	if perFile != 10*1024*1024 || perTurn != 40*1024*1024 {
+		t.Fatalf("example attachment limits = (%d, %d)", perFile, perTurn)
+	}
 	// workspace "./workspace" resolves relative to the repo root.
 	want, err := filepath.Abs(filepath.Join("..", "workspace"))
 	if err != nil {

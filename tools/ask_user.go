@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
+
+	"ageage/input"
 )
 
 // AskUserTool pauses pipeline/agent execution and asks the user a question.
@@ -78,7 +81,7 @@ func (t *AskUserTool) Execute(ctx context.Context, args json.RawMessage) (string
 	if scope.ChannelID == "" {
 		scope = LegacyInteractionScope(t.ChannelID)
 	}
-	requestID, respCh := t.Manager.RequestInputScoped(scope)
+	requestID, respCh := t.Manager.RequestUserInputScoped(scope)
 
 	// Send the question to the user.
 	notifyFn := t.resolveNotifyFunc()
@@ -103,11 +106,40 @@ func (t *AskUserTool) Execute(ctx context.Context, args json.RawMessage) (string
 		if !ok {
 			return "", fmt.Errorf("user input cancelled")
 		}
-		return answer, nil
+		if len(answer.Parts) > 0 {
+			handler := userInputHandlerFromContext(ctx)
+			if handler == nil {
+				return "", fmt.Errorf("ask_user: typed attachments received without an input handler")
+			}
+			handler(answer)
+		}
+		return summarizeUserInput(answer), nil
 	case <-ctx.Done():
 		t.Manager.CancelByID(requestID, scope) // clean up this request only
 		return "", fmt.Errorf("user input cancelled: %w", ctx.Err())
 	}
+}
+
+func summarizeUserInput(answer input.UserInput) string {
+	if answer.Text != "" {
+		return answer.Text
+	}
+	var text []string
+	images := 0
+	for _, part := range answer.Parts {
+		switch part.Type {
+		case "text":
+			if part.Text != "" {
+				text = append(text, part.Text)
+			}
+		case "image_url":
+			images++
+		}
+	}
+	if images > 0 {
+		text = append(text, fmt.Sprintf("[User attached %d image(s)]", images))
+	}
+	return strings.Join(text, "\n")
 }
 
 func (t *AskUserTool) resolveNotifyFunc() func(string, []string) {

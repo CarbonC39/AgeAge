@@ -426,7 +426,7 @@ func buildInitConfig(
 
 	p("[multimodal]\n")
 	p("vision          = true        # false if your model does not support images\n")
-	p("max_image_bytes = 10485760    # 10 MB\n")
+	p("max_attachment_bytes = 10485760      # 10 MiB maximum size per file\nmax_turn_attachment_bytes = 41943040 # 40 MiB total per turn\n")
 	p("# [[multimodal.converters]]\n")
 	p("# extensions = [\"pdf\"]\n")
 	p("# command    = \"pdftotext {input} {output}\"\n\n")
@@ -994,11 +994,12 @@ func startChannels(factory *agent.AgentFactory) (*channel.Manager, int, func(too
 	}
 
 	// respond is a helper that sends a reply via msg.Respond (if set) or returns
-	// the text for the channel to send. It always returns "" when Respond is used.
+	// the text for the channel to send. Failed sends retain the fallback text.
 	respond := func(msg channel.IncomingMessage, text string) string {
 		if msg.Respond != nil {
-			_ = msg.Respond(text)
-			return ""
+			if err := msg.Respond(text); err == nil {
+				return ""
+			}
 		}
 		return text
 	}
@@ -1008,7 +1009,7 @@ func startChannels(factory *agent.AgentFactory) (*channel.Manager, int, func(too
 		textLow := strings.ToLower(text)
 		cmd := parseIMCommand(msg.ChannelType, text)
 		// Media captions are part of a user turn, even when they happen to
-		// resemble administrative commands or answers to a pending question.
+		// resemble administrative commands or confirmation replies.
 		if len(msg.Attachments) > 0 {
 			cmd = imCommand{}
 		}
@@ -1030,21 +1031,32 @@ func startChannels(factory *agent.AgentFactory) (*channel.Manager, int, func(too
 			ChannelID:   msg.ChannelID,
 		}, confirmationAllowlist...)
 
-		// In group chats, only respond when the bot is @mentioned or replied to.
-		// Confirmation replies and recognized channel commands are directed at the
-		// bot by definition; unknown prefixed text still requires a mention.
-		if msg.IsGroupChat && !msg.BotMentioned {
-			if !isConfirmationResponse && !isRecognizedIMCommand(cmd, factory.GetSkills()) {
-				return ""
-			}
-		}
-
 		// rKey is always the room-level key ("type:channelID"), used for session prefix.
 		// chatKey additionally encodes the thread when msg.ThreadID is set.
 		rKey := msg.ChannelType + ":" + msg.ChannelID
 		chatKey := rKey
 		if msg.ThreadID != "" {
 			chatKey += ":t:" + msg.ThreadID
+		}
+
+		agentMu.Lock()
+		waitingSession := activeSessions[chatKey]
+		agentMu.Unlock()
+		waitingScope := tools.InteractionScope{
+			ChannelType: msg.ChannelType, ChannelID: msg.ChannelID,
+			ThreadID: msg.ThreadID, SessionID: waitingSession, SenderID: msg.SenderID,
+		}
+		// A scoped ask_user question is already directed at its owner. Their
+		// screenshot answer needs no extra mention, including in Matrix rooms.
+		isPendingAnswer := factory.UserInputMgr.HasPendingScope(waitingScope)
+
+		// In group chats, only respond when the bot is @mentioned or replied to.
+		// Confirmation replies and recognized channel commands are directed at the
+		// bot by definition; unknown prefixed text still requires a mention.
+		if msg.IsGroupChat && !msg.BotMentioned && !isPendingAnswer {
+			if !isConfirmationResponse && !isRecognizedIMCommand(cmd, factory.GetSkills()) {
+				return ""
+			}
 		}
 
 		// Confirmation responses bypass the per-chat mutex.
@@ -1113,11 +1125,16 @@ func startChannels(factory *agent.AgentFactory) (*channel.Manager, int, func(too
 			SessionID:   pendingSession,
 			SenderID:    msg.SenderID,
 		}
-		if len(msg.Attachments) == 0 && len(factory.UserInputMgr.GetPendingForScope(scope)) > 0 {
-			if !factory.UserInputMgr.RespondForScope(scope, text) {
-				return respond(msg, "❌ User input could not be matched uniquely or you are not authorised.")
+		if len(factory.UserInputMgr.GetPendingForScope(scope)) > 0 {
+			agentMu.Lock()
+			waitingAgent := agents[pendingSession]
+			agentMu.Unlock()
+			var tmp *agent.TmpManager
+			if waitingAgent != nil {
+				tmp = waitingAgent.TmpManager()
 			}
-			return respond(msg, "✅ Got it.")
+			_, reply := answerPendingIMInput(context.Background(), msg, scope, factory.UserInputMgr, factory.Config, tmp)
+			return respond(msg, reply)
 		}
 
 		// Send read receipt promptly (before acquiring the per-chat mutex).
@@ -1414,10 +1431,8 @@ func startChannels(factory *agent.AgentFactory) (*channel.Manager, int, func(too
 			input = normalizeIMInput(context.Background(), msg, factory.Config, ag.TmpManager())
 		}
 		warningReply := imInputWarnings(input)
-		if warningReply != "" && msg.Respond != nil {
-			if err := msg.Respond(warningReply); err == nil {
-				warningReply = ""
-			}
+		if warningReply != "" {
+			warningReply = respond(msg, warningReply)
 		}
 		var result string
 		var err error
@@ -2440,7 +2455,11 @@ func runCLI(cmd *cobra.Command, args []string) error {
 					ui.printWarn("Stop signal sent.")
 				} else if len(factory.UserInputMgr.GetPendingForScope(ag.GetInteractionScope())) > 0 {
 					// A pipeline node is waiting for user input — deliver the answer.
-					factory.UserInputMgr.RespondForScope(ag.GetInteractionScope(), trimmed)
+					text, parts, warnings := agent.ParseCLIInput(trimmed, factory.Config, ag.TmpManager())
+					for _, warning := range warnings {
+						ui.printWarn(warning)
+					}
+					factory.UserInputMgr.RespondInputForScope(ag.GetInteractionScope(), agent.UserInput{Text: text, Parts: parts, Warnings: warnings})
 				}
 			}
 		}

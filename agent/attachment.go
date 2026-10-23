@@ -15,6 +15,7 @@ import (
 
 	"ageage/attachment"
 	"ageage/config"
+	"ageage/input"
 	"ageage/llm"
 )
 
@@ -28,11 +29,7 @@ const (
 // It contains no open readers or download callbacks and can later be queued in
 // a RunHandle inbox. Warnings are also included as text parts for model context.
 // Referenced files belong to the session's TmpManager until history releases them.
-type UserInput struct {
-	Text     string
-	Parts    []llm.ContentPart
-	Warnings []string
-}
+type UserInput = input.UserInput
 
 // RunInput submits a previously normalized turn. Normalization can be performed
 // before choosing whether to start a run or enqueue input into an active run.
@@ -41,8 +38,8 @@ func (a *Agent) RunInput(ctx context.Context, input UserInput, cb llm.StreamCall
 }
 
 // NormalizeUserInput owns the common incoming attachment pipeline for CLI and IM.
-// Each attachment fails independently. The existing max_image_bytes setting caps
-// every input file and the total successfully staged bytes in a turn.
+// Each attachment fails independently. Single-file limits and the total
+// successfully staged bytes in a turn have separate configuration settings.
 func NormalizeUserInput(ctx context.Context, text string, attachments []attachment.Attachment, cfg *config.Config, tmpMgr *TmpManager) UserInput {
 	input := UserInput{Text: text}
 	if len(attachments) == 0 {
@@ -51,13 +48,13 @@ func NormalizeUserInput(ctx context.Context, text string, attachments []attachme
 	if cfg == nil {
 		cfg = config.DefaultConfig()
 	}
-	limit := cfg.Multimodal.MaxImageBytes
-	if limit <= 0 {
-		limit = defaultAttachmentBytes
-	}
+	limit, turnLimit := cfg.Multimodal.AttachmentLimits()
 	// Keep limit+1 representable even for a manually constructed configuration.
 	if limit == int64(^uint64(0)>>1) {
 		limit--
+	}
+	if turnLimit == int64(^uint64(0)>>1) {
+		turnLimit--
 	}
 	retainPaths := tmpMgr != nil
 	if tmpMgr == nil {
@@ -74,7 +71,7 @@ func NormalizeUserInput(ctx context.Context, text string, attachments []attachme
 	if text != "" {
 		input.Parts = append(input.Parts, llm.ContentPart{Type: "text", Text: text})
 	}
-	remaining := limit
+	remaining := turnLimit
 	for i, att := range attachments {
 		if i >= maxIncomingAttachments {
 			warning := fmt.Sprintf("attachments: only the first %d files per message can be processed", maxIncomingAttachments)
@@ -83,7 +80,16 @@ func NormalizeUserInput(ctx context.Context, text string, attachments []attachme
 			break
 		}
 		att.Filename = sanitizeAttachmentName(att.Filename)
-		parts, warnings, size := normalizeAttachment(ctx, att, cfg, tmpMgr, remaining, retainPaths)
+		effectiveLimit, limitName := limit, "single-file attachment limit"
+		if remaining < limit {
+			effectiveLimit, limitName = remaining, "remaining turn attachment budget"
+		}
+		parts, warnings, size := normalizeAttachment(ctx, att, cfg, tmpMgr, effectiveLimit, retainPaths)
+		for index := range warnings {
+			if strings.HasPrefix(warnings[index], "too large:") {
+				warnings[index] += fmt.Sprintf(" (%s: %d bytes)", limitName, effectiveLimit)
+			}
+		}
 		remaining -= size
 		input.Parts = append(input.Parts, parts...)
 		for _, warning := range warnings {
@@ -143,7 +149,7 @@ func normalizeAttachment(ctx context.Context, att attachment.Attachment, cfg *co
 		return nil, []string{"invalid negative file size"}, 0
 	}
 	if att.Size > limit || limit <= 0 {
-		return nil, []string{fmt.Sprintf("too large: %d bytes; remaining attachment limit %d bytes", att.Size, limit)}, 0
+		return nil, []string{fmt.Sprintf("too large: reported size %d bytes exceeds the allowed size", att.Size)}, 0
 	}
 	if att.Open == nil {
 		return nil, []string{"download unavailable"}, 0
@@ -178,7 +184,7 @@ func normalizeAttachment(ctx context.Context, att attachment.Attachment, cfg *co
 	n, copyErr := io.Copy(f, &io.LimitedReader{R: &attachmentContextReader{ctx: ctx, r: body}, N: limit + 1})
 	closeErr := f.Close()
 	if n > limit {
-		return nil, []string{fmt.Sprintf("too large: download exceeds %d byte attachment limit", limit)}, 0
+		return nil, []string{"too large: download exceeds the allowed size"}, 0
 	}
 	if copyErr != nil || closeErr != nil {
 		return nil, []string{"failed to read or stage attachment"}, 0

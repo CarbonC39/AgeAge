@@ -308,8 +308,27 @@ func (r *Router) filterHistoryForRouter(history []llm.Message) []llm.Message {
 	for i := len(history) - 1; i >= 0 && len(filtered) < maxHistoryForRouter; i-- {
 		msg := history[i]
 		if msg.Role == "user" || msg.Role == "assistant" {
-			if msg.TextContent() != "" {
-				filtered = append([]llm.Message{msg}, filtered...)
+			text := msg.TextContent()
+			imageCount := 0
+			for _, part := range msg.Parts {
+				if part.Type == "image_url" {
+					imageCount++
+				}
+			}
+			if imageCount > 0 {
+				label := fmt.Sprintf("[User attached %d image(s)]", imageCount)
+				if msg.Role == "assistant" {
+					label = fmt.Sprintf("[Assistant included %d image(s)]", imageCount)
+				}
+				if text != "" {
+					text += "\n"
+				}
+				text += label
+			}
+			if text != "" {
+				// Router classifiers may be text-only. Project history into fresh
+				// text messages so image URLs/base64 and original parts never leak.
+				filtered = append([]llm.Message{{Role: msg.Role, Content: text}}, filtered...)
 			}
 		}
 	}

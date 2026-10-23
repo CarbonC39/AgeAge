@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -22,7 +23,6 @@ type boundedConverterWriter struct {
 	data     bytes.Buffer
 	limit    int
 	overflow bool
-	cancel   context.CancelFunc
 }
 
 func (w *boundedConverterWriter) Write(p []byte) (int, error) {
@@ -33,9 +33,6 @@ func (w *boundedConverterWriter) Write(p []byte) (int, error) {
 	if len(p) > available {
 		p = p[:available]
 		w.overflow = true
-		if w.cancel != nil {
-			w.cancel()
-		}
 	}
 	_, _ = w.data.Write(p)
 	return n, nil
@@ -47,7 +44,8 @@ func (w *boundedConverterWriter) snapshot() ([]byte, bool) {
 }
 
 // runConverterContext accepts only a staged input bounded by the incoming
-// pipeline. Output is limited at the child file, stdout, and read boundaries.
+// pipeline. In-memory output is bounded; large output is truncated after the
+// converter finishes, allowing it to complete its own file writes normally.
 func runConverterContext(parent context.Context, inputPath string, conv *config.ConverterConfig, mgr *TmpManager) (text, path string, truncated bool, err error) {
 	if mgr == nil {
 		return "", "", false, fmt.Errorf("converter requires temporary storage")
@@ -75,39 +73,14 @@ func runConverterContext(parent context.Context, inputPath string, conv *config.
 	}
 	ctx, cancel := context.WithTimeout(parent, 60*time.Second)
 	defer cancel()
-	cmd := limitedConverterCommand(ctx, tokens)
+	cmd := exec.CommandContext(ctx, tokens[0], tokens[1:]...)
 	// A child which inherits output pipes must not hold Wait forever.
 	cmd.WaitDelay = time.Second
-	stdout := &boundedConverterWriter{limit: maxAttachmentTextBytes, cancel: cancel}
+	stdout := &boundedConverterWriter{limit: maxAttachmentTextBytes + 1}
 	stderr := &boundedConverterWriter{limit: 8 * 1024}
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
-	// Also watch file output on platforms without POSIX file-size limits.
-	// Cancellation terminates the converter; the output read is bounded below
-	// regardless of how much the child managed to write between checks.
-	monitorDone := make(chan struct{})
-	monitorStopped := make(chan struct{})
-	go func() {
-		defer close(monitorStopped)
-		ticker := time.NewTicker(10 * time.Millisecond)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-monitorDone:
-				return
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				if info, err := os.Lstat(path); err == nil && (info.Size() > 2*maxAttachmentTextBytes || !info.Mode().IsRegular()) {
-					cancel()
-					return
-				}
-			}
-		}
-	}()
 	runErr := cmd.Run()
-	close(monitorDone)
-	<-monitorStopped
 	out, outTruncated := stdout.snapshot()
 	// Reading a converter-created file is bounded independently of the process
 	// limit. Reject symlinks or non-regular output instead of following them.
@@ -124,14 +97,16 @@ func runConverterContext(parent context.Context, inputPath string, conv *config.
 	if readErr != nil {
 		return "", path, false, fmt.Errorf("cannot read converter output")
 	}
-	truncated = len(content) > maxAttachmentTextBytes || outTruncated
+	usedStdout := false
 	if len(bytes.TrimSpace(content)) == 0 {
 		content = out
+		usedStdout = true
 	}
+	truncated = len(content) > maxAttachmentTextBytes || (usedStdout && outTruncated)
 	if err := parent.Err(); err != nil {
 		return "", path, false, err
 	}
-	if runErr != nil && !outTruncated {
+	if runErr != nil {
 		return "", path, false, fmt.Errorf("converter failed: %w", runErr)
 	}
 	if len(bytes.TrimSpace(content)) == 0 {

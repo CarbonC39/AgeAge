@@ -234,9 +234,35 @@ type ConverterConfig struct {
 
 // MultimodalConfig holds settings for file attachment processing.
 type MultimodalConfig struct {
-	Vision        bool              `toml:"vision"`          // true = LLM accepts image parts; false = extract text instead
-	MaxImageBytes int64             `toml:"max_image_bytes"` // per-file and per-turn incoming attachment bytes (default 10 MB)
-	Converters    []ConverterConfig `toml:"converters"`      // converters for non-image document formats
+	Vision                 bool              `toml:"vision"`                    // true = LLM accepts image parts; false = extract text instead
+	MaxAttachmentBytes     int64             `toml:"max_attachment_bytes"`      // per-file incoming attachment limit
+	MaxTurnAttachmentBytes int64             `toml:"max_turn_attachment_bytes"` // total incoming attachment limit per turn
+	MaxImageBytes          int64             `toml:"max_image_bytes"`           // deprecated alias for max_attachment_bytes
+	Converters             []ConverterConfig `toml:"converters"`                // converters for non-image document formats
+}
+
+const (
+	defaultMaxAttachmentBytes     int64 = 10 * 1024 * 1024
+	defaultMaxTurnAttachmentBytes int64 = 40 * 1024 * 1024
+)
+
+// AttachmentLimits returns effective per-file and per-turn attachment limits.
+// MaxImageBytes remains a fallback for callers constructing old configs
+// directly; loaded configs normalize the deprecated TOML key in LoadConfig.
+func (m MultimodalConfig) AttachmentLimits() (perFile, perTurn int64) {
+	perFile = m.MaxAttachmentBytes
+	if perFile <= 0 {
+		if m.MaxImageBytes > 0 {
+			perFile = m.MaxImageBytes
+		} else {
+			perFile = defaultMaxAttachmentBytes
+		}
+	}
+	perTurn = m.MaxTurnAttachmentBytes
+	if perTurn <= 0 {
+		perTurn = defaultMaxTurnAttachmentBytes
+	}
+	return perFile, perTurn
 }
 
 // FindConverter returns the first ConverterConfig that handles the given extension (without dot, lowercase).
@@ -398,9 +424,10 @@ func DefaultConfig() *Config {
 			Timeout:     30,
 		},
 		Multimodal: MultimodalConfig{
-			Vision:        true,
-			MaxImageBytes: 10 * 1024 * 1024, // 10 MB
-			Converters:    []ConverterConfig{},
+			Vision:                 true,
+			MaxAttachmentBytes:     defaultMaxAttachmentBytes,
+			MaxTurnAttachmentBytes: defaultMaxTurnAttachmentBytes,
+			Converters:             []ConverterConfig{},
 		},
 		Server: ServerConfig{
 			Host:          "127.0.0.1",
@@ -423,8 +450,19 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("failed to read config file %s: %w", path, err)
 	}
 
-	if err := toml.Unmarshal(data, cfg); err != nil {
+	meta, err := toml.Decode(string(data), cfg)
+	if err != nil {
 		return nil, fmt.Errorf("failed to parse config file %s: %w", path, err)
+	}
+	newPerFileDefined := meta.IsDefined("multimodal", "max_attachment_bytes")
+	legacyDefined := meta.IsDefined("multimodal", "max_image_bytes")
+	if newPerFileDefined {
+		// The explicit new setting takes precedence, including when it is zero
+		// (which means use the default); prevent the compatibility fallback from
+		// reviving a legacy value in the same file.
+		cfg.Multimodal.MaxImageBytes = 0
+	} else if legacyDefined {
+		cfg.Multimodal.MaxAttachmentBytes = cfg.Multimodal.MaxImageBytes
 	}
 
 	// configDir = directory containing config.toml.

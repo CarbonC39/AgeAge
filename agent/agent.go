@@ -790,6 +790,7 @@ func (a *Agent) runLoop(ctx context.Context, streamCb llm.StreamCallback, toolDe
 		type toolExecResult struct {
 			result  string
 			execErr error
+			inputs  []UserInput
 		}
 		inflightResults := make(map[int]chan toolExecResult)
 
@@ -800,7 +801,7 @@ func (a *Agent) runLoop(ctx context.Context, streamCb llm.StreamCallback, toolDe
 		sem := make(chan struct{}, maxPar)
 
 		// dispatchTool executes a single tool call.
-		dispatchTool := func(tc llm.ToolCall) (string, error) {
+		dispatchTool := func(tc llm.ToolCall) toolExecResult {
 			var rawArgs json.RawMessage
 			if err2 := jsonutil.ParseToolArgs(tc.Function.Arguments, &rawArgs); err2 != nil {
 				rawArgs = json.RawMessage(tc.Function.Arguments)
@@ -808,7 +809,11 @@ func (a *Agent) runLoop(ctx context.Context, streamCb llm.StreamCallback, toolDe
 
 			a.debugLog("Tool▷", "%s  %s", tc.Function.Name, briefActionSummary(tc.Function.Name, tc.Function.Arguments))
 			dispatcher := NewToolDispatcher(a.registry, a.CredMgr)
-			res, execErr := dispatcher.Execute(ctx, tc.Function.Name, rawArgs, ToolDispatchHooks{
+			var replies []UserInput
+			execCtx := tools.WithUserInputHandler(ctx, func(reply UserInput) {
+				replies = append(replies, reply)
+			})
+			res, execErr := dispatcher.Execute(execCtx, tc.Function.Name, rawArgs, ToolDispatchHooks{
 				Start: a.Callbacks.ToolStart,
 				End:   a.Callbacks.ToolEnd,
 			})
@@ -817,7 +822,7 @@ func (a *Agent) runLoop(ctx context.Context, streamCb llm.StreamCallback, toolDe
 			}
 			a.debugLog("Tool◁", "%s  %s", tc.Function.Name, truncateStr(res, 600))
 			a.debugBlankLine()
-			return res, execErr
+			return toolExecResult{result: res, execErr: execErr, inputs: replies}
 		}
 
 		// For streaming calls, start read-only tools progressively.
@@ -832,8 +837,7 @@ func (a *Agent) runLoop(ctx context.Context, streamCb llm.StreamCallback, toolDe
 				go func() {
 					sem <- struct{}{}
 					defer func() { <-sem }()
-					res, execErr := dispatchTool(call)
-					ch <- toolExecResult{res, execErr}
+					ch <- dispatchTool(call)
 				}()
 			}
 		}
@@ -959,16 +963,15 @@ func (a *Agent) runLoop(ctx context.Context, streamCb llm.StreamCallback, toolDe
 				go func() {
 					sem <- struct{}{}
 					defer func() { <-sem }()
-					res, execErr := dispatchTool(tc)
-					ch <- toolExecResult{res, execErr}
+					ch <- dispatchTool(tc)
 				}()
 			} else {
-				res, execErr := dispatchTool(tc)
-				ch <- toolExecResult{res, execErr}
+				ch <- dispatchTool(tc)
 			}
 		}
 
 		var currentTurnResults []string
+		var userReplies []UserInput
 		anyToolError := false
 		for idx, tc := range cleanedMsg.ToolCalls {
 			res := <-inflightResults[idx]
@@ -993,6 +996,14 @@ func (a *Agent) runLoop(ctx context.Context, streamCb llm.StreamCallback, toolDe
 				ToolCallID: toolCallID,
 			})
 			currentTurnResults = append(currentTurnResults, toolResult)
+			if res.execErr == nil {
+				userReplies = append(userReplies, res.inputs...)
+			}
+		}
+		// Resolve every tool call before adding user answers. Providers require
+		// tool responses to remain adjacent to the originating assistant batch.
+		for _, reply := range userReplies {
+			a.conv.Append(llm.Message{Role: "user", Content: reply.Text, Parts: reply.Parts})
 		}
 
 		if anyToolError && !a.Mode.IsSubAgent {

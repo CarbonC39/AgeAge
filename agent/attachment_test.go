@@ -6,7 +6,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -192,7 +191,7 @@ func partTextLen(parts []llm.ContentPart) int {
 
 func TestNormalizeUserInputUnsupportedMetadataAndReadLimit(t *testing.T) {
 	cfg := config.DefaultConfig()
-	cfg.Multimodal.MaxImageBytes = 4
+	cfg.Multimodal.MaxAttachmentBytes = 4
 	opened := false
 	unsupported := attachment.Attachment{Filename: "voice.ogg", MIMEType: "audio/ogg", UnsupportedReason: "encrypted", Open: func(context.Context) (io.ReadCloser, error) {
 		opened = true
@@ -228,7 +227,8 @@ func TestNormalizeUserInputUnsupportedMetadataAndReadLimit(t *testing.T) {
 
 func TestNormalizeUserInputTotalBudgetAndOverrunDoesNotBlockLaterFile(t *testing.T) {
 	cfg := config.DefaultConfig()
-	cfg.Multimodal.MaxImageBytes = 5
+	cfg.Multimodal.MaxAttachmentBytes = 5
+	cfg.Multimodal.MaxTurnAttachmentBytes = 5
 	cfg.Multimodal.Vision = false
 	var opens []string
 	makeAtt := func(name, content string) attachment.Attachment {
@@ -421,13 +421,13 @@ func TestNormalizeUserInputCapsConverterOutputAndContinues(t *testing.T) {
 		t.Fatalf("converter output was not capped: %d bytes", partTextLen(in.Parts))
 	}
 
-	if runtime.GOOS == "windows" {
-		t.Skip("POSIX child file limit is unavailable on Windows")
-	}
 	cfg.Multimodal.Converters[0].Command = os.Args[0] + " -test.run=TestAttachmentConverterHugeFileHelper -- {output}"
 	in = NormalizeUserInput(context.Background(), "", attachments, cfg, newTmpManager(t.TempDir()))
-	if len(in.Warnings) == 0 {
-		t.Fatal("oversized converter file should warn")
+	if !strings.Contains(strings.Join(in.Warnings, " "), "truncated at 512 KiB") {
+		t.Fatalf("large converter output should be truncated: %v", in.Warnings)
+	}
+	if !strings.Contains(strings.Join(texts(in.Parts), " "), "converted to text") {
+		t.Fatal("large output should finish conversion before truncation")
 	}
 	if !strings.Contains(strings.Join(texts(in.Parts), " "), "later-file-survived") {
 		t.Fatalf("later file was not processed after oversized converter file: %#v", in.Parts)

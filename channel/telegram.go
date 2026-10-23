@@ -11,9 +11,11 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"ageage/attachment"
 	"ageage/config"
+	"ageage/conversation"
 )
 
 // TelegramChannel connects to Telegram via Bot API (long polling).
@@ -183,7 +185,9 @@ func (t *TelegramChannel) parseIncoming(message *tgMessage) (IncomingMessage, bo
 	if message.MessageThreadID != 0 {
 		threadID = fmt.Sprintf("%d", message.MessageThreadID)
 	}
-	out := IncomingMessage{ChannelType: config.ChannelTelegram, ChannelID: fmt.Sprintf("%d", message.Chat.ID), SenderID: senderID, SenderName: message.From.FirstName, Text: text, Attachments: attachments, ReplyTo: fmt.Sprintf("%d", message.MessageID), ThreadID: threadID, IsGroupChat: isGroup, BotMentioned: botMentioned}
+	channelID, replyTo := fmt.Sprintf("%d", message.Chat.ID), fmt.Sprintf("%d", message.MessageID)
+	target := conversation.Target{ChannelType: config.ChannelTelegram, ChannelID: channelID, ThreadID: threadID, ReplyTo: replyTo, SenderID: senderID, SenderName: message.From.FirstName}
+	out := IncomingMessage{ChannelType: config.ChannelTelegram, ChannelID: channelID, SenderID: senderID, SenderName: message.From.FirstName, Text: text, Attachments: attachments, ReplyTo: replyTo, ThreadID: threadID, Conversation: target, IsGroupChat: isGroup, BotMentioned: botMentioned}
 	chatID, msgID, topicID := out.ChannelID, message.MessageID, message.MessageThreadID
 	out.Respond = func(replyText string) error { return t.sendInTopic(chatID, topicID, msgID, replyText) }
 	return out, true
@@ -356,6 +360,36 @@ func (t *TelegramChannel) Reply(chatID, replyToID, text string) error {
 	var replyTo int
 	fmt.Sscanf(replyToID, "%d", &replyTo)
 	return t.sendInTopic(chatID, 0, replyTo, text)
+}
+
+func (t *TelegramChannel) DeliveryID(target conversation.Target) string { return target.ChannelID }
+
+func (t *TelegramChannel) ReplyMessage(target conversation.Target, text string) (string, error) {
+	var replyTo, topic int
+	fmt.Sscanf(target.ReplyTo, "%d", &replyTo)
+	fmt.Sscanf(target.ThreadID, "%d", &topic)
+	return t.doSendMessageWithID(target.ChannelID, text, replyTo, topic)
+}
+
+func (t *TelegramChannel) AskInConversation(target conversation.Target, question string, options []string) error {
+	return t.sendQuestion(target, question, options)
+}
+
+func (t *TelegramChannel) ConversationLink(ref conversation.Reference) string {
+	if ref.MessageID == "" {
+		return ""
+	}
+	if !strings.HasPrefix(ref.Target.ChannelID, "-100") {
+		return ""
+	}
+	channelID := strings.TrimPrefix(ref.Target.ChannelID, "-100")
+	if channelID == "" {
+		return ""
+	}
+	if ref.Target.ThreadID != "" {
+		return fmt.Sprintf("https://t.me/c/%s/%s/%s", channelID, ref.Target.ThreadID, ref.MessageID)
+	}
+	return fmt.Sprintf("https://t.me/c/%s/%s", channelID, ref.MessageID)
 }
 
 // SendTyping shows a typing indicator in the given chat, kept alive until
@@ -783,9 +817,18 @@ func (t *TelegramChannel) answerCallbackQuery(callbackQueryID string) {
 // they are rendered as a single-column inline keyboard; otherwise plain text.
 // Implements InteractiveChannel.
 func (t *TelegramChannel) SendQuestion(channelID, question string, options []string) error {
+	return t.sendQuestion(conversation.Target{ChannelType: config.ChannelTelegram, ChannelID: channelID}, question, options)
+}
+
+func (t *TelegramChannel) sendQuestion(target conversation.Target, question string, options []string) error {
 	payload := map[string]any{
-		"chat_id": channelID,
+		"chat_id": target.ChannelID,
 		"text":    "❓ " + question,
+	}
+	var topicID int
+	fmt.Sscanf(target.ThreadID, "%d", &topicID)
+	if topicID > 0 {
+		payload["message_thread_id"] = topicID
 	}
 	if len(options) > 0 {
 		rows := make([][]tgInlineButton, len(options))
@@ -811,10 +854,10 @@ func (t *TelegramChannel) SendQuestion(channelID, question string, options []str
 	return nil
 }
 
-// splitTextChunks splits text into chunks of at most maxLen characters,
-// preferring to split at paragraph breaks then newlines.
+// splitTextChunks splits text into UTF-8-safe chunks of at most maxLen bytes,
+// preferring paragraph and line breaks without discarding their delimiters.
 func splitTextChunks(text string, maxLen int) []string {
-	if len(text) <= maxLen {
+	if maxLen <= 0 || len(text) <= maxLen {
 		return []string{text}
 	}
 	var chunks []string
@@ -823,21 +866,21 @@ func splitTextChunks(text string, maxLen int) []string {
 			chunks = append(chunks, text)
 			break
 		}
-		chunk := text[:maxLen]
-		// Prefer paragraph break.
-		if idx := strings.LastIndex(chunk, "\n\n"); idx > maxLen/2 {
-			chunks = append(chunks, text[:idx])
-			text = strings.TrimLeft(text[idx:], "\n")
-			continue
+		cut := maxLen
+		for cut > 0 && !utf8.RuneStart(text[cut]) {
+			cut--
 		}
-		// Fall back to any newline.
-		if idx := strings.LastIndex(chunk, "\n"); idx > maxLen/2 {
-			chunks = append(chunks, text[:idx])
-			text = strings.TrimLeft(text[idx:], "\n")
-			continue
+		if cut == 0 { // A single rune is wider than maxLen; keep it intact.
+			_, cut = utf8.DecodeRuneInString(text)
 		}
-		chunks = append(chunks, chunk)
-		text = text[maxLen:]
+		prefix := text[:cut]
+		if idx := strings.LastIndex(prefix, "\n\n"); idx >= maxLen/2 {
+			cut = idx + len("\n\n")
+		} else if idx := strings.LastIndex(prefix, "\n"); idx >= maxLen/2 {
+			cut = idx + 1
+		}
+		chunks = append(chunks, text[:cut])
+		text = text[cut:]
 	}
 	return chunks
 }

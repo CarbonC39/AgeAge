@@ -20,6 +20,9 @@ func TestTelegramParseIncomingChoosesLargestPhotoAndPreservesTopic(t *testing.T)
 	if !ok || in.Text != "inspect" || !in.BotMentioned || in.ThreadID != "99" || in.ChannelID != "-10" || len(in.Attachments) != 1 {
 		t.Fatalf("message=%#v ok=%v", in, ok)
 	}
+	if target := in.Target(); target.ChannelType != "telegram" || target.ChannelID != "-10" || target.ThreadID != "99" || target.ReplyTo != "7" {
+		t.Fatalf("conversation target=%#v", target)
+	}
 	if in.Attachments[0].Filename != "photo.jpg" || in.Attachments[0].Size != 2 || in.Attachments[0].Open == nil {
 		t.Fatalf("attachment=%#v", in.Attachments[0])
 	}

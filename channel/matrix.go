@@ -14,6 +14,7 @@ import (
 
 	"ageage/attachment"
 	"ageage/config"
+	"ageage/conversation"
 )
 
 // MatrixChannel connects to a Matrix homeserver via Client-Server API.
@@ -366,7 +367,8 @@ func (m *MatrixChannel) parseIncoming(roomID string, event matrixEvent) (Incomin
 	if mentioned {
 		body = strings.TrimSpace(strings.ReplaceAll(body, m.UserID, ""))
 	}
-	out := IncomingMessage{ChannelType: config.ChannelMatrix, ChannelID: roomID, SenderID: event.Sender, SenderName: event.Sender, Text: body, ReplyTo: event.EventID, ThreadID: threadID, IsGroupChat: isGroup, BotMentioned: botMentioned}
+	target := conversation.Target{ChannelType: config.ChannelMatrix, ChannelID: roomID, SenderID: event.Sender, SenderName: event.Sender, ReplyTo: event.EventID, ThreadID: threadID}
+	out := IncomingMessage{ChannelType: config.ChannelMatrix, ChannelID: roomID, SenderID: event.Sender, SenderName: event.Sender, Text: body, ReplyTo: event.EventID, ThreadID: threadID, Conversation: target, IsGroupChat: isGroup, BotMentioned: botMentioned}
 	capturedRoomID, capturedEventID, capturedThreadID := roomID, event.EventID, threadID
 	out.Respond = func(text string) error {
 		if capturedThreadID != "" {
@@ -534,6 +536,9 @@ func (m *MatrixChannel) SendInThread(roomID, threadRootID, latestEventID, text s
 func (m *MatrixChannel) SendMessageInThread(roomID, threadRootID, latestEventID, text string) (string, error) {
 	chunks := splitMessages(text, 4000)
 	replyTo := latestEventID
+	if replyTo == "" {
+		replyTo = threadRootID
+	}
 	var lastID string
 	for i, chunk := range chunks {
 		if i > 0 {
@@ -567,29 +572,91 @@ func (m *MatrixChannel) SendMessageInThread(roomID, threadRootID, latestEventID,
 
 // EditMessage replaces the content of a previously sent Matrix event using m.replace.
 func (m *MatrixChannel) EditMessage(roomID, eventID, text string) error {
+	return m.EditInConversation(conversation.Target{ChannelType: config.ChannelMatrix, ChannelID: roomID}, eventID, text)
+}
+
+func (m *MatrixChannel) EditInConversation(target conversation.Target, eventID, text string) error {
+	if len([]rune(text)) > 4000 {
+		return fmt.Errorf("Matrix edit exceeds single-event limit; sending replacement instead")
+	}
 	htmlBody := markdownToHTML(text)
+	newContent := map[string]interface{}{
+		"msgtype":        "m.text",
+		"body":           text,
+		"format":         "org.matrix.custom.html",
+		"formatted_body": htmlBody,
+	}
+	if target.ThreadID != "" && target.ThreadID != eventID {
+		newContent["m.relates_to"] = map[string]interface{}{"rel_type": "m.thread", "event_id": target.ThreadID}
+	}
 	payload := map[string]interface{}{
-		"msgtype": "m.text",
-		"body":    "* " + text,
-		"format":  "org.matrix.custom.html",
-		"m.new_content": map[string]interface{}{
-			"msgtype":        "m.text",
-			"body":           text,
-			"format":         "org.matrix.custom.html",
-			"formatted_body": htmlBody,
-		},
+		"msgtype":       "m.text",
+		"body":          "* " + text,
+		"format":        "org.matrix.custom.html",
+		"m.new_content": newContent,
 		"m.relates_to": map[string]interface{}{
 			"rel_type": "m.replace",
 			"event_id": eventID,
 		},
 	}
 
-	_, err := m.sendEvent(roomID, "m.room.message", payload)
+	_, err := m.sendEvent(target.ChannelID, "m.room.message", payload)
 	return err
 }
 
 func (m *MatrixChannel) Reply(roomID, replyToID, text string) error {
-	return m.Send(roomID, text)
+	_, err := m.ReplyMessage(conversation.Target{ChannelType: config.ChannelMatrix, ChannelID: roomID, ReplyTo: replyToID}, text)
+	return err
+}
+
+func (m *MatrixChannel) DeliveryID(target conversation.Target) string { return target.ChannelID }
+
+func (m *MatrixChannel) ReplyMessage(target conversation.Target, text string) (string, error) {
+	if target.ReplyTo == "" {
+		if target.ThreadID != "" {
+			return m.SendMessageInThread(target.ChannelID, target.ThreadID, target.ThreadID, text)
+		}
+		return m.SendMessage(target.ChannelID, text)
+	}
+	content := map[string]any{"msgtype": "m.text", "body": text, "format": "org.matrix.custom.html", "formatted_body": markdownToHTML(text), "m.relates_to": map[string]any{"m.in_reply_to": map[string]any{"event_id": target.ReplyTo}}}
+	if target.ThreadID != "" {
+		content["m.relates_to"] = map[string]any{"rel_type": "m.thread", "event_id": target.ThreadID, "m.in_reply_to": map[string]any{"event_id": target.ReplyTo}}
+	}
+	return m.sendEvent(target.ChannelID, "m.room.message", content)
+}
+
+func (m *MatrixChannel) CreateConversationThread(target conversation.Target, title, body string) (conversation.Target, conversation.Reference, error) {
+	if target.ThreadID != "" {
+		return conversation.Target{}, conversation.Reference{}, ErrUnsupported
+	}
+	text := strings.TrimSpace(body)
+	if strings.TrimSpace(title) != "" {
+		if text != "" {
+			text = strings.TrimSpace(title) + "\n\n" + text
+		} else {
+			text = strings.TrimSpace(title)
+		}
+	}
+	if text == "" {
+		text = "Conversation"
+	}
+	rootID, err := m.SendMessage(target.ChannelID, text)
+	if err != nil {
+		return conversation.Target{}, conversation.Reference{}, err
+	}
+	if rootID == "" {
+		return conversation.Target{}, conversation.Reference{}, fmt.Errorf("Matrix root event returned no ID")
+	}
+	threadTarget := target
+	threadTarget.ThreadID, threadTarget.ReplyTo = rootID, rootID
+	return threadTarget, conversation.Reference{Target: threadTarget, MessageID: rootID}, nil
+}
+
+func (m *MatrixChannel) ConversationLink(ref conversation.Reference) string {
+	if ref.Target.ChannelID == "" || ref.MessageID == "" {
+		return ""
+	}
+	return "https://matrix.to/#/" + url.PathEscape(ref.Target.ChannelID) + "/" + url.PathEscape(ref.MessageID)
 }
 
 // SendTyping sends or clears a typing indicator in a room.
@@ -676,6 +743,16 @@ func (m *MatrixChannel) clearTyping(channelID string, generation uint64) {
 func (m *MatrixChannel) SendReadReceipt(channelID, eventID string) error {
 	path := fmt.Sprintf("/_matrix/client/v3/rooms/%s/receipt/m.read/%s", channelID, eventID)
 	_, err := m.doRequest("POST", path, map[string]any{})
+	return err
+}
+
+func (m *MatrixChannel) ReadInConversation(target conversation.Target) error {
+	path := fmt.Sprintf("/_matrix/client/v3/rooms/%s/receipt/m.read/%s", target.ChannelID, target.ReplyTo)
+	body := map[string]any{}
+	if target.ThreadID != "" {
+		body["thread_id"] = target.ThreadID
+	}
+	_, err := m.doRequest("POST", path, body)
 	return err
 }
 

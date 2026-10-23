@@ -1,16 +1,15 @@
 package agent
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
 	"sync"
 	"time"
+
+	"ageage/conversation"
 )
 
 const sessionRegistryVersion = 1
@@ -27,6 +26,17 @@ type SessionBinding struct {
 	OwnerID     string    `json:"owner_id,omitempty"`
 	Kind        string    `json:"kind,omitempty"` // cli, room, thread
 	UpdatedAt   time.Time `json:"updated_at"`
+}
+
+// Target returns the transport-independent conversation location represented
+// by this binding.
+func (b SessionBinding) Target() conversation.Target {
+	return conversation.Target{
+		ChannelType: b.ChannelType,
+		ChannelID:   b.ChannelID,
+		ThreadID:    b.ThreadID,
+		OwnerID:     b.OwnerID,
+	}
 }
 
 type sessionRegistryFile struct {
@@ -126,13 +136,7 @@ func (r *SessionRegistry) Reload() error {
 // BindingKey creates a stable, collision-resistant key for an external
 // location. Length-prefixing prevents delimiter collisions in IDs.
 func BindingKey(channelType, channelID, threadID, ownerID string) string {
-	parts := []string{channelType, channelID, threadID, ownerID}
-	var b strings.Builder
-	for _, part := range parts {
-		fmt.Fprintf(&b, "%d:%s|", len(part), part)
-	}
-	sum := sha256.Sum256([]byte(b.String()))
-	return hex.EncodeToString(sum[:])
+	return conversation.BindingKey(channelType, channelID, threadID, ownerID)
 }
 
 // KeyForBinding returns the binding key, deriving one from its scope when the
@@ -159,6 +163,10 @@ func (r *SessionRegistry) Bind(binding SessionBinding) error {
 	if err := r.reloadLocked(); err != nil {
 		return err
 	}
+	if existing, ok := r.bindings[binding.Key]; ok && existing.ThreadID != "" &&
+		existing.SessionID != binding.SessionID {
+		return fmt.Errorf("thread %q is already bound to session %q; thread bindings cannot be switched", existing.ThreadID, existing.SessionID)
+	}
 	for key, existing := range r.bindings {
 		if key != binding.Key && existing.SessionID == binding.SessionID {
 			return fmt.Errorf("session %q is already bound to another conversation", binding.SessionID)
@@ -166,6 +174,23 @@ func (r *SessionRegistry) Bind(binding SessionBinding) error {
 	}
 	r.bindings[binding.Key] = binding
 	return r.saveFileLocked()
+}
+
+// BindTarget stores a session association for a transport-independent target.
+func (r *SessionRegistry) BindTarget(target conversation.Target, sessionID, kind string) error {
+	return r.Bind(SessionBinding{
+		SessionID:   sessionID,
+		ChannelType: target.ChannelType,
+		ChannelID:   target.ChannelID,
+		ThreadID:    target.ThreadID,
+		OwnerID:     target.OwnerID,
+		Kind:        kind,
+	})
+}
+
+// ResolveTarget returns the durable session binding for a target, if present.
+func (r *SessionRegistry) ResolveTarget(target conversation.Target) (SessionBinding, bool) {
+	return r.Get(target.BindingKey())
 }
 
 func (r *SessionRegistry) Get(key string) (SessionBinding, bool) {

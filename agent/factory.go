@@ -14,6 +14,7 @@ import (
 
 	"ageage/config"
 	"ageage/creds"
+	"ageage/event"
 	"ageage/llm"
 	"ageage/security"
 	"ageage/skills"
@@ -380,14 +381,18 @@ func (f *AgentFactory) CreateAgentFiltered(confirmMgr *tools.ConfirmationManager
 		if confirmMgr != nil && currentAgent != nil && currentAgent.GetChannelID() != "" {
 			ag := currentAgent
 
-			prompt := fmt.Sprintf("*Agent Confirmation Required*\nOperation: `%s`\nReply with `y`, `n`, or `a` (always allow).", operation)
-			if ag.Callbacks.Notify != nil {
-				ag.Callbacks.Notify(prompt)
+			_, resultCh := confirmMgr.RequestConfirmationScoped(operation, ag.GetInteractionScope(), 10*time.Minute)
+			if ag.Callbacks.Event != nil {
+				ag.emitEvent(event.Event{Kind: event.ConfirmationRequested, Text: operation, Options: []string{"y", "n", "a"}})
 			} else {
-				fmt.Printf("\n[IM Confirmation] %s\n", prompt)
+				prompt := fmt.Sprintf("*Agent Confirmation Required*\nOperation: `%s`\nReply with `y`, `n`, or `a` (always allow).", operation)
+				if ag.Callbacks.Notify != nil {
+					ag.Callbacks.Notify(prompt)
+				} else {
+					fmt.Printf("\n[IM Confirmation] %s\n", prompt)
+				}
 			}
 
-			_, resultCh := confirmMgr.RequestConfirmationScoped(operation, ag.GetInteractionScope(), 10*time.Minute)
 			allowed, ok := <-resultCh
 			if !ok {
 				return false // Timeout

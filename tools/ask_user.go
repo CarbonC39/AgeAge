@@ -20,6 +20,9 @@ type AskUserTool struct {
 	// Scope binds the request to the originating channel/thread/session/user.
 	// ChannelID is retained for CLI and older factory callers.
 	Scope InteractionScope
+	// ScopeFunc resolves live ownership at execution time. Persistent agents
+	// receive their conversation/session scope after their tools are constructed.
+	ScopeFunc func() InteractionScope
 	// Manager handles the request/response lifecycle.
 	Manager *UserInputManager
 	// NotifyFuncPtr points to the agent's AskUserNotify field. Dereferenced at
@@ -75,7 +78,10 @@ func (t *AskUserTool) Execute(ctx context.Context, args json.RawMessage) (string
 	// Register the pending request BEFORE notifying the user to avoid the
 	// race where the user replies before RequestInput is called.
 	scope := t.Scope
-	if scope.ChannelID == "" {
+	if t.ScopeFunc != nil {
+		scope = t.ScopeFunc()
+	}
+	if scope == (InteractionScope{}) {
 		scope = LegacyInteractionScope(t.ChannelID)
 	}
 	requestID, respCh := t.Manager.RequestUserInputScoped(scope)

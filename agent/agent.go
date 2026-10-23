@@ -13,6 +13,7 @@ import (
 
 	"ageage/config"
 	"ageage/creds"
+	"ageage/event"
 	"ageage/jsonutil"
 	"ageage/llm"
 	"ageage/skills"
@@ -27,7 +28,7 @@ func (a *Agent) triggerEvaluator(skill *skills.Skill, userInput, agentOutput str
 		return
 	}
 	docsDir := filepath.Join(factory.Config.AgeAgeDirPath(), "docs")
-	ev := NewEvaluator(factory, docsDir, a.Callbacks.Notify)
+	ev := NewEvaluator(factory, docsDir, evaluatorNotify(a.Callbacks.BackgroundEvent, a.Callbacks.Notify))
 	errStr := ""
 	if originalErr != nil {
 		errStr = originalErr.Error()
@@ -46,6 +47,17 @@ func (a *Agent) triggerEvaluator(skill *skills.Skill, userInput, agentOutput str
 		PipelineContext:  pipelineContext,
 	}
 	go ev.Run(context.Background(), snap)
+}
+
+func evaluatorNotify(background func(event.Event), fallback func(string)) func(string) {
+	// Capture one immutable callback at scheduling time. The evaluator runs in
+	// the background and may finish after a per-run event renderer is closed.
+	if background != nil {
+		return func(message string) {
+			background(event.Event{Kind: event.Notification, Text: message, At: time.Now()})
+		}
+	}
+	return fallback
 }
 
 // turnRecord tracks an uncompressed tool-call turn so it can be compressed later.
@@ -423,9 +435,80 @@ func (a *Agent) Run(ctx context.Context, userInput string, streamCb llm.StreamCa
 	return a.RunWithParts(ctx, userInput, nil, streamCb)
 }
 
+func (a *Agent) emitEvent(ev event.Event) {
+	if a == nil || a.Callbacks.Event == nil {
+		return
+	}
+	if ev.At.IsZero() {
+		ev.At = time.Now()
+	}
+	a.Callbacks.Event(ev)
+}
+
+// installEventCallbackBridge emits semantic runtime events while preserving
+// the legacy callback surface for CLI callers and external integrations.
+func (a *Agent) installEventCallbackBridge() {
+	if a.Callbacks.Event == nil {
+		return
+	}
+	eventFn := a.Callbacks.Event
+	notify := a.Callbacks.Notify
+	askUser := a.Callbacks.AskUser
+	todoSend := a.Callbacks.TodoSend
+	todoEdit := a.Callbacks.TodoEdit
+	toolStart := a.Callbacks.ToolStart
+	toolEnd := a.Callbacks.ToolEnd
+	a.Callbacks.Notify = func(message string) {
+		eventFn(event.Event{Kind: event.Notification, Text: message, At: time.Now()})
+		if notify != nil {
+			notify(message)
+		}
+	}
+	a.Callbacks.AskUser = func(question string, options []string) {
+		eventFn(event.Event{Kind: event.Waiting, Name: "ask_user", Text: question, Options: append([]string(nil), options...), At: time.Now()})
+		if askUser != nil {
+			askUser(question, options)
+		}
+	}
+	a.Callbacks.TodoSend = func(text string) string {
+		eventFn(event.Event{Kind: event.PlanUpdated, Name: "plan", Text: text, At: time.Now()})
+		if todoSend != nil {
+			return todoSend(text)
+		}
+		return ""
+	}
+	a.Callbacks.TodoEdit = func(msgID, text string) error {
+		eventFn(event.Event{Kind: event.PlanUpdated, Name: "plan", Text: text, At: time.Now()})
+		if todoEdit != nil {
+			return todoEdit(msgID, text)
+		}
+		return nil
+	}
+	a.Callbacks.ToolStart = func(name, args string) {
+		kind := event.ToolStarted
+		if name == "delegate" || name == "escalate" {
+			kind = event.SubagentStarted
+		}
+		eventFn(event.Event{Kind: kind, Name: name, Arguments: args, At: time.Now()})
+		if toolStart != nil {
+			toolStart(name, args)
+		}
+	}
+	a.Callbacks.ToolEnd = func(name string) {
+		kind := event.ToolCompleted
+		if name == "delegate" || name == "escalate" {
+			kind = event.SubagentCompleted
+		}
+		eventFn(event.Event{Kind: kind, Name: name, At: time.Now()})
+		if toolEnd != nil {
+			toolEnd(name)
+		}
+	}
+}
+
 // RunWithParts executes a single user turn. If parts is non-nil the user message
 // is sent as a multimodal content array; otherwise userInput is used as plain text.
-func (a *Agent) RunWithParts(ctx context.Context, userInput string, parts []llm.ContentPart, streamCb llm.StreamCallback) (string, error) {
+func (a *Agent) RunWithParts(ctx context.Context, userInput string, parts []llm.ContentPart, streamCb llm.StreamCallback) (result string, runErr error) {
 	a.finishTool.Reset()
 	a.runUsage = llm.Usage{}
 
@@ -445,6 +528,24 @@ func (a *Agent) RunWithParts(ctx context.Context, userInput string, parts []llm.
 	a.cancel = cancel
 	a.cancelMu.Unlock()
 	defer cancel()
+	originalCallbacks := a.Callbacks
+	a.installEventCallbackBridge()
+	defer func() { a.Callbacks = originalCallbacks }()
+	if !a.Mode.IsSubAgent {
+		a.emitEvent(event.Event{Kind: event.RunStarted})
+		defer func() {
+			kind := event.RunCompleted
+			text := result
+			if ctx.Err() != nil {
+				kind = event.RunCancelled
+				text = ctx.Err().Error()
+			} else if runErr != nil {
+				kind = event.RunFailed
+				text = runErr.Error()
+			}
+			a.emitEvent(event.Event{Kind: kind, Text: text})
+		}()
+	}
 
 	// --- Skill selection ---
 	isFirstTurn := a.conv.Len() == 0
@@ -820,6 +921,9 @@ func (a *Agent) runLoop(ctx context.Context, streamCb llm.StreamCallback, toolDe
 			if a.Callbacks.ToolResult != nil {
 				a.Callbacks.ToolResult(tc.Function.Name, res)
 			}
+			if execErr != nil {
+				a.emitEvent(event.Event{Kind: event.Warning, Name: tc.Function.Name, Text: execErr.Error()})
+			}
 			a.debugLog("Tool◁", "%s  %s", tc.Function.Name, truncateStr(res, 600))
 			a.debugBlankLine()
 			return toolExecResult{result: res, execErr: execErr, inputs: replies}
@@ -1003,7 +1107,7 @@ func (a *Agent) runLoop(ctx context.Context, streamCb llm.StreamCallback, toolDe
 		// Resolve every tool call before adding user answers. Providers require
 		// tool responses to remain adjacent to the originating assistant batch.
 		for _, reply := range userReplies {
-			a.conv.Append(llm.Message{Role: "user", Content: reply.Text, Parts: reply.Parts})
+			a.conv.Append(llm.Message{Role: "user", Content: reply.Text, Parts: reply.Parts, InputReply: true})
 		}
 
 		if anyToolError && !a.Mode.IsSubAgent {
@@ -1076,6 +1180,7 @@ func (a *Agent) runPipelineSkill(ctx context.Context, skill *skills.Skill, input
 		a.GetChannelID(),
 		a.registry,
 	)
+	exec.eventSink = a.Callbacks.Event
 	exec.scope = a.GetInteractionScope()
 	result, err = exec.Run(ctx)
 	if err != nil {

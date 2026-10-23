@@ -15,8 +15,9 @@ import (
 // to Agent.RunInput now or an active run's inbox in the future.
 func normalizeIMInput(ctx context.Context, msg channel.IncomingMessage, cfg *config.Config, tmp *agent.TmpManager) agent.UserInput {
 	text := msg.Text
-	if msg.IsGroupChat && msg.SenderID != "" {
-		text = "[" + senderDisplayName(msg.ChannelType, msg.SenderID, msg.SenderName) + "]: " + text
+	target := msg.Target()
+	if msg.IsGroupChat && target.SenderID != "" {
+		text = "[" + channel.SenderLabel(target) + "]: " + text
 	}
 	return agent.NormalizeUserInput(ctx, text, msg.Attachments, cfg, tmp)
 }

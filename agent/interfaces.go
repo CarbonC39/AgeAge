@@ -2,6 +2,7 @@ package agent
 
 import (
 	"ageage/config"
+	"ageage/event"
 	"ageage/security"
 	"ageage/skills"
 	"ageage/tools"
@@ -26,13 +27,15 @@ type AgentDeps interface {
 // AgentCallbacks groups all optional outbound notification callbacks.
 // The zero value is valid — all nil callbacks are silently skipped.
 type AgentCallbacks struct {
-	Notify     func(message string)
-	AskUser    func(question string, options []string)
-	TodoSend   func(text string) string
-	TodoEdit   func(msgID, text string) error
-	ToolStart  func(name, args string)
-	ToolEnd    func(name string)
-	ToolResult func(name, result string)
+	Event           func(event.Event)
+	BackgroundEvent func(event.Event)
+	Notify          func(message string)
+	AskUser         func(question string, options []string)
+	TodoSend        func(text string) string
+	TodoEdit        func(msgID, text string) error
+	ToolStart       func(name, args string)
+	ToolEnd         func(name string)
+	ToolResult      func(name, result string)
 }
 
 // AgentMode groups boolean configuration flags for an Agent.

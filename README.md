@@ -135,6 +135,12 @@ You ▸ Summarise @report.pdf and check @screenshot.png for issues
 
 In IM mode, Matrix AgeAge commands use `!` (for example `!help` and `!session new`); Telegram and Discord commands continue to use `/`. IM progress visibility is configured with `[notifications]`, including per-channel overrides. See the [channel configuration](docs/config.md#channels) for details.
 
+IM conversations share a target/surface abstraction for replies, topics, status
+cards, questions and notifications. Matrix `!session new [name]` creates a named
+thread root; session lists include previews, turn counts and links. Existing
+threads keep their session when navigating with `session switch`. See the
+[IM conversation architecture](docs/im-conversations.md) for behavior and fallbacks.
+
 ---
 
 ## Architecture overview

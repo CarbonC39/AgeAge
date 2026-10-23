@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"ageage/conversation"
 )
 
 func TestDiscordPollPreservesTextAndAttachments(t *testing.T) {
@@ -108,6 +110,9 @@ func TestDiscordPollThreadMentionAndAllowlistWithAttachment(t *testing.T) {
 		if m.Text != "hi" || !m.BotMentioned || m.ThreadID != "thread" || m.ChannelID != "c" || len(m.Attachments) != 1 {
 			t.Fatalf("thread/mention message = %#v", m)
 		}
+		if target := m.Target(); target.ChannelType != "discord" || target.ChannelID != "c" || target.ThreadID != "thread" || target.ReplyTo != "1" {
+			t.Fatalf("thread conversation target = %#v", target)
+		}
 	case <-time.After(time.Second):
 		t.Fatal("allowed mention was not delivered")
 	}
@@ -115,6 +120,105 @@ func TestDiscordPollThreadMentionAndAllowlistWithAttachment(t *testing.T) {
 	d.AllowedUsers = []string{"someone-else"}
 	d.lastMsgIDs["c"] = "0"
 	d.pollChannel("c", func(m IncomingMessage) string { t.Errorf("disallowed user delivered: %#v", m); return "" })
+}
+
+func TestDiscordSlashMentionDoesNotCreateAutomaticThread(t *testing.T) {
+	threadRequests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/threads") {
+			threadRequests++
+			_, _ = io.WriteString(w, `{"id":"unexpected"}`)
+			return
+		}
+		if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/channels/c/messages") {
+			_, _ = io.WriteString(w, `[{"id":"1","content":"<@bot> /session new","author":{"id":"u","username":"user"}}]`)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+
+	d := NewDiscord("token", []string{"c"}, []string{"u"}, ChannelOptions{})
+	d.baseURL, d.client, d.botUserID = server.URL, server.Client(), "bot"
+	d.groupChannels["c"] = true
+	d.lastMsgIDs["c"] = "0"
+	got := make(chan IncomingMessage, 1)
+	d.pollChannel("c", func(m IncomingMessage) string { got <- m; return "" })
+	select {
+	case m := <-got:
+		if m.Text != "/session new" || m.ThreadID != "" || m.ChannelID != "c" {
+			t.Fatalf("slash command was routed into automatic thread: %#v", m)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("slash command was not delivered")
+	}
+	if threadRequests != 0 {
+		t.Fatalf("automatic thread requests = %d", threadRequests)
+	}
+}
+
+func TestDiscordTrackConversationInitializesThreadCursorOnStart(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/users/@me":
+			_, _ = io.WriteString(w, `{"id":"bot"}`)
+		case r.URL.Path == "/channels/parent":
+			_, _ = io.WriteString(w, `{"type":0,"guild_id":"guild"}`)
+		case r.URL.Path == "/channels/parent/messages":
+			_, _ = io.WriteString(w, `[{"id":"parent-latest"}]`)
+		case r.URL.Path == "/channels/thread/messages":
+			if r.URL.Query().Get("after") != "" {
+				t.Errorf("thread cursor queried with after=%q during startup", r.URL.Query().Get("after"))
+			}
+			_, _ = io.WriteString(w, `[{"id":"thread-latest"}]`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	d := NewDiscord("token", []string{"parent"}, []string{"u"}, ChannelOptions{})
+	d.baseURL, d.client = server.URL, server.Client()
+	d.TrackConversation(conversation.Target{ChannelType: "discord", ChannelID: "parent", ThreadID: "thread", OwnerID: "owner"})
+	startErr := make(chan error, 1)
+	go func() { startErr <- d.Start(func(IncomingMessage) string { return "" }) }()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		d.mu.Lock()
+		cursor := d.lastMsgIDs["thread"]
+		d.mu.Unlock()
+		if cursor == "thread-latest" {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	d.mu.Lock()
+	cursor := d.lastMsgIDs["thread"]
+	parent := d.threadParent["thread"]
+	d.mu.Unlock()
+	if cursor != "thread-latest" || parent != "parent" {
+		t.Fatalf("restored thread state cursor=%q parent=%q", cursor, parent)
+	}
+	_ = d.Stop()
+	select {
+	case err := <-startErr:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Start did not stop")
+	}
+}
+
+func TestSenderLabelFormatsMatrixLocalpart(t *testing.T) {
+	target := conversation.Target{ChannelType: "matrix", SenderID: "@alice:matrix.example", SenderName: "@alice:matrix.example"}
+	if got := SenderLabel(target); got != "alice" {
+		t.Fatalf("Matrix sender label = %q", got)
+	}
+	target = conversation.Target{ChannelType: "discord", SenderID: "123", SenderName: " Alice "}
+	if got := SenderLabel(target); got != "Alice" {
+		t.Fatalf("sender name = %q", got)
+	}
 }
 
 func TestDiscordAttachmentRejectsUnsafeURLWithoutLeakingURL(t *testing.T) {

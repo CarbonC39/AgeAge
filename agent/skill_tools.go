@@ -59,6 +59,7 @@ var skillOnlyToolSpecs = []skillOnlyToolSpec{
 		return &tools.AskUserTool{
 			ChannelID:     a.GetChannelID(),
 			Scope:         a.GetInteractionScope(),
+			ScopeFunc:     a.GetInteractionScope,
 			Manager:       f.GetUserInputMgr(),
 			NotifyFuncPtr: &a.Callbacks.AskUser,
 		}

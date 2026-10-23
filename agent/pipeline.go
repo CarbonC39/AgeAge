@@ -8,8 +8,10 @@ import (
 	"reflect"
 	"regexp"
 	"strings"
+	"time"
 
 	"ageage/config"
+	"ageage/event"
 	"ageage/llm"
 	"ageage/skills"
 	"ageage/tools"
@@ -61,7 +63,9 @@ type PipelineExecutor struct {
 	sendFn        func(text string) string
 	editFn        func(msgID, text string) error
 	notifyFn      func(message string)
-	askUserNotify func(string, []string) // Propagated to pipeline sub-agents for ask_user tool
+	askUserNotify func(string, []string)                                    // Propagated to pipeline sub-agents for ask_user tool
+	eventSink     func(event.Event)                                         // Parent-run event sink for pipeline agent nodes
+	agentBuilder  func(*tools.ConfirmationManager, string, []string) *Agent // optional test seam
 
 	// Passed through to sub-agents for supervised-mode confirmations.
 	confirmMgr *tools.ConfirmationManager
@@ -585,12 +589,27 @@ func (e *PipelineExecutor) runAgentNodeAttempt(
 	filteredTools []string,
 	taskPrompt string,
 	tier string,
-) (map[string]interface{}, error) {
+) (outVars map[string]interface{}, runErr error) {
+	if e.eventSink != nil {
+		e.eventSink(event.Event{Kind: event.SubagentStarted, Name: node.ID, At: time.Now()})
+		defer func() {
+			ev := event.Event{Kind: event.SubagentCompleted, Name: node.ID, At: time.Now()}
+			if runErr != nil {
+				ev.Text = runErr.Error()
+			}
+			e.eventSink(ev)
+		}()
+	}
 	// Create an isolated sub-agent. Sub-agents in pipelines:
 	//   - Do NOT get pipeline todo callbacks (would conflict with pipeline's own display).
 	//   - Do NOT load skills (IsSubAgent=true skips skill-only tool injection).
 	//   - Do NOT run the router.
-	subAgent := e.factory.CreateAgentFiltered(e.confirmMgr, e.channelID, filteredTools)
+	var subAgent *Agent
+	if e.agentBuilder != nil {
+		subAgent = e.agentBuilder(e.confirmMgr, e.channelID, filteredTools)
+	} else {
+		subAgent = e.factory.CreateAgentFiltered(e.confirmMgr, e.channelID, filteredTools)
+	}
 	subAgent.SetInteractionScope(e.scope)
 	subAgent.Mode.IsSubAgent = true
 	subAgent.SessionDir = e.sessionDir
@@ -747,6 +766,8 @@ func (e *PipelineExecutor) execNestedPipeline(ctx context.Context, node skills.P
 		e.sharedReg,
 	)
 	nestedExec.askUserNotify = e.askUserNotify
+	nestedExec.eventSink = e.eventSink
+	nestedExec.agentBuilder = e.agentBuilder
 	nestedExec.scope = e.scope
 	// Apply all resolved inputs as nested vars (including non-"input" keys).
 	for k, v := range extraVars {

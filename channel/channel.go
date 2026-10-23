@@ -2,6 +2,8 @@ package channel
 
 import (
 	"ageage/attachment"
+	"ageage/config"
+	"ageage/conversation"
 	"fmt"
 	"strings"
 	"sync"
@@ -15,6 +17,7 @@ type IncomingMessage struct {
 	SenderName   string // Display name
 	Text         string // Message content (mention prefix already stripped)
 	Attachments  []attachment.Attachment
+	Conversation conversation.Target
 	ReplyTo      string // Message ID to reply to (if applicable)
 	ThreadID     string // Thread/topic ID within the channel; empty if not in a thread
 	IsGroupChat  bool   // True if the message came from a multi-user room (not a DM)
@@ -24,6 +27,31 @@ type IncomingMessage struct {
 	// correct channel-specific path (e.g. inside a Matrix thread). When nil,
 	// the handler returns a plain string which the channel sends via Send().
 	Respond func(text string) error
+}
+
+// Target returns the normalized conversation target, falling back to legacy
+// message fields for callers that construct IncomingMessage directly.
+func (m IncomingMessage) Target() conversation.Target {
+	t := m.Conversation
+	if t.ChannelType == "" {
+		t.ChannelType = m.ChannelType
+	}
+	if t.ChannelID == "" {
+		t.ChannelID = m.ChannelID
+	}
+	if t.ThreadID == "" {
+		t.ThreadID = m.ThreadID
+	}
+	if t.ReplyTo == "" {
+		t.ReplyTo = m.ReplyTo
+	}
+	if t.SenderID == "" {
+		t.SenderID = m.SenderID
+	}
+	if t.SenderName == "" {
+		t.SenderName = m.SenderName
+	}
+	return t
 }
 
 // ChannelOptions holds common settings passed to all channel connectors.
@@ -199,28 +227,67 @@ func (m *Manager) Send(channelType, channelID, text string) {
 // SendQuestion sends a question to a specific channel, using interactive
 // buttons when the channel supports it. Falls back to a numbered text list.
 func (m *Manager) SendQuestion(channelType, channelID, question string, options []string) {
+	target := conversation.Target{ChannelType: channelType, ChannelID: channelID}
+	if surface, ok := m.SurfaceFor(target); ok {
+		_ = surface.Ask(question, options)
+	}
+}
+
+// SurfaceFor binds a normalized target to its registered connector.
+func (m *Manager) SurfaceFor(target conversation.Target) (Surface, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-
 	for _, ch := range m.channels {
-		if ch.Name() != channelType {
-			continue
+		if ch.Name() == target.ChannelType {
+			return NewSurface(ch, target), true
 		}
-		if ic, ok := ch.(InteractiveChannel); ok {
-			if err := ic.SendQuestion(channelID, question, options); err != nil {
-				fmt.Printf("[%s] SendQuestion error: %s\n", channelType, err)
-			}
-			return
-		}
-		// Plain-text fallback.
-		text := "❓ " + question
-		for i, opt := range options {
-			text += fmt.Sprintf("\n%d. %s", i+1, opt)
-		}
-		if len(options) > 0 {
-			text += "\n" + strings.Repeat("-", 20) + "\nReply with a number or your answer."
-		}
-		ch.Send(channelID, text)
-		return
 	}
+	return nil, false
+}
+
+// SendTo sends a message while preserving thread/topic routing in target.
+func (m *Manager) SendTo(target conversation.Target, text string) (conversation.Reference, error) {
+	surface, ok := m.SurfaceFor(target)
+	if !ok {
+		return conversation.Reference{}, fmt.Errorf("channel %q is not registered", target.ChannelType)
+	}
+	return surface.Send(text)
+}
+
+// TrackConversation restores a durable target in connectors that need local
+// routing state, such as Discord's thread-parent map.
+func (m *Manager) TrackConversation(target conversation.Target) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, ch := range m.channels {
+		if ch.Name() == target.ChannelType {
+			if tracker, ok := ch.(ConversationTracker); ok {
+				tracker.TrackConversation(target)
+			}
+		}
+	}
+}
+
+// SenderLabel returns a concise local label for the target's sender.
+func SenderLabel(target conversation.Target) string {
+	name := strings.TrimSpace(target.SenderName)
+	if target.ChannelType == config.ChannelMatrix {
+		id := strings.TrimSpace(target.SenderID)
+		if name == "" || name == id {
+			name = id
+			if strings.HasPrefix(name, "@") {
+				name = strings.TrimPrefix(name, "@")
+				if host := strings.IndexByte(name, ':'); host >= 0 {
+					name = name[:host]
+				}
+			}
+		}
+	}
+	if name == "" {
+		name = strings.TrimSpace(target.SenderID)
+	}
+	if name == "" {
+		return "user"
+	}
+	return name
 }

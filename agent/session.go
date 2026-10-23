@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -36,10 +37,12 @@ var sessionLocks sync.Map // absolute session directory -> *sync.RWMutex
 
 // SessionInfo describes a single session for listing.
 type SessionInfo struct {
-	ID        string    // full session ID (directory name)
-	TurnCount int       // number of completed user→assistant turns
-	ModTime   time.Time // last-modified time of the session directory
-	Preview   string    // first 50 chars of the last user message (best-effort)
+	ID          string    // full ID in List; display name in ListWithPrefix for compatibility
+	FullID      string    // canonical session ID (directory name)
+	DisplayName string    // independent user-facing name; old sessions fall back to ID
+	TurnCount   int       // number of completed user→assistant turns
+	ModTime     time.Time // last-modified time of the session directory
+	Preview     string    // first 50 chars of the last external user message (best-effort)
 }
 
 // historyRecord is the on-disk representation of a single llm.Message.
@@ -50,6 +53,11 @@ type historyRecord struct {
 	Parts      []llm.ContentPart `json:"parts,omitempty"`
 	ToolCalls  []llm.ToolCall    `json:"tool_calls,omitempty"`
 	ToolCallID string            `json:"tool_call_id,omitempty"`
+	InputReply bool              `json:"input_reply,omitempty"`
+}
+
+type sessionMetadata struct {
+	DisplayName string `json:"display_name,omitempty"`
 }
 
 // sanitizeRe matches characters that are not safe in a directory name.
@@ -93,6 +101,88 @@ func (sm *SessionManager) ContextPath(id string) string {
 // HistoryPath returns the history.jsonl path for the named session.
 func (sm *SessionManager) HistoryPath(id string) string {
 	return filepath.Join(sm.sessionsDir, id, "history.jsonl")
+}
+
+// MetadataPath returns the path to the session's display metadata.
+func (sm *SessionManager) MetadataPath(id string) string {
+	return filepath.Join(sm.SessionDir(id), "metadata.json")
+}
+
+// SetDisplayName persists a user-facing session name without changing its
+// canonical ID. It only updates existing sessions and uses an atomic replace.
+func (sm *SessionManager) SetDisplayName(id, name string) error {
+	lock := sm.SessionLock(id)
+	lock.Lock()
+	defer lock.Unlock()
+	info, err := os.Stat(sm.SessionDir(id))
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("session %q is not a directory", id)
+	}
+	data, err := json.Marshal(sessionMetadata{DisplayName: strings.TrimSpace(name)})
+	if err != nil {
+		return err
+	}
+	dir := sm.SessionDir(id)
+	tmp, err := os.CreateTemp(dir, ".metadata-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, sm.MetadataPath(id))
+}
+
+// DisplayName returns the persisted display name, falling back to the session
+// ID for old sessions. It never creates a missing session.
+func (sm *SessionManager) DisplayName(id string) (string, error) {
+	lock := sm.SessionLock(id)
+	lock.RLock()
+	defer lock.RUnlock()
+	return sm.displayNameSnapshot(id)
+}
+
+func (sm *SessionManager) displayNameSnapshot(id string) (string, error) {
+	info, err := os.Stat(sm.SessionDir(id))
+	if err != nil {
+		return "", err
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("session %q is not a directory", id)
+	}
+	data, err := os.ReadFile(sm.MetadataPath(id))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return id, nil
+		}
+		return "", err
+	}
+	var metadata sessionMetadata
+	if err := json.Unmarshal(data, &metadata); err != nil {
+		return "", fmt.Errorf("parse session metadata: %w", err)
+	}
+	name := strings.TrimSpace(metadata.DisplayName)
+	if name == "" {
+		return id, nil
+	}
+	return name, nil
 }
 
 // SessionLock returns the process-wide lock for a session. Callers that need
@@ -321,12 +411,34 @@ func (sm *SessionManager) List() ([]SessionInfo, error) {
 		// Count turns and capture a preview of the last user message.
 		turns := 0
 		preview := ""
-		if msgs, err := sm.LoadHistory(id); err == nil {
+		// SaveHistory publishes complete snapshots by atomic rename. Read that
+		// committed file directly instead of waiting for a transaction lock: an
+		// agent may hold it while paused in ask_user for an arbitrary duration.
+		if msgs, err := sm.loadHistorySnapshot(id); err == nil {
 			for _, m := range msgs {
 				if m.Role == "user" {
-					turns++
+					if !m.InputReply {
+						turns++
+					}
+					if m.InputReply {
+						continue
+					}
 					// Keep updating so we end up with the LAST user message.
-					t := m.TextContent()
+					t := m.Content
+					if strings.TrimSpace(t) == "" {
+						t = m.TextContent()
+						if strings.HasPrefix(t, "[File ") {
+							t = "[File attachment]"
+						}
+					}
+					if strings.TrimSpace(t) == "" {
+						for _, part := range m.Parts {
+							if part.Type == "image_url" {
+								t = "[Image attachment]"
+								break
+							}
+						}
+					}
 					if len([]rune(t)) > 50 {
 						t = string([]rune(t)[:50]) + "…"
 					}
@@ -341,7 +453,11 @@ func (sm *SessionManager) List() ([]SessionInfo, error) {
 			modTime = fi.ModTime()
 		}
 
-		infos = append(infos, SessionInfo{ID: id, TurnCount: turns, ModTime: modTime, Preview: preview})
+		displayName, err := sm.displayNameSnapshot(id)
+		if err != nil || displayName == "" {
+			displayName = id
+		}
+		infos = append(infos, SessionInfo{ID: id, FullID: id, DisplayName: displayName, TurnCount: turns, ModTime: modTime, Preview: preview})
 	}
 
 	// Sort newest first.
@@ -370,7 +486,8 @@ func (sm *SessionManager) FindByPrefix(prefix string) (exact *SessionInfo, prefi
 }
 
 // ListWithPrefix returns only sessions whose IDs start with prefix.
-// The display name returned in SessionInfo.ID has the prefix stripped.
+// SessionInfo.ID retains the historical prefix-relative canonical ID, while
+// DisplayName carries the independent user-facing name.
 func (sm *SessionManager) ListWithPrefix(prefix string) ([]SessionInfo, error) {
 	all, err := sm.List()
 	if err != nil {
@@ -385,7 +502,12 @@ func (sm *SessionManager) ListWithPrefix(prefix string) ([]SessionInfo, error) {
 			} else if si.ID == prefix {
 				display = "default"
 			}
-			filtered = append(filtered, SessionInfo{ID: display, TurnCount: si.TurnCount, ModTime: si.ModTime})
+			displayName := si.DisplayName
+			if displayName == "" || displayName == si.FullID {
+				// Preserve the historical room-relative name for legacy sessions.
+				displayName = display
+			}
+			filtered = append(filtered, SessionInfo{ID: display, FullID: si.FullID, DisplayName: displayName, TurnCount: si.TurnCount, ModTime: si.ModTime, Preview: si.Preview})
 		}
 	}
 	return filtered, nil
@@ -502,6 +624,7 @@ func (sm *SessionManager) saveHistoryLocked(id string, msgs []llm.Message) error
 			Parts:      m.Parts,
 			ToolCalls:  m.ToolCalls,
 			ToolCallID: m.ToolCallID,
+			InputReply: m.InputReply,
 		}
 		if err := enc.Encode(rec); err != nil {
 			writeErr = err
@@ -533,6 +656,18 @@ func (sm *SessionManager) LoadHistory(id string) ([]llm.Message, error) {
 }
 
 func (sm *SessionManager) loadHistoryLocked(id string) ([]llm.Message, error) {
+	return sm.readHistoryFile(id, true)
+}
+
+// loadHistorySnapshot reads the last fully committed history file without the
+// session lock. SaveHistory writes a sibling file and publishes it with one
+// atomic rename, so readers see either the previous complete history or the
+// new complete history; they never observe a partial write.
+func (sm *SessionManager) loadHistorySnapshot(id string) ([]llm.Message, error) {
+	return sm.readHistoryFile(id, false)
+}
+
+func (sm *SessionManager) readHistoryFile(id string, protectPermissions bool) ([]llm.Message, error) {
 	path := sm.HistoryPath(id)
 	f, err := os.Open(path)
 	if err != nil {
@@ -542,29 +677,29 @@ func (sm *SessionManager) loadHistoryLocked(id string) ([]llm.Message, error) {
 		return nil, err
 	}
 	defer f.Close()
-	if err := f.Chmod(0o600); err != nil {
-		return nil, err
+	if protectPermissions {
+		if err := f.Chmod(0o600); err != nil {
+			return nil, err
+		}
 	}
 
 	var msgs []llm.Message
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
+	// Attachment budgets belong to the input pipeline. Read one JSONL record
+	// at a time without imposing a second, smaller Scanner token limit on
+	// base64 images that were already accepted and persisted successfully.
+	reader := bufio.NewReaderSize(f, 64*1024)
+	for {
+		line, readErr := reader.ReadBytes('\n')
+		if readErr != nil && readErr != io.EOF {
+			return nil, readErr
 		}
 		var rec historyRecord
-		if err := json.Unmarshal([]byte(line), &rec); err != nil {
-			continue // skip malformed lines rather than failing hard
+		if json.Unmarshal(line, &rec) == nil {
+			msgs = append(msgs, llm.Message{Role: rec.Role, Content: rec.Content, Parts: rec.Parts, ToolCalls: rec.ToolCalls, ToolCallID: rec.ToolCallID, InputReply: rec.InputReply})
 		}
-		msgs = append(msgs, llm.Message{
-			Role:       rec.Role,
-			Content:    rec.Content,
-			Parts:      rec.Parts,
-			ToolCalls:  rec.ToolCalls,
-			ToolCallID: rec.ToolCallID,
-		})
+		if readErr == io.EOF {
+			break
+		}
 	}
-	return msgs, scanner.Err()
+	return msgs, nil
 }

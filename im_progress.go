@@ -1,14 +1,17 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"ageage/agent"
 	"ageage/channel"
 	"ageage/config"
+	"ageage/conversation"
+	"ageage/event"
+	"ageage/rendering"
 	"ageage/tools"
 )
 
@@ -35,184 +38,91 @@ func cronDeliveryTarget(entry tools.CronEntry) (channelType, channelID, threadID
 	return channelType, channelID, threadID, channelType != "" && channelID != ""
 }
 
-// newIMProgressReporter creates one run-scoped progress sink. The send target
-// is fixed here so delayed/coalesced updates cannot escape the originating
-// room or thread.
+// newIMProgressReporter retains the filtered sink API for integrations which
+// submit pre-rendered messages. The surface owns all native routing decisions.
 func newIMProgressReporter(cfg config.NotificationConfig, ch channel.Channel, msg channel.IncomingMessage) *channel.FilteredProgressReporter {
-	policy := cfg.EffectiveForChannel(msg.ChannelType)
-	if ch == nil {
-		return channel.NewFilteredProgressReporter(channel.ProgressReporterOptions{
-			Allowed: func(category channel.ProgressCategory) bool { return policy.Allows(string(category)) },
-		})
-	}
-
+	policy := cfg.EffectiveForChannel(msg.Target().ChannelType)
 	var send func(string) (string, error)
 	var edit func(string, string) error
-	if editable, ok := ch.(channel.Editable); ok {
-		editChannelID := msg.ChannelID
-		if msg.ChannelType == config.ChannelDiscord && msg.ThreadID != "" {
-			// Discord threads are channels in their own right.
-			editChannelID = msg.ThreadID
+	if ch != nil {
+		surface := channel.NewSurface(ch, msg.Target())
+		var ref conversation.Reference
+		send = func(text string) (string, error) {
+			var err error
+			ref, err = surface.Send(text)
+			return ref.MessageID, err
 		}
-		edit = func(messageID, text string) error {
-			return editable.EditMessage(editChannelID, messageID, text)
-		}
-
-		if msg.ThreadID != "" {
-			if threadEditable, ok := ch.(channel.ThreadEditable); ok {
-				send = func(text string) (string, error) {
-					return threadEditable.SendMessageInThread(msg.ChannelID, msg.ThreadID, msg.ReplyTo, text)
-				}
-			}
-		}
-		if send == nil && msg.ThreadID == "" {
-			send = func(text string) (string, error) {
-				return editable.SendMessage(msg.ChannelID, text)
-			}
+		if surface.Capabilities().Edit {
+			edit = func(_ string, text string) error { var err error; ref, err = surface.Update(ref, text); return err }
 		}
 	}
-	if send == nil && msg.Respond != nil {
-		send = func(text string) (string, error) { return "", msg.Respond(text) }
-		edit = nil
-	}
-	if send == nil {
-		send = func(text string) (string, error) { return "", ch.Send(msg.ChannelID, text) }
-		edit = nil
-	}
-
-	return channel.NewFilteredProgressReporter(channel.ProgressReporterOptions{
-		Allowed:  func(category channel.ProgressCategory) bool { return policy.Allows(string(category)) },
-		Throttle: time.Duration(policy.ThrottleMS) * time.Millisecond,
-		Send:     send,
-		Edit:     edit,
-	})
+	return channel.NewFilteredProgressReporter(channel.ProgressReporterOptions{Allowed: func(category channel.ProgressCategory) bool { return policy.Allows(string(category)) }, Throttle: time.Duration(policy.ThrottleMS) * time.Millisecond, Send: send, Edit: edit})
 }
 
-// installIMProgressCallbacks maps the Agent's existing callback surface onto
-// stable progress categories. It returns a restoration function because Agent
-// instances persist across turns while reporters are deliberately per-run.
-func installIMProgressCallbacks(ag *agent.Agent, reporter channel.ProgressReporter, askUser func(string, []string)) func() {
-	if ag == nil || reporter == nil {
-		return func() {}
-	}
+// installIMRunCallbacks keeps the runtime event stream independent of transport
+// formatting. AskUser remains an interaction, sent through the same surface.
+func installIMRunCallbacks(ag *agent.Agent, run *rendering.Run, surface channel.Surface) func() {
 	saved := ag.Callbacks
-	report := func(category channel.ProgressCategory, name, message string) {
-		if err := reporter.ReportProgress(channel.ProgressEvent{Category: category, Name: name, Message: message}); err != nil {
-			fmt.Printf("[progress] report error: %s\n", err)
-		}
+	ag.Callbacks = agent.AgentCallbacks{
+		BackgroundEvent: saved.BackgroundEvent,
+		Event: func(ev event.Event) {
+			if err := run.Handle(ev); err != nil {
+				fmt.Printf("[progress] %s\n", err)
+			}
+		},
+		AskUser: func(question string, options []string) {
+			if err := surface.Ask(question, options); err != nil {
+				fmt.Printf("[ask_user] %s\n", err)
+			}
+		},
 	}
-
-	ag.Callbacks.Notify = func(message string) {
-		report(channel.ProgressLifecycle, "notification", message)
-	}
-	ag.Callbacks.AskUser = func(question string, options []string) {
-		if askUser != nil {
-			askUser(question, options)
-		}
-	}
-	ag.Callbacks.TodoSend = func(text string) string {
-		report(channel.ProgressPlan, "plan", text)
-		if current, ok := reporter.(interface{ MessageID() string }); ok {
-			return current.MessageID()
-		}
-		return ""
-	}
-	ag.Callbacks.TodoEdit = func(_ string, text string) error {
-		return reporter.ReportProgress(channel.ProgressEvent{Category: channel.ProgressPlan, Name: "plan", Message: text})
-	}
-	ag.Callbacks.ToolStart = func(name, args string) {
-		category, message := formatIMToolProgress(name, args, false)
-		report(category, name, message)
-	}
-	ag.Callbacks.ToolEnd = func(name string) {
-		category, message := formatIMToolProgress(name, "", true)
-		report(category, name, message)
-	}
-
 	return func() { ag.Callbacks = saved }
 }
 
-func formatIMToolProgress(name, args string, finished bool) (channel.ProgressCategory, string) {
-	label := strings.TrimSpace(name)
-	if label == "" {
-		label = "tool"
-	}
-	if name == "delegate" || name == "escalate" {
-		if finished {
-			return channel.ProgressSubagent, "Sub-agent finished."
-		}
-		return channel.ProgressSubagent, "Delegating work to a sub-agent…"
-	}
-	if finished {
-		return channel.ProgressTool, fmt.Sprintf("Finished `%s`.", label)
-	}
-
-	// File updates are the one selected tool activity where a compact diff is
-	// more useful than a generic tool name. They remain hidden in balanced mode.
-	switch name {
-	case "file_write":
-		var p struct {
-			Path    string `json:"path"`
-			Content string `json:"content"`
-		}
-		if json.Unmarshal([]byte(args), &p) == nil && p.Path != "" {
-			return channel.ProgressTool, imDiffWrite(p.Path, p.Content)
-		}
-	case "file_edit":
-		var p struct {
-			Path    string `json:"path"`
-			Search  string `json:"search"`
-			Replace string `json:"replace"`
-		}
-		if json.Unmarshal([]byte(args), &p) == nil && p.Path != "" {
-			return channel.ProgressTool, imDiffEdit(p.Path, p.Search, p.Replace)
-		}
-	}
-	return channel.ProgressTool, fmt.Sprintf("Running `%s`…", label)
-}
-
-// imRunFeedback owns the ephemeral typing indicator and pending reaction for
-// one handler invocation. Close is idempotent so normal and deferred cleanup
-// can safely share it.
+// imRunFeedback owns ephemeral affordances, never native room or thread IDs.
 type imRunFeedback struct {
-	typing     channel.TypingIndicator
-	reactor    channel.Reactor
-	roomID     string
-	typingID   string
-	messageID  string
-	reactionID string
-	closed     bool
+	mu       sync.Mutex
+	surface  channel.Surface
+	message  conversation.Reference
+	reaction conversation.Reference
+	closed   bool
 }
 
 func beginIMRunFeedback(ch channel.Channel, msg channel.IncomingMessage) *imRunFeedback {
-	f := &imRunFeedback{roomID: msg.ChannelID, typingID: msg.ChannelID, messageID: msg.ReplyTo}
-	if msg.ChannelType == config.ChannelDiscord && msg.ThreadID != "" {
-		f.roomID = msg.ThreadID
-		f.typingID = msg.ThreadID
-	}
-	if typing, ok := ch.(channel.TypingIndicator); ok {
-		f.typing = typing
-		_ = typing.SendTyping(f.typingID, true)
-	}
-	if reactor, ok := ch.(channel.Reactor); ok {
-		f.reactor = reactor
-		f.reactionID, _ = reactor.React(f.roomID, msg.ReplyTo, "⏳")
+	return beginSurfaceFeedback(channel.NewSurface(ch, msg.Target()))
+}
+func beginSurfaceFeedback(surface channel.Surface) *imRunFeedback {
+	target := surface.Target()
+	f := &imRunFeedback{surface: surface, message: conversation.Reference{Target: target, MessageID: target.ReplyTo}}
+	_ = surface.Typing(true)
+	if f.message.MessageID != "" {
+		f.reaction, _ = surface.React(f.message, "⏳")
 	}
 	return f
 }
-
 func (f *imRunFeedback) Close(failed bool) {
-	if f == nil || f.closed {
+	if failed {
+		f.finish("❌")
+	} else {
+		f.finish("")
+	}
+}
+func (f *imRunFeedback) Stop() { f.finish("🛑") }
+func (f *imRunFeedback) finish(emoji string) {
+	if f == nil {
+		return
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.closed {
 		return
 	}
 	f.closed = true
-	if f.typing != nil {
-		_ = f.typing.SendTyping(f.typingID, false)
+	_ = f.surface.Typing(false)
+	if f.reaction.MessageID != "" {
+		_ = f.surface.Unreact(f.reaction)
 	}
-	if f.reactor != nil && f.reactionID != "" {
-		_ = f.reactor.Unreact(f.roomID, f.reactionID)
-		if failed {
-			_, _ = f.reactor.React(f.roomID, f.messageID, "❌")
-		}
+	if emoji != "" && f.message.MessageID != "" {
+		_, _ = f.surface.React(f.message, emoji)
 	}
 }

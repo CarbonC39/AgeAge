@@ -14,6 +14,7 @@ import (
 
 	"ageage/attachment"
 	"ageage/config"
+	"ageage/conversation"
 )
 
 // DiscordChannel connects to Discord via Bot API (REST polling).
@@ -29,6 +30,7 @@ type DiscordChannel struct {
 	botUserID     string            // Bot's own user ID (set in Start)
 	groupChannels map[string]bool   // channelID → true if guild channel, false if DM
 	threadParent  map[string]string // thread channel ID → parent channel ID
+	guildIDs      map[string]string // channel ID → guild ID, for authentic message links
 	mu            sync.Mutex
 	typingStop    map[string]discordTypingState // channelID → active keep-alive state
 	typingMu      sync.Mutex
@@ -52,6 +54,7 @@ func NewDiscord(botToken string, channelIDs []string, allowedUsers []string, opt
 		lastMsgIDs:    make(map[string]string),
 		groupChannels: make(map[string]bool),
 		threadParent:  make(map[string]string),
+		guildIDs:      make(map[string]string),
 		typingStop:    make(map[string]discordTypingState),
 	}
 }
@@ -81,19 +84,55 @@ func (d *DiscordChannel) isAllowedUser(candidates ...string) bool {
 
 func (d *DiscordChannel) Name() string { return config.ChannelDiscord }
 
+// TrackConversation restores routing metadata for a persisted Discord thread.
+func (d *DiscordChannel) TrackConversation(target conversation.Target) {
+	if target.ChannelType != config.ChannelDiscord || target.ChannelID == "" || target.ThreadID == "" {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.threadParent[target.ThreadID] = target.ChannelID
+	if group, ok := d.groupChannels[target.ChannelID]; ok {
+		d.groupChannels[target.ThreadID] = group
+	} else {
+		d.groupChannels[target.ThreadID] = true
+	}
+	if guildID := d.guildIDs[target.ChannelID]; guildID != "" {
+		d.guildIDs[target.ThreadID] = guildID
+	}
+}
+
+// CanCreateConversationThread reports whether Discord threads can be created
+// for this known target. Unknown targets remain eligible for an API attempt.
+func (d *DiscordChannel) CanCreateConversationThread(target conversation.Target) bool {
+	if target.ChannelType != config.ChannelDiscord || target.ThreadID != "" {
+		return false
+	}
+	d.mu.Lock()
+	group, known := d.groupChannels[target.ChannelID]
+	d.mu.Unlock()
+	return !known || group
+}
+
 // getChannelType returns the Discord channel type integer (0=guild text, 1=DM, etc.).
 func (d *DiscordChannel) getChannelType(channelID string) (int, error) {
+	t, _, err := d.getChannelInfo(channelID)
+	return t, err
+}
+
+func (d *DiscordChannel) getChannelInfo(channelID string) (int, string, error) {
 	body, err := d.doRequest("GET", fmt.Sprintf("/channels/%s", channelID), nil)
 	if err != nil {
-		return 0, err
+		return 0, "", err
 	}
 	var ch struct {
-		Type int `json:"type"`
+		Type    int    `json:"type"`
+		GuildID string `json:"guild_id"`
 	}
 	if err := json.Unmarshal(body, &ch); err != nil {
-		return 0, err
+		return 0, "", err
 	}
-	return ch.Type, nil
+	return ch.Type, ch.GuildID, nil
 }
 
 // Start begins polling Discord channels for new messages.
@@ -116,8 +155,9 @@ func (d *DiscordChannel) Start(handler MessageHandler) error {
 	// messages that arrive after startup. Also detect group vs DM channels.
 	for _, chID := range d.ChannelIDs {
 		// Detect channel type: type 1 = DM, anything else = guild/group.
-		if chType, err := d.getChannelType(chID); err == nil {
+		if chType, guildID, err := d.getChannelInfo(chID); err == nil {
 			d.groupChannels[chID] = chType != 1
+			d.guildIDs[chID] = guildID
 		} else {
 			d.groupChannels[chID] = true // default to group for safety
 		}
@@ -138,6 +178,37 @@ func (d *DiscordChannel) Start(handler MessageHandler) error {
 				d.lastMsgIDs[chID] = msgs[0].ID
 			} else {
 				d.lastMsgIDs[chID] = "0"
+			}
+			d.mu.Unlock()
+			break
+		}
+	}
+	// Restored threads also need a startup cursor so their old messages are not
+	// replayed as fresh input.
+	d.mu.Lock()
+	trackedThreads := make([]string, 0, len(d.threadParent))
+	for threadID := range d.threadParent {
+		trackedThreads = append(trackedThreads, threadID)
+	}
+	d.mu.Unlock()
+	for _, threadID := range trackedThreads {
+		for {
+			select {
+			case <-d.stopCh:
+				return nil
+			default:
+			}
+			msgs, err := d.getLatestMessages(threadID, 1)
+			if err != nil {
+				fmt.Printf("[Discord] Error initialising thread %s: %s — retrying\n", threadID, err)
+				time.Sleep(3 * time.Second)
+				continue
+			}
+			d.mu.Lock()
+			if len(msgs) > 0 {
+				d.lastMsgIDs[threadID] = msgs[0].ID
+			} else {
+				d.lastMsgIDs[threadID] = "0"
 			}
 			d.mu.Unlock()
 			break
@@ -215,9 +286,10 @@ func (d *DiscordChannel) SendMessageInThread(_ string, threadRootID, _ string, t
 // EditMessage replaces a previously sent Discord message.
 // Implements the Editable interface.
 func (d *DiscordChannel) EditMessage(channelID, messageID, text string) error {
-	// Truncate to Discord's limit; edits are single-message only.
+	// Edits are single-message only; Surface.Update sends a chunked replacement
+	// on this same channel/thread when the text exceeds the edit limit.
 	if len(text) > 1900 {
-		text = text[:1900]
+		return fmt.Errorf("Discord edit exceeds single-message limit")
 	}
 	payload := map[string]any{"content": text}
 	_, err := d.doRequest("PATCH", fmt.Sprintf("/channels/%s/messages/%s", channelID, messageID), payload)
@@ -523,6 +595,76 @@ func (d *DiscordChannel) createThread(channelID, messageID, name string) (string
 	return thread.ID, nil
 }
 
+func (d *DiscordChannel) DeliveryID(target conversation.Target) string {
+	if target.ThreadID != "" {
+		return target.ThreadID
+	}
+	return target.ChannelID
+}
+
+func (d *DiscordChannel) ReplyMessage(target conversation.Target, text string) (string, error) {
+	return d.createMessageWithID(d.DeliveryID(target), text, target.ReplyTo)
+}
+
+func (d *DiscordChannel) CreateConversationThread(target conversation.Target, title, body string) (conversation.Target, conversation.Reference, error) {
+	if target.ThreadID != "" {
+		return conversation.Target{}, conversation.Reference{}, ErrUnsupported
+	}
+	rootText := strings.TrimSpace(body)
+	if strings.TrimSpace(title) != "" {
+		if rootText != "" {
+			rootText = strings.TrimSpace(title) + "\n\n" + rootText
+		} else {
+			rootText = strings.TrimSpace(title)
+		}
+	}
+	if rootText == "" {
+		rootText = "Conversation"
+	}
+	rootID, err := d.createMessageWithID(target.ChannelID, rootText, "")
+	if err != nil {
+		return conversation.Target{}, conversation.Reference{}, err
+	}
+	if rootID == "" {
+		return conversation.Target{}, conversation.Reference{}, fmt.Errorf("Discord root message returned no ID")
+	}
+	threadID, err := d.createThread(target.ChannelID, rootID, title)
+	if err != nil {
+		return conversation.Target{}, conversation.Reference{}, err
+	}
+	d.mu.Lock()
+	d.lastMsgIDs[threadID] = "0"
+	d.threadParent[threadID] = target.ChannelID
+	d.groupChannels[threadID] = true
+	d.guildIDs[threadID] = d.guildIDs[target.ChannelID]
+	d.mu.Unlock()
+	threadTarget := target
+	threadTarget.ThreadID, threadTarget.ReplyTo = threadID, rootID
+	return threadTarget, conversation.Reference{Target: threadTarget, MessageID: rootID}, nil
+}
+
+func (d *DiscordChannel) ConversationLink(ref conversation.Reference) string {
+	if ref.MessageID == "" {
+		return ""
+	}
+	target := ref.Target
+	d.mu.Lock()
+	guildID := d.guildIDs[target.ChannelID]
+	if target.ThreadID != "" {
+		if id := d.guildIDs[target.ThreadID]; id != "" {
+			guildID = id
+		}
+		if ref.MessageID != target.ReplyTo {
+			target.ChannelID = target.ThreadID
+		}
+	}
+	d.mu.Unlock()
+	if guildID == "" {
+		return ""
+	}
+	return fmt.Sprintf("https://discord.com/channels/%s/%s/%s", guildID, target.ChannelID, ref.MessageID)
+}
+
 func (d *DiscordChannel) pollChannel(channelID string, handler MessageHandler) {
 	botID := d.botUserID
 
@@ -603,7 +745,7 @@ func (d *DiscordChannel) pollChannel(channelID string, handler MessageHandler) {
 		// mentioned: create a thread so the conversation stays contained.
 		// The thread is added to the poll list for subsequent messages.
 		sendChannelID := channelID // where responses go
-		if isGroup && !isThread && botMentioned {
+		if isGroup && !isThread && botMentioned && !strings.HasPrefix(strings.TrimSpace(content), "/") {
 			name := content
 			if len([]rune(name)) > 100 {
 				name = string([]rune(name)[:100])
@@ -615,6 +757,7 @@ func (d *DiscordChannel) pollChannel(channelID string, handler MessageHandler) {
 				d.lastMsgIDs[tid] = "0"
 				d.threadParent[tid] = channelID
 				d.groupChannels[tid] = true
+				d.guildIDs[tid] = d.guildIDs[channelID]
 				d.mu.Unlock()
 			}
 			// Thread creation failure falls back to sending in the original channel.
@@ -631,6 +774,7 @@ func (d *DiscordChannel) pollChannel(channelID string, handler MessageHandler) {
 			Attachments:  d.incomingAttachments(msg.Attachments),
 			ReplyTo:      msg.ID,
 			ThreadID:     threadID,
+			Conversation: conversation.Target{ChannelType: config.ChannelDiscord, ChannelID: effectiveChannelID, ThreadID: threadID, ReplyTo: msg.ID, SenderID: msg.Author.ID, SenderName: msg.Author.Username},
 			IsGroupChat:  isGroup,
 			BotMentioned: botMentioned,
 		}

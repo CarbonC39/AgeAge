@@ -21,6 +21,9 @@ func TestMatrixParseIncomingAttachmentAndMention(t *testing.T) {
 	if !ok || !msg.BotMentioned || msg.Text != "photo.png" || len(msg.Attachments) != 1 {
 		t.Fatalf("message = %#v, ok=%v", msg, ok)
 	}
+	if target := msg.Target(); target.ChannelType != "matrix" || target.ChannelID != "!room:example" || target.ReplyTo != "$event" {
+		t.Fatalf("conversation target = %#v", target)
+	}
 	att := msg.Attachments[0]
 	if att.Filename != "photo.png" || att.MIMEType != "image/png" || att.Size != 12 || att.URL != "mxc://media.example/id123" || att.Open == nil {
 		t.Fatalf("attachment = %#v", att)

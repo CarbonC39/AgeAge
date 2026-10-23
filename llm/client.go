@@ -38,6 +38,9 @@ type Message struct {
 	Parts      []ContentPart // multimodal content parts; non-nil overrides Content in JSON
 	ToolCalls  []ToolCall
 	ToolCallID string
+	// InputReply marks an ask_user answer within an existing run. It is
+	// persisted locally but excluded from provider JSON and session turn counts.
+	InputReply bool
 	// ReasoningContent captures thinking-model output (e.g. Gemini's reasoning_content).
 	// Always stripped before any outbound request.
 	ReasoningContent string

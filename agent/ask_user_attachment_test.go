@@ -29,9 +29,11 @@ func TestAskUserTypedAttachmentAppendsAfterCompleteToolBatch(t *testing.T) {
 		if question != "Please send a screenshot" {
 			t.Errorf("unexpected ask_user question %q", question)
 		}
-		answer := input.UserInput{Text: "Screenshot caption", Parts: []llm.ContentPart{
+		answer := input.UserInput{Text: "Screenshot caption", Warnings: []string{"converter warning; do not add to the tool result"}, Parts: []llm.ContentPart{
 			{Type: "text", Text: "Screenshot caption"},
+			{Type: "text", Text: "private extracted file text"},
 			{Type: "image_url", ImageURL: &llm.ImageURLPart{URL: "data:image/png;base64,ZmFrZQ==", Detail: "high"}},
+			{Type: "image_url", ImageURL: &llm.ImageURLPart{URL: "https://private.example/second"}},
 		}}
 		if !manager.RespondInputForScope(scope, answer) {
 			t.Error("typed ask_user response was not accepted")
@@ -76,18 +78,23 @@ func TestAskUserTypedAttachmentAppendsAfterCompleteToolBatch(t *testing.T) {
 		t.Fatalf("typed answer text/parts were not preserved: %#v", answer)
 	}
 	foundImage := false
+	imageCount := 0
 	for _, part := range answer.Parts {
-		if part.Type == "image_url" && part.ImageURL != nil && part.ImageURL.URL == "data:image/png;base64,ZmFrZQ==" && part.ImageURL.Detail == "high" {
-			foundImage = true
+		if part.Type == "image_url" && part.ImageURL != nil {
+			imageCount++
+			if part.ImageURL.URL == "data:image/png;base64,ZmFrZQ==" && part.ImageURL.Detail == "high" {
+				foundImage = true
+			}
 		}
 	}
-	if !foundImage {
+	if !foundImage || imageCount != 2 {
 		t.Fatalf("image part was not fully preserved: %#v", answer.Parts)
 	}
-	if !strings.Contains(messages[askIndex].Content, "Screenshot caption") {
-		t.Fatalf("ask_user tool response lost its text summary: %#v", messages[askIndex])
+	const expectedToolResult = "[User provided additional input; see the following user message.]"
+	if messages[askIndex].Content != expectedToolResult {
+		t.Fatalf("ask_user tool response = %q", messages[askIndex].Content)
 	}
-	if strings.Contains(messages[askIndex].Content, "data:image/png") {
-		t.Fatal("tool response should not duplicate the image payload")
+	if strings.Contains(messages[askIndex].Content, "Screenshot caption") || strings.Contains(messages[askIndex].Content, "private extracted file text") || strings.Contains(messages[askIndex].Content, "converter warning") || strings.Contains(messages[askIndex].Content, "data:image/png") {
+		t.Fatal("tool response duplicated typed answer data")
 	}
 }

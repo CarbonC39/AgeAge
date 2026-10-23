@@ -138,7 +138,12 @@ func TestAskUserTypedAttachmentsReachContextHandler(t *testing.T) {
 	if !notified {
 		t.Fatal("question was not notified")
 	}
-	answer := input.UserInput{Text: "Here", Parts: []llm.ContentPart{{Type: "text", Text: "Here"}, {Type: "image_url", ImageURL: &llm.ImageURLPart{URL: "data:image/png;base64,very-secret"}}}}
+	answer := input.UserInput{Text: "Here", Warnings: []string{"converter warning; keep out of tool result"}, Parts: []llm.ContentPart{
+		{Type: "text", Text: "Here"},
+		{Type: "text", Text: "private extracted file text"},
+		{Type: "image_url", ImageURL: &llm.ImageURLPart{URL: "data:image/png;base64,very-secret"}},
+		{Type: "image_url", ImageURL: &llm.ImageURLPart{URL: "https://private.example/image"}},
+	}}
 	if !manager.RespondInputForScope(scope, answer) {
 		t.Fatal("typed answer was rejected")
 	}
@@ -146,11 +151,12 @@ func TestAskUserTypedAttachmentsReachContextHandler(t *testing.T) {
 	if got.err != nil {
 		t.Fatal(got.err)
 	}
-	if got.text != "Here" || received.Text != answer.Text || len(received.Parts) != 2 || received.Parts[1].ImageURL.URL != answer.Parts[1].ImageURL.URL {
+	const expectedToolResult = "[User provided additional input; see the following user message.]"
+	if got.text != expectedToolResult || received.Text != answer.Text || len(received.Parts) != 4 || received.Warnings[0] != answer.Warnings[0] || received.Parts[0].Text != answer.Parts[0].Text || received.Parts[1].Text != answer.Parts[1].Text || received.Parts[2].ImageURL.URL != answer.Parts[2].ImageURL.URL || received.Parts[3].ImageURL.URL != answer.Parts[3].ImageURL.URL {
 		t.Fatalf("result=%q received=%#v", got.text, received)
 	}
-	if strings.Contains(got.text, "very-secret") {
-		t.Fatal("tool summary exposed image payload")
+	if strings.Contains(got.text, "private extracted file text") || strings.Contains(got.text, answer.Warnings[0]) || strings.Contains(got.text, "very-secret") {
+		t.Fatalf("tool result leaked additional input data: %q", got.text)
 	}
 }
 
@@ -215,5 +221,53 @@ func TestAskUserLegacyStringAnswerDoesNotInvokeTypedHandler(t *testing.T) {
 	}
 	if called {
 		t.Fatal("legacy text answer invoked typed handler")
+	}
+}
+
+func TestAskUserPartsOnlyAnswerUsesFixedToolResult(t *testing.T) {
+	manager := NewUserInputManager()
+	scope := InteractionScope{ChannelType: "matrix", ChannelID: "room", SenderID: "alice"}
+	tool := &AskUserTool{Scope: scope, Manager: manager, NotifyFuncPtr: new(func(string, []string))}
+	answer := input.UserInput{Warnings: []string{"download warning"}, Parts: []llm.ContentPart{
+		{Type: "text", Text: "first extracted file text"},
+		{Type: "text", Text: "second extracted file text"},
+		{Type: "image_url", ImageURL: &llm.ImageURLPart{URL: "data:image/png;base64,one"}},
+		{Type: "image_url", ImageURL: &llm.ImageURLPart{URL: "https://private.example/two"}},
+	}}
+	var received input.UserInput
+	ctx := WithUserInputHandler(context.Background(), func(value input.UserInput) { received = value })
+	type result struct {
+		text string
+		err  error
+	}
+	resultCh := make(chan result, 1)
+	go func() {
+		text, err := tool.Execute(ctx, json.RawMessage(`{"question":"send files"}`))
+		resultCh <- result{text, err}
+	}()
+	deadline := time.After(time.Second)
+	for !manager.HasPendingScope(scope) {
+		select {
+		case <-deadline:
+			t.Fatal("request was not registered")
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+	if !manager.RespondInputForScope(scope, answer) {
+		t.Fatal("parts-only answer was rejected")
+	}
+	got := <-resultCh
+	if got.err != nil {
+		t.Fatal(got.err)
+	}
+	if got.text != "[User provided additional input; see the following user message.]" {
+		t.Fatalf("tool result = %q", got.text)
+	}
+	if len(received.Parts) != len(answer.Parts) || received.Parts[0].Text != answer.Parts[0].Text || received.Parts[1].Text != answer.Parts[1].Text || received.Parts[2].ImageURL.URL != answer.Parts[2].ImageURL.URL || received.Parts[3].ImageURL.URL != answer.Parts[3].ImageURL.URL || received.Warnings[0] != answer.Warnings[0] {
+		t.Fatalf("typed callback lost parts or warnings: %#v", received)
+	}
+	if strings.Contains(got.text, "extracted file text") || strings.Contains(got.text, "download warning") || strings.Contains(got.text, "private.example") || strings.Contains(got.text, "base64") {
+		t.Fatalf("tool result leaked answer data: %q", got.text)
 	}
 }

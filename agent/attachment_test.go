@@ -423,11 +423,12 @@ func TestNormalizeUserInputCapsConverterOutputAndContinues(t *testing.T) {
 
 	cfg.Multimodal.Converters[0].Command = os.Args[0] + " -test.run=TestAttachmentConverterHugeFileHelper -- {output}"
 	in = NormalizeUserInput(context.Background(), "", attachments, cfg, newTmpManager(t.TempDir()))
-	if !strings.Contains(strings.Join(in.Warnings, " "), "truncated at 512 KiB") {
-		t.Fatalf("large converter output should be truncated: %v", in.Warnings)
+	warnings := strings.Join(in.Warnings, " ")
+	if !strings.Contains(warnings, "hard limit") {
+		t.Fatalf("large converter output should exceed hard limit: %v", in.Warnings)
 	}
-	if !strings.Contains(strings.Join(texts(in.Parts), " "), "converted to text") {
-		t.Fatal("large output should finish conversion before truncation")
+	if strings.Contains(strings.Join(texts(in.Parts), " "), "converted to text") {
+		t.Fatal("hard-limit converter output must not be accepted as a conversion")
 	}
 	if !strings.Contains(strings.Join(texts(in.Parts), " "), "later-file-survived") {
 		t.Fatalf("later file was not processed after oversized converter file: %#v", in.Parts)

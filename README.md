@@ -300,8 +300,10 @@ both defaults. At most 16 files are processed per turn. Metadata is checked befo
 opening streams; bodies are streamed into private staging files with hard byte
 limits. Filenames are cleaned and content is sniffed before constructing image
 parts. Text and converter output are capped at 512 KiB per file. Converters run
-for at most 60 seconds, and converter output reads are capped at 512 KiB. Staged
-files and converter results share the session's temporary-file GC.
+for at most 60 seconds. During execution their output file is checked every
+10 ms; exceeding the 1 MiB hard limit terminates the process and reports an error.
+Model-facing output reads remain capped at 512 KiB. Staged files and converter
+results share the session's temporary-file GC.
 
 Download failures, size violations, disabled Vision without a usable converter,
 and unsupported formats produce warnings in both the reply and model context;

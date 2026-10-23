@@ -5,9 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"strings"
-
-	"ageage/input"
 )
 
 // AskUserTool pauses pipeline/agent execution and asks the user a question.
@@ -112,34 +109,13 @@ func (t *AskUserTool) Execute(ctx context.Context, args json.RawMessage) (string
 				return "", fmt.Errorf("ask_user: typed attachments received without an input handler")
 			}
 			handler(answer)
+			return "[User provided additional input; see the following user message.]", nil
 		}
-		return summarizeUserInput(answer), nil
+		return answer.Text, nil
 	case <-ctx.Done():
 		t.Manager.CancelByID(requestID, scope) // clean up this request only
 		return "", fmt.Errorf("user input cancelled: %w", ctx.Err())
 	}
-}
-
-func summarizeUserInput(answer input.UserInput) string {
-	if answer.Text != "" {
-		return answer.Text
-	}
-	var text []string
-	images := 0
-	for _, part := range answer.Parts {
-		switch part.Type {
-		case "text":
-			if part.Text != "" {
-				text = append(text, part.Text)
-			}
-		case "image_url":
-			images++
-		}
-	}
-	if images > 0 {
-		text = append(text, fmt.Sprintf("[User attached %d image(s)]", images))
-	}
-	return strings.Join(text, "\n")
 }
 
 func (t *AskUserTool) resolveNotifyFunc() func(string, []string) {

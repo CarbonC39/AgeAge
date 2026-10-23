@@ -1,6 +1,7 @@
 package channel
 
 import (
+	"ageage/attachment"
 	"fmt"
 	"strings"
 	"sync"
@@ -13,6 +14,7 @@ type IncomingMessage struct {
 	SenderID     string // User identifier
 	SenderName   string // Display name
 	Text         string // Message content (mention prefix already stripped)
+	Attachments  []attachment.Attachment
 	ReplyTo      string // Message ID to reply to (if applicable)
 	ThreadID     string // Thread/topic ID within the channel; empty if not in a thread
 	IsGroupChat  bool   // True if the message came from a multi-user room (not a DM)

@@ -25,14 +25,24 @@ func newTmpManager(workspace string) *TmpManager {
 // NewFile creates an empty managed tmp file with the given suffix (e.g. ".md").
 // The caller is responsible for writing content to the returned path.
 func (t *TmpManager) NewFile(suffix string) (string, error) {
+	return t.newFile(t.dir, suffix)
+}
+
+// NewStagedFile reserves a private, uniquely named incoming file and tracks it
+// with converter output, so both GC and ClearAll reclaim attachments.
+func (t *TmpManager) NewStagedFile(name string) (string, error) {
+	return t.newFile(t.StagingDir(), "-"+sanitizeAttachmentName(name))
+}
+
+func (t *TmpManager) newFile(dir, suffix string) (string, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	if err := os.MkdirAll(t.dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", fmt.Errorf("tmpmanager: mkdir: %w", err)
 	}
 
-	f, err := os.CreateTemp(t.dir, "att-*"+suffix)
+	f, err := os.CreateTemp(dir, "att-*"+suffix)
 	if err != nil {
 		return "", fmt.Errorf("tmpmanager: create: %w", err)
 	}
@@ -40,6 +50,20 @@ func (t *TmpManager) NewFile(suffix string) (string, error) {
 
 	t.files = append(t.files, f.Name())
 	return f.Name(), nil
+}
+
+// Remove releases a failed or no longer needed attachment immediately.
+func (t *TmpManager) Remove(path string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for i, p := range t.files {
+		if p == path {
+			if err := os.Remove(path); err == nil || os.IsNotExist(err) {
+				t.files = append(t.files[:i], t.files[i+1:]...)
+			}
+			return
+		}
+	}
 }
 
 // GC removes managed files whose paths do not appear anywhere in the current

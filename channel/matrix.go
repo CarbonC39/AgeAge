@@ -7,10 +7,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
 
+	"ageage/attachment"
 	"ageage/config"
 )
 
@@ -277,84 +279,10 @@ func (m *MatrixChannel) Start(handler MessageHandler) error {
 				continue
 			}
 			for _, event := range roomData.Timeline.Events {
-				if event.Type != "m.room.message" {
+				incoming, ok := m.parseIncoming(roomID, event)
+				if !ok {
 					continue
 				}
-
-				msgType, _ := event.Content["msgtype"].(string)
-				if msgType != "m.text" {
-					continue
-				}
-
-				body, _ := event.Content["body"].(string)
-				if body == "" {
-					continue
-				}
-
-				if event.Sender == m.UserID {
-					continue
-				}
-
-				isGroup := m.isGroupRoom(roomID)
-
-				// Security: deny all messages from group rooms when no allowlist is set.
-				if isGroup && len(m.AllowedUsers) == 0 {
-					continue
-				}
-
-				if !m.isAllowedUser(event.Sender) {
-					continue
-				}
-
-				// Parse m.relates_to to determine thread context.
-				relatesTo, _ := event.Content["m.relates_to"].(map[string]interface{})
-				relType, _ := relatesTo["rel_type"].(string)
-
-				// Skip edit events — they are not new messages.
-				if relType == "m.replace" {
-					continue
-				}
-
-				// Determine thread ID: set only when message is already in a thread.
-				threadID := ""
-				if relType == "m.thread" {
-					threadID, _ = relatesTo["event_id"].(string)
-				}
-
-				// Detect @mention: bot's UserID appears in the message body.
-				// DM rooms and thread messages are always directed at the bot.
-				botMentioned := !isGroup || threadID != "" || strings.Contains(body, m.UserID)
-
-				// Strip the @mention prefix from the body so the agent sees clean text.
-				if botMentioned && strings.Contains(body, m.UserID) {
-					body = strings.ReplaceAll(body, m.UserID, "")
-					body = strings.TrimSpace(body)
-				}
-
-				// Capture loop-local values for closure safety.
-				capturedRoomID := roomID
-				capturedEventID := event.EventID
-				capturedThreadID := threadID
-
-				incoming := IncomingMessage{
-					ChannelType:  config.ChannelMatrix,
-					ChannelID:    roomID,
-					SenderID:     event.Sender,
-					SenderName:   event.Sender,
-					Text:         body,
-					ReplyTo:      event.EventID,
-					ThreadID:     threadID,
-					IsGroupChat:  isGroup,
-					BotMentioned: botMentioned,
-				}
-
-				incoming.Respond = func(text string) error {
-					if capturedThreadID != "" {
-						return m.SendInThread(capturedRoomID, capturedThreadID, capturedEventID, text)
-					}
-					return m.Send(capturedRoomID, text)
-				}
-
 				go func(msg IncomingMessage) {
 					reply := handler(msg)
 					// Fallback for handlers that return a string instead of calling Respond.
@@ -387,6 +315,147 @@ func (m *MatrixChannel) Start(handler MessageHandler) error {
 			}
 		}
 	}
+}
+
+// parseIncoming converts a Matrix room event into the shared channel message.
+// It is intentionally independent of /sync so protocol behavior can be tested.
+func (m *MatrixChannel) parseIncoming(roomID string, event matrixEvent) (IncomingMessage, bool) {
+	if event.Type != "m.room.message" || event.Sender == m.UserID {
+		return IncomingMessage{}, false
+	}
+	content := event.Content
+	msgType, _ := content["msgtype"].(string)
+	body, _ := content["body"].(string)
+	filename, hasFilename := content["filename"].(string)
+	if hasFilename && filename != "" && body == filename {
+		body = ""
+	}
+	if body == "" && msgType == "m.text" {
+		return IncomingMessage{}, false
+	}
+	if msgType != "m.text" && msgType != "m.image" && msgType != "m.file" && msgType != "m.audio" && msgType != "m.video" {
+		return IncomingMessage{}, false
+	}
+	if body == "" && content["url"] == nil && content["file"] == nil && msgType != "m.text" {
+		return IncomingMessage{}, false
+	}
+	isGroup := m.isGroupRoom(roomID)
+	if isGroup && len(m.AllowedUsers) == 0 || !m.isAllowedUser(event.Sender) {
+		return IncomingMessage{}, false
+	}
+	relatesTo, _ := content["m.relates_to"].(map[string]interface{})
+	relType, _ := relatesTo["rel_type"].(string)
+	if relType == "m.replace" {
+		return IncomingMessage{}, false
+	}
+	threadID := ""
+	if relType == "m.thread" {
+		threadID, _ = relatesTo["event_id"].(string)
+	}
+	mentioned := strings.Contains(body, m.UserID)
+	if mentions, ok := content["m.mentions"].(map[string]interface{}); ok {
+		if users, ok := mentions["user_ids"].([]interface{}); ok {
+			for _, user := range users {
+				if id, ok := user.(string); ok && id == m.UserID {
+					mentioned = true
+				}
+			}
+		}
+	}
+	botMentioned := !isGroup || threadID != "" || mentioned
+	if mentioned {
+		body = strings.TrimSpace(strings.ReplaceAll(body, m.UserID, ""))
+	}
+	out := IncomingMessage{ChannelType: config.ChannelMatrix, ChannelID: roomID, SenderID: event.Sender, SenderName: event.Sender, Text: body, ReplyTo: event.EventID, ThreadID: threadID, IsGroupChat: isGroup, BotMentioned: botMentioned}
+	capturedRoomID, capturedEventID, capturedThreadID := roomID, event.EventID, threadID
+	out.Respond = func(text string) error {
+		if capturedThreadID != "" {
+			return m.SendInThread(capturedRoomID, capturedThreadID, capturedEventID, text)
+		}
+		return m.Send(capturedRoomID, text)
+	}
+	if msgType == "m.image" || msgType == "m.file" || msgType == "m.audio" || msgType == "m.video" {
+		out.Attachments = append(out.Attachments, m.matrixAttachment(content, msgType))
+	}
+	return out, true
+}
+
+func (m *MatrixChannel) matrixAttachment(content map[string]interface{}, msgType string) attachment.Attachment {
+	body, _ := content["body"].(string)
+	att := attachment.Attachment{Filename: body}
+	info, _ := content["info"].(map[string]interface{})
+	att.MIMEType, _ = info["mimetype"].(string)
+	if size, ok := info["size"].(float64); ok {
+		att.Size = int64(size)
+		if size < 0 {
+			att.UnsupportedReason = "invalid negative Matrix attachment size"
+			return att
+		}
+	}
+	if filename, ok := content["filename"].(string); ok && filename != "" {
+		att.Filename = filename
+	}
+	if msgType == "m.audio" || msgType == "m.video" {
+		att.UnsupportedReason = "Matrix audio/video attachments are not supported"
+		return att
+	}
+	if encrypted, ok := content["file"].(map[string]interface{}); ok && len(encrypted) > 0 {
+		att.UnsupportedReason = "encrypted Matrix attachments are not supported"
+		return att
+	}
+	mxc, _ := content["url"].(string)
+	if att.Filename == "" {
+		att.Filename = "attachment"
+	}
+	if mxc == "" {
+		att.UnsupportedReason = "Matrix attachment URL is missing"
+		return att
+	}
+	server, mediaID, err := parseMXC(mxc)
+	if err != nil {
+		att.UnsupportedReason = "invalid Matrix attachment URL"
+		return att
+	}
+	att.URL = "mxc://" + server + "/" + mediaID
+	att.Open = func(ctx context.Context) (io.ReadCloser, error) { return m.openMatrixMedia(ctx, server, mediaID) }
+	return att
+}
+
+func parseMXC(raw string) (string, string, error) {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme != "mxc" || u.User != nil || u.Host == "" || u.RawQuery != "" || u.Fragment != "" {
+		return "", "", fmt.Errorf("invalid mxc")
+	}
+	mediaID := strings.TrimPrefix(u.EscapedPath(), "/")
+	if mediaID == "" || strings.Contains(mediaID, "/") {
+		return "", "", fmt.Errorf("invalid mxc")
+	}
+	decoded, err := url.PathUnescape(mediaID)
+	if err != nil || decoded == "." || decoded == ".." || strings.ContainsAny(decoded, "/\\") {
+		return "", "", fmt.Errorf("invalid mxc")
+	}
+	return u.Host, decoded, nil
+}
+
+func (m *MatrixChannel) openMatrixMedia(ctx context.Context, server, mediaID string) (io.ReadCloser, error) {
+	origin, err := url.Parse(m.Homeserver)
+	if err != nil || (origin.Scheme != "https" && origin.Scheme != "http") || origin.Host == "" || origin.User != nil || origin.RawQuery != "" || origin.Fragment != "" {
+		return nil, fmt.Errorf("invalid Matrix homeserver")
+	}
+	path := "/_matrix/client/v1/media/download/" + url.PathEscape(server) + "/" + url.PathEscape(mediaID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(m.Homeserver, "/")+path, nil)
+	if err != nil {
+		return nil, fmt.Errorf("invalid Matrix media request")
+	}
+	req.Header.Set("Authorization", "Bearer "+m.Token)
+	resp, err := mediaHTTPClient(m.client, origin).Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("Matrix media request failed")
+	}
+	if err := checkMediaStatus(resp); err != nil {
+		return nil, err
+	}
+	return resp.Body, nil
 }
 
 func (m *MatrixChannel) Stop() error {

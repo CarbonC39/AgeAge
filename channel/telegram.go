@@ -7,10 +7,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
 
+	"ageage/attachment"
 	"ageage/config"
 )
 
@@ -135,77 +137,10 @@ func (t *TelegramChannel) Start(handler MessageHandler) error {
 				continue
 			}
 
-			// Accept both text messages and media with captions.
-			text := update.Message.Text
-			if text == "" {
-				text = update.Message.Caption
-			}
-			if text == "" {
+			incoming, ok := t.parseIncoming(update.Message)
+			if !ok {
 				continue
 			}
-
-			if update.Message.From.ID == t.botID {
-				continue
-			}
-
-			isGroup := update.Message.Chat.Type != "private"
-			senderID := fmt.Sprintf("%d", update.Message.From.ID)
-			username := update.Message.From.Username
-
-			// Security: deny all group messages when no allowlist is configured.
-			if isGroup && len(t.AllowedUsers) == 0 {
-				continue
-			}
-
-			if !t.isAllowedUser(senderID, username) {
-				continue
-			}
-
-			// Detect whether this message is directed at the bot:
-			//   1. @mention — text contains "@botUsername"
-			//   2. Reply to bot — the replied-to message was sent by the bot
-			//   3. Supergroup topic thread — Telegram only delivers topic messages to bots
-			//      that are members of the topic (treated as implicitly directed)
-			mentionTag := "@" + t.botUsername
-			hasMention := t.botUsername != "" && strings.Contains(text, mentionTag)
-			isReplyToBot := update.Message.ReplyToMessage != nil &&
-				t.botID != 0 &&
-				update.Message.ReplyToMessage.From.ID == t.botID
-			botMentioned := hasMention || isReplyToBot || update.Message.MessageThreadID != 0
-
-			// Strip the @mention text only when an explicit @mention is present.
-			if hasMention {
-				text = strings.ReplaceAll(text, mentionTag, "")
-				text = strings.TrimSpace(text)
-			}
-
-			chatID := fmt.Sprintf("%d", update.Message.Chat.ID)
-			msgID := fmt.Sprintf("%d", update.Message.MessageID)
-			threadID := ""
-			if update.Message.MessageThreadID != 0 {
-				threadID = fmt.Sprintf("%d", update.Message.MessageThreadID)
-			}
-
-			incoming := IncomingMessage{
-				ChannelType:  config.ChannelTelegram,
-				ChannelID:    chatID,
-				SenderID:     senderID,
-				SenderName:   update.Message.From.FirstName,
-				Text:         text,
-				ReplyTo:      msgID,
-				ThreadID:     threadID,
-				IsGroupChat:  isGroup,
-				BotMentioned: botMentioned,
-			}
-
-			// Capture values for the Respond closure.
-			capturedChatID := chatID
-			capturedMsgID := update.Message.MessageID
-			capturedThreadID := update.Message.MessageThreadID
-			incoming.Respond = func(replyText string) error {
-				return t.sendInTopic(capturedChatID, capturedThreadID, capturedMsgID, replyText)
-			}
-
 			go func(msg IncomingMessage, topicID int) {
 				reply := handler(msg)
 				if reply != "" {
@@ -214,9 +149,157 @@ func (t *TelegramChannel) Start(handler MessageHandler) error {
 					fmt.Sscanf(msg.ReplyTo, "%d", &msgIDInt)
 					_ = t.sendInTopic(msg.ChannelID, topicID, msgIDInt, reply)
 				}
-			}(incoming, capturedThreadID)
+			}(incoming, update.Message.MessageThreadID)
 		}
 	}
+}
+
+// parseIncoming extracts text and lazy media streams from a Telegram message.
+func (t *TelegramChannel) parseIncoming(message *tgMessage) (IncomingMessage, bool) {
+	if message == nil || message.From.ID == t.botID {
+		return IncomingMessage{}, false
+	}
+	text := message.Text
+	if text == "" {
+		text = message.Caption
+	}
+	attachments := t.telegramAttachments(message)
+	if text == "" && len(attachments) == 0 {
+		return IncomingMessage{}, false
+	}
+	isGroup := message.Chat.Type != "private"
+	senderID := fmt.Sprintf("%d", message.From.ID)
+	if isGroup && len(t.AllowedUsers) == 0 || !t.isAllowedUser(senderID, message.From.Username) {
+		return IncomingMessage{}, false
+	}
+	mentionTag := "@" + t.botUsername
+	hasMention := t.botUsername != "" && strings.Contains(text, mentionTag)
+	isReplyToBot := message.ReplyToMessage != nil && t.botID != 0 && message.ReplyToMessage.From.ID == t.botID
+	botMentioned := hasMention || isReplyToBot || message.MessageThreadID != 0
+	if hasMention {
+		text = strings.TrimSpace(strings.ReplaceAll(text, mentionTag, ""))
+	}
+	threadID := ""
+	if message.MessageThreadID != 0 {
+		threadID = fmt.Sprintf("%d", message.MessageThreadID)
+	}
+	out := IncomingMessage{ChannelType: config.ChannelTelegram, ChannelID: fmt.Sprintf("%d", message.Chat.ID), SenderID: senderID, SenderName: message.From.FirstName, Text: text, Attachments: attachments, ReplyTo: fmt.Sprintf("%d", message.MessageID), ThreadID: threadID, IsGroupChat: isGroup, BotMentioned: botMentioned}
+	chatID, msgID, topicID := out.ChannelID, message.MessageID, message.MessageThreadID
+	out.Respond = func(replyText string) error { return t.sendInTopic(chatID, topicID, msgID, replyText) }
+	return out, true
+}
+
+func (t *TelegramChannel) telegramAttachments(message *tgMessage) []attachment.Attachment {
+	var out []attachment.Attachment
+	if n := len(message.Photo); n > 0 {
+		var best tgPhotoSize
+		for _, photo := range message.Photo {
+			if photo.FileID == "" || photo.ParseError != "" {
+				continue
+			}
+			if best.FileID == "" || photo.Width*photo.Height > best.Width*best.Height || photo.Width*photo.Height == best.Width*best.Height && photo.FileSize > best.FileSize {
+				best = photo
+			}
+		}
+		if best.FileID != "" {
+			out = append(out, t.telegramAttachment(best.FileID, "photo.jpg", "image/jpeg", best.FileSize))
+		} else {
+			out = append(out, attachment.Attachment{Filename: "photo.jpg", MIMEType: "image/jpeg", UnsupportedReason: "invalid Telegram photo metadata"})
+		}
+	}
+	if message.Document != nil {
+		name := message.Document.FileName
+		if name == "" {
+			name = "document"
+		}
+		if message.Document.ParseError != "" {
+			out = append(out, attachment.Attachment{Filename: name, MIMEType: message.Document.MIMEType, Size: message.Document.FileSize, UnsupportedReason: "invalid Telegram document metadata: " + message.Document.ParseError})
+		} else if message.Document.FileID != "" {
+			out = append(out, t.telegramAttachment(message.Document.FileID, name, message.Document.MIMEType, message.Document.FileSize))
+		} else {
+			out = append(out, attachment.Attachment{Filename: name, MIMEType: message.Document.MIMEType, Size: message.Document.FileSize, UnsupportedReason: "Telegram document file_id is missing"})
+		}
+	}
+	return out
+}
+
+func (t *TelegramChannel) telegramAttachment(fileID, filename, mime string, size int64) attachment.Attachment {
+	return attachment.Attachment{Filename: filename, MIMEType: mime, Size: size, Open: func(ctx context.Context) (io.ReadCloser, error) {
+		filePath, err := t.getFilePath(ctx, fileID)
+		if err != nil {
+			return nil, err
+		}
+		return t.openTelegramFile(ctx, filePath)
+	}}
+}
+
+type tgFile struct {
+	FilePath string `json:"file_path"`
+}
+
+func (t *TelegramChannel) getFilePath(ctx context.Context, fileID string) (string, error) {
+	u, err := url.Parse(t.baseURL)
+	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return "", fmt.Errorf("invalid Telegram API endpoint")
+	}
+	reqURL := strings.TrimRight(t.baseURL, "/") + "/getFile?file_id=" + url.QueryEscape(fileID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("invalid Telegram file request")
+	}
+	resp, err := mediaHTTPClient(t.client, u).Do(req)
+	if err != nil {
+		return "", fmt.Errorf("Telegram getFile request failed")
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		resp.Body.Close()
+		return "", fmt.Errorf("Telegram getFile failed (HTTP %d)", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20+1))
+	resp.Body.Close()
+	if err != nil || len(body) > 1<<20 {
+		return "", fmt.Errorf("Telegram getFile response invalid")
+	}
+	var result struct {
+		OK     bool   `json:"ok"`
+		Result tgFile `json:"result"`
+	}
+	if json.Unmarshal(body, &result) != nil || !result.OK || result.Result.FilePath == "" {
+		return "", fmt.Errorf("Telegram getFile response invalid")
+	}
+	return result.Result.FilePath, nil
+}
+
+func (t *TelegramChannel) openTelegramFile(ctx context.Context, filePath string) (io.ReadCloser, error) {
+	u, err := url.Parse(t.baseURL)
+	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return nil, fmt.Errorf("invalid Telegram API endpoint")
+	}
+	path := strings.TrimLeft(filePath, "/")
+	if path == "" || strings.ContainsAny(path, "\\?#") {
+		return nil, fmt.Errorf("invalid Telegram file path")
+	}
+	for _, segment := range strings.Split(path, "/") {
+		if segment == "" || segment == "." || segment == ".." {
+			return nil, fmt.Errorf("invalid Telegram file path")
+		}
+	}
+	basePath := strings.TrimRight(u.EscapedPath(), "/")
+	// Telegram's file API mirrors the token path below /file.
+	u.Path = "/file" + basePath + "/" + path
+	u.RawPath = ""
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("invalid Telegram file request")
+	}
+	resp, err := mediaHTTPClient(t.client, u).Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("Telegram file download failed")
+	}
+	if err := checkMediaStatus(resp); err != nil {
+		return nil, err
+	}
+	return resp.Body, nil
 }
 
 func (t *TelegramChannel) Stop() error {
@@ -392,13 +475,109 @@ type tgInlineButton struct {
 }
 
 type tgMessage struct {
-	MessageID       int        `json:"message_id"`
-	Text            string     `json:"text"`
-	Caption         string     `json:"caption"` // Text for photo/document/voice messages
-	Chat            tgChat     `json:"chat"`
-	From            tgUser     `json:"from"`
-	MessageThreadID int        `json:"message_thread_id"` // Supergroup topic ID; 0 if none
-	ReplyToMessage  *tgMessage `json:"reply_to_message"`  // Non-nil when this is a reply
+	MessageID       int           `json:"message_id"`
+	Text            string        `json:"text"`
+	Caption         string        `json:"caption"` // Text for photo/document/voice messages
+	Chat            tgChat        `json:"chat"`
+	From            tgUser        `json:"from"`
+	MessageThreadID int           `json:"message_thread_id"` // Supergroup topic ID; 0 if none
+	ReplyToMessage  *tgMessage    `json:"reply_to_message"`  // Non-nil when this is a reply
+	Photo           []tgPhotoSize `json:"photo"`
+	Document        *tgDocument   `json:"document"`
+}
+
+type tgPhotoSize struct {
+	FileID     string `json:"file_id"`
+	Width      int    `json:"width"`
+	Height     int    `json:"height"`
+	FileSize   int64  `json:"file_size"`
+	ParseError string `json:"-"`
+}
+
+type tgDocument struct {
+	FileID     string `json:"file_id"`
+	FileName   string `json:"file_name"`
+	MIMEType   string `json:"mime_type"`
+	FileSize   int64  `json:"file_size"`
+	ParseError string `json:"-"`
+}
+
+func (p *tgPhotoSize) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		FileID   json.RawMessage `json:"file_id"`
+		Width    json.RawMessage `json:"width"`
+		Height   json.RawMessage `json:"height"`
+		FileSize json.RawMessage `json:"file_size"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		p.ParseError = "invalid photo object"
+		return nil
+	}
+	var problems []string
+	var err error
+	if p.FileID, err = parseJSONString(raw.FileID); err != nil {
+		problems = append(problems, "file_id")
+	}
+	if p.Width, err = parseJSONInt(raw.Width); err != nil {
+		problems = append(problems, "width")
+	}
+	if p.Height, err = parseJSONInt(raw.Height); err != nil {
+		problems = append(problems, "height")
+	}
+	if raw.FileSize != nil {
+		if p.FileSize, err = parseJSONInt64(raw.FileSize); err != nil {
+			problems = append(problems, "file_size")
+		}
+	}
+	p.ParseError = strings.Join(problems, ", ")
+	return nil
+}
+
+func (d *tgDocument) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		FileID   json.RawMessage `json:"file_id"`
+		FileName json.RawMessage `json:"file_name"`
+		MIMEType json.RawMessage `json:"mime_type"`
+		FileSize json.RawMessage `json:"file_size"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		d.ParseError = "invalid document object"
+		return nil
+	}
+	var err error
+	if d.FileID, err = parseJSONString(raw.FileID); err != nil {
+		d.ParseError = "file_id"
+	}
+	d.FileName, _ = parseJSONString(raw.FileName)
+	d.MIMEType, _ = parseJSONString(raw.MIMEType)
+	if raw.FileSize != nil {
+		if d.FileSize, err = parseJSONInt64(raw.FileSize); err != nil {
+			d.ParseError = "file_size"
+		}
+	}
+	return nil
+}
+
+func parseJSONString(raw json.RawMessage) (string, error) {
+	var value string
+	if len(raw) == 0 {
+		return "", nil
+	}
+	err := json.Unmarshal(raw, &value)
+	return value, err
+}
+func parseJSONInt(raw json.RawMessage) (int, error) {
+	var value int
+	if len(raw) == 0 {
+		return 0, nil
+	}
+	err := json.Unmarshal(raw, &value)
+	return value, err
+}
+func parseJSONInt64(raw json.RawMessage) (int64, error) {
+	var value int64
+	err := json.Unmarshal(raw, &value)
+	return value, err
 }
 
 type tgChat struct {

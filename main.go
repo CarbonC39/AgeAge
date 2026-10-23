@@ -1007,6 +1007,12 @@ func startChannels(factory *agent.AgentFactory) (*channel.Manager, int, func(too
 		text := strings.TrimSpace(msg.Text)
 		textLow := strings.ToLower(text)
 		cmd := parseIMCommand(msg.ChannelType, text)
+		// Media captions are part of a user turn, even when they happen to
+		// resemble administrative commands or answers to a pending question.
+		if len(msg.Attachments) > 0 {
+			cmd = imCommand{}
+		}
+		isConfirmationResponse := len(msg.Attachments) == 0 && (textLow == "y" || textLow == "n" || textLow == "a")
 		// Reuse the channel connector's inbound allowlist for confirmation
 		// approval. The originating sender remains authorised even when the
 		// allowlist is empty.
@@ -1028,7 +1034,7 @@ func startChannels(factory *agent.AgentFactory) (*channel.Manager, int, func(too
 		// Confirmation replies and recognized channel commands are directed at the
 		// bot by definition; unknown prefixed text still requires a mention.
 		if msg.IsGroupChat && !msg.BotMentioned {
-			if textLow != "y" && textLow != "n" && textLow != "a" && !isRecognizedIMCommand(cmd, factory.GetSkills()) {
+			if !isConfirmationResponse && !isRecognizedIMCommand(cmd, factory.GetSkills()) {
 				return ""
 			}
 		}
@@ -1042,7 +1048,7 @@ func startChannels(factory *agent.AgentFactory) (*channel.Manager, int, func(too
 		}
 
 		// Confirmation responses bypass the per-chat mutex.
-		if textLow == "y" || textLow == "n" || textLow == "a" {
+		if isConfirmationResponse {
 			agentMu.Lock()
 			pendingSession := activeSessions[chatKey]
 			agentMu.Unlock()
@@ -1107,7 +1113,7 @@ func startChannels(factory *agent.AgentFactory) (*channel.Manager, int, func(too
 			SessionID:   pendingSession,
 			SenderID:    msg.SenderID,
 		}
-		if len(factory.UserInputMgr.GetPendingForScope(scope)) > 0 {
+		if len(msg.Attachments) == 0 && len(factory.UserInputMgr.GetPendingForScope(scope)) > 0 {
 			if !factory.UserInputMgr.RespondForScope(scope, text) {
 				return respond(msg, "❌ User input could not be matched uniquely or you are not authorised.")
 			}
@@ -1399,36 +1405,33 @@ func startChannels(factory *agent.AgentFactory) (*channel.Manager, int, func(too
 				runFailed = false
 				return respond(msg, "Nothing to retry.")
 			}
-			runText = lastMsg.TextContent()
-			retryParts = lastMsg.Parts
-			if retryModifier != "" {
-				runText += "\n\n" + retryModifier
-			}
+			retried := retryUserInput(lastMsg, retryModifier)
+			runText, retryParts = retried.Text, retried.Parts
 			ag.RollbackLastTurn()
 		}
-		// In group chats, prefix with a clean sender name so the agent can
-		// distinguish participants. DMs are unlabelled (single user).
-		if msg.IsGroupChat && msg.SenderID != "" && !retryRequested {
-			displayName := senderDisplayName(msg.ChannelType, msg.SenderID, msg.SenderName)
-			runText = fmt.Sprintf("[%s]: %s", displayName, runText)
+		input := agent.UserInput{Text: runText, Parts: retryParts}
+		if !retryRequested {
+			input = normalizeIMInput(context.Background(), msg, factory.Config, ag.TmpManager())
+		}
+		warningReply := imInputWarnings(input)
+		if warningReply != "" && msg.Respond != nil {
+			if err := msg.Respond(warningReply); err == nil {
+				warningReply = ""
+			}
 		}
 		var result string
 		var err error
-		if len(retryParts) > 0 {
-			result, err = ag.RunWithParts(context.Background(), runText, retryParts, nil)
-		} else {
-			result, err = ag.Run(context.Background(), runText, nil)
-		}
+		result, err = ag.RunInput(context.Background(), input, nil)
 		// Save history after every run (best-effort; ignore errors).
 		if saveErr := tx.SaveHistory(ag.Messages()); saveErr != nil && err == nil {
 			err = fmt.Errorf("save session history: %w", saveErr)
 		}
 
 		if err != nil {
-			return respond(msg, fmt.Sprintf("Agent error: %s", err))
+			return respond(msg, warningReply+fmt.Sprintf("Agent error: %s", err))
 		}
 		runFailed = false
-		return respond(msg, result)
+		return respond(msg, warningReply+result)
 	}
 
 	manager := channel.NewManager(handler)
@@ -2372,11 +2375,8 @@ func runCLI(cmd *cobra.Command, args []string) error {
 							if !ok {
 								err = fmt.Errorf("nothing to retry")
 							} else {
-								text = lastMsg.TextContent()
-								ps = lastMsg.Parts
-								if modifier != "" {
-									text += "\n\n" + modifier
-								}
+								retried := retryUserInput(lastMsg, modifier)
+								text, ps = retried.Text, retried.Parts
 								ag.RollbackLastTurn()
 							}
 						}

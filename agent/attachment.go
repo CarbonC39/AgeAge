@@ -4,243 +4,392 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"io"
+	"mime"
+	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
-	"time"
+	"unicode"
+	"unicode/utf8"
 
+	"ageage/attachment"
 	"ageage/config"
 	"ageage/llm"
 )
 
-// imageExts maps lowercase file extensions to MIME types for images
-// that can be sent directly to vision-capable LLMs.
-var imageExts = map[string]string{
-	".jpg":  "image/jpeg",
-	".jpeg": "image/jpeg",
-	".png":  "image/png",
-	".gif":  "image/gif",
-	".webp": "image/webp",
+const (
+	defaultAttachmentBytes int64 = 10 * 1024 * 1024
+	maxAttachmentTextBytes       = 512 * 1024
+	maxIncomingAttachments       = 16
+)
+
+// UserInput is a normalized turn, independent of transport and run scheduling.
+// It contains no open readers or download callbacks and can later be queued in
+// a RunHandle inbox. Warnings are also included as text parts for model context.
+// Referenced files belong to the session's TmpManager until history releases them.
+type UserInput struct {
+	Text     string
+	Parts    []llm.ContentPart
+	Warnings []string
 }
 
-// processAttachment reads the file at path and returns the appropriate
-// ContentPart(s) based on the file type and multimodal config.
-//
-// For images with vision=true:  base64 data URI image_url part.
-// For images with vision=false: text placeholder or converter output.
-// For documents with a converter: runs the converter, returns text part with output.
-// For other files: reads as text, returns a text part.
+// RunInput submits a previously normalized turn. Normalization can be performed
+// before choosing whether to start a run or enqueue input into an active run.
+func (a *Agent) RunInput(ctx context.Context, input UserInput, cb llm.StreamCallback) (string, error) {
+	return a.RunWithParts(ctx, input.Text, input.Parts, cb)
+}
+
+// NormalizeUserInput owns the common incoming attachment pipeline for CLI and IM.
+// Each attachment fails independently. The existing max_image_bytes setting caps
+// every input file and the total successfully staged bytes in a turn.
+func NormalizeUserInput(ctx context.Context, text string, attachments []attachment.Attachment, cfg *config.Config, tmpMgr *TmpManager) UserInput {
+	input := UserInput{Text: text}
+	if len(attachments) == 0 {
+		return input
+	}
+	if cfg == nil {
+		cfg = config.DefaultConfig()
+	}
+	limit := cfg.Multimodal.MaxImageBytes
+	if limit <= 0 {
+		limit = defaultAttachmentBytes
+	}
+	// Keep limit+1 representable even for a manually constructed configuration.
+	if limit == int64(^uint64(0)>>1) {
+		limit--
+	}
+	retainPaths := tmpMgr != nil
+	if tmpMgr == nil {
+		dir, err := os.MkdirTemp("", "ageage-attachments-*")
+		if err != nil {
+			input.Warnings = append(input.Warnings, "attachments: cannot create temporary storage")
+			input.Parts = warningParts(text, input.Warnings)
+			return input
+		}
+		defer os.RemoveAll(dir)
+		tmpMgr = newTmpManager(dir)
+		defer tmpMgr.ClearAll()
+	}
+	if text != "" {
+		input.Parts = append(input.Parts, llm.ContentPart{Type: "text", Text: text})
+	}
+	remaining := limit
+	for i, att := range attachments {
+		if i >= maxIncomingAttachments {
+			warning := fmt.Sprintf("attachments: only the first %d files per message can be processed", maxIncomingAttachments)
+			input.Warnings = append(input.Warnings, warning)
+			input.Parts = append(input.Parts, llm.ContentPart{Type: "text", Text: "[Attachment warning: " + warning + "]"})
+			break
+		}
+		att.Filename = sanitizeAttachmentName(att.Filename)
+		parts, warnings, size := normalizeAttachment(ctx, att, cfg, tmpMgr, remaining, retainPaths)
+		remaining -= size
+		input.Parts = append(input.Parts, parts...)
+		for _, warning := range warnings {
+			warning = fmt.Sprintf("attachment %q: %s", att.Filename, warning)
+			input.Warnings = append(input.Warnings, warning)
+			input.Parts = append(input.Parts, llm.ContentPart{Type: "text", Text: "[Attachment warning: " + warning + "]"})
+		}
+	}
+	return input
+}
+
+func warningParts(text string, warnings []string) []llm.ContentPart {
+	var parts []llm.ContentPart
+	if text != "" {
+		parts = append(parts, llm.ContentPart{Type: "text", Text: text})
+	}
+	for _, w := range warnings {
+		parts = append(parts, llm.ContentPart{Type: "text", Text: "[Attachment warning: " + w + "]"})
+	}
+	return parts
+}
+
+// sanitizeAttachmentName treats both Windows and POSIX paths as untrusted names.
+// Files are always created using a random prefix beneath the staging directory.
+func sanitizeAttachmentName(name string) string {
+	name = filepath.Base(strings.ReplaceAll(name, "\\", "/"))
+	name = strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) || r == ':' {
+			return '_'
+		}
+		return r
+	}, name)
+	name = strings.Trim(name, " .")
+	if name == "" {
+		name = "attachment"
+	}
+	if len(name) > 180 {
+		ext := filepath.Ext(name)
+		if len(ext) > 30 {
+			ext = ""
+		}
+		name = name[:150]
+		for !utf8.ValidString(name) {
+			name = name[:len(name)-1]
+		}
+		name += ext
+	}
+	return name
+}
+
+func normalizeAttachment(ctx context.Context, att attachment.Attachment, cfg *config.Config, mgr *TmpManager, limit int64, retainPaths bool) ([]llm.ContentPart, []string, int64) {
+	metadata := fmt.Sprintf("[Attachment %q; MIME: %s; size: %d bytes]", att.Filename, cleanMIME(att.MIMEType), att.Size)
+	if att.UnsupportedReason != "" {
+		return []llm.ContentPart{{Type: "text", Text: metadata}}, []string{att.UnsupportedReason}, 0
+	}
+	if att.Size < 0 {
+		return nil, []string{"invalid negative file size"}, 0
+	}
+	if att.Size > limit || limit <= 0 {
+		return nil, []string{fmt.Sprintf("too large: %d bytes; remaining attachment limit %d bytes", att.Size, limit)}, 0
+	}
+	if att.Open == nil {
+		return nil, []string{"download unavailable"}, 0
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, []string{err.Error()}, 0
+	}
+	body, err := att.Open(ctx)
+	if err != nil {
+		return nil, []string{fmt.Sprintf("download failed: %s", err)}, 0
+	}
+	if body == nil {
+		return nil, []string{"download returned no stream"}, 0
+	}
+	defer body.Close()
+	path, err := mgr.NewStagedFile(att.Filename)
+	if err != nil {
+		return nil, []string{"cannot create staged file"}, 0
+	}
+	keep := false
+	defer func() {
+		if !keep {
+			mgr.Remove(path)
+		}
+	}()
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0600)
+	if err != nil {
+		return nil, []string{"cannot write staged file"}, 0
+	}
+	// Never trust the platform's size. Read at most limit+1 to detect overflow,
+	// streaming directly to disk instead of buffering the incoming body in RAM.
+	n, copyErr := io.Copy(f, &io.LimitedReader{R: &attachmentContextReader{ctx: ctx, r: body}, N: limit + 1})
+	closeErr := f.Close()
+	if n > limit {
+		return nil, []string{fmt.Sprintf("too large: download exceeds %d byte attachment limit", limit)}, 0
+	}
+	if copyErr != nil || closeErr != nil {
+		return nil, []string{"failed to read or stage attachment"}, 0
+	}
+	data, err := os.ReadFile(path) // file was exclusively created and bounded above
+	if err != nil {
+		return nil, []string{"cannot read staged file"}, 0
+	}
+	sniffed := cleanMIME(http.DetectContentType(data))
+	ext := strings.ToLower(filepath.Ext(att.Filename))
+	declared := cleanMIME(att.MIMEType)
+	inferred := sniffed
+	if inferred == "application/octet-stream" && declared != "" {
+		inferred = declared
+	}
+	if inferred == "application/octet-stream" {
+		if m := mime.TypeByExtension(ext); m != "" {
+			inferred = cleanMIME(m)
+		}
+	}
+	isImage := isVisionMIME(sniffed)
+	if isImage && cfg.Multimodal.Vision {
+		return []llm.ContentPart{{Type: "image_url", ImageURL: &llm.ImageURLPart{URL: "data:" + sniffed + ";base64," + base64.StdEncoding.EncodeToString(data), Detail: "auto"}}}, nil, n
+	}
+	// Prefer the content-derived image extension when a filename is missing or
+	// misleading, so vision-disabled images can still use a configured converter.
+	convExt := strings.TrimPrefix(ext, ".")
+	if isImage {
+		if e := imageMIMEExtension(sniffed); e != "" {
+			convExt = e
+		}
+	}
+	var warnings []string
+	conv := cfg.FindConverter(strings.TrimPrefix(ext, "."))
+	if conv == nil {
+		conv = cfg.FindConverter(convExt)
+	}
+	if conv == nil {
+		// Media often arrives without an extension. Prefer the sniffed MIME,
+		// then the platform hint, to locate an existing configured converter.
+		for _, mediaType := range []string{sniffed, declared} {
+			if mediaType == "application/octet-stream" {
+				continue
+			}
+			extensions, _ := mime.ExtensionsByType(mediaType)
+			for _, extension := range extensions {
+				if conv = cfg.FindConverter(strings.TrimPrefix(extension, ".")); conv != nil {
+					break
+				}
+			}
+			if conv != nil {
+				break
+			}
+		}
+	}
+	if conv != nil {
+		converted, outputPath, truncated, convErr := runConverterContext(ctx, path, conv, mgr)
+		if convErr == nil {
+			keep = true
+			if truncated {
+				warnings = append(warnings, "converter output truncated at 512 KiB")
+			}
+			note, outputNote := "", ""
+			if retainPaths {
+				note = "; staged at: " + path
+				outputNote = "\n[tmp: " + outputPath + "]"
+			}
+			return []llm.ContentPart{{Type: "text", Text: fmt.Sprintf("[File %q converted to text — %d lines%s]\n\n%s%s", att.Filename, countLines(converted), note, converted, outputNote)}}, warnings, n
+		}
+		warnings = append(warnings, fmt.Sprintf("conversion failed: %s", convErr))
+	}
+	if isImage || strings.HasPrefix(sniffed, "image/") {
+		warnings = append(warnings, "image cannot be read: vision not enabled or image format unsupported; configure a text converter")
+		return []llm.ContentPart{{Type: "text", Text: metadata}}, warnings, n
+	}
+	if isTextAttachment(data, sniffed) {
+		content := string(data)
+		if len(content) > maxAttachmentTextBytes {
+			content = truncateAttachmentText(content, maxAttachmentTextBytes)
+			warning := "text output truncated at 512 KiB"
+			if retainPaths {
+				warning += "; full file remains staged"
+			}
+			warnings = append(warnings, warning)
+		}
+		keep = true
+		note := ""
+		if retainPaths {
+			note = "; staged at: " + path
+		}
+		return []llm.ContentPart{{Type: "text", Text: fmt.Sprintf("[File %q — %d lines; MIME: %s%s]\n\n%s", att.Filename, countLines(string(data)), inferred, note, content)}}, warnings, n
+	}
+	warnings = append(warnings, fmt.Sprintf("unsupported binary format (%s); configure a converter", inferred))
+	return []llm.ContentPart{{Type: "text", Text: metadata}}, warnings, n
+}
+
+type attachmentContextReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (r *attachmentContextReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.r.Read(p)
+}
+func cleanMIME(s string) string {
+	m, _, err := mime.ParseMediaType(s)
+	if err != nil {
+		return "application/octet-stream"
+	}
+	return strings.ToLower(m)
+}
+func isVisionMIME(m string) bool {
+	return m == "image/png" || m == "image/jpeg" || m == "image/gif" || m == "image/webp"
+}
+func imageMIMEExtension(m string) string {
+	switch m {
+	case "image/png":
+		return "png"
+	case "image/jpeg":
+		return "jpg"
+	case "image/gif":
+		return "gif"
+	case "image/webp":
+		return "webp"
+	}
+	return ""
+}
+func isTextAttachment(data []byte, detected string) bool {
+	if !utf8.Valid(data) || !strings.HasPrefix(detected, "text/") {
+		return false
+	}
+	for _, r := range string(data) {
+		if unicode.IsControl(r) && r != '\n' && r != '\r' && r != '\t' {
+			return false
+		}
+	}
+	return true
+}
+func truncateAttachmentText(text string, limit int) string {
+	if len(text) <= limit {
+		return text
+	}
+	text = text[:limit]
+	for !utf8.ValidString(text) {
+		text = text[:len(text)-1]
+	}
+	return text + "\n[... output truncated at 512 KiB ...]"
+}
+
+func localAttachment(path string, info os.FileInfo) attachment.Attachment {
+	return attachment.Attachment{Filename: filepath.Base(path), Size: info.Size(), Open: func(ctx context.Context) (io.ReadCloser, error) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return os.Open(path)
+	}}
+}
+
+// processAttachment is retained as the local-file adapter; all interpretation
+// and limits live in NormalizeUserInput, exactly as for incoming IM files.
 func processAttachment(path string, cfg *config.Config, tmpMgr *TmpManager) ([]llm.ContentPart, error) {
-	mm := cfg.Multimodal
 	info, err := os.Stat(path)
 	if err != nil {
-		return nil, fmt.Errorf("cannot access %q: %w", path, err)
+		return nil, err
 	}
-	if info.IsDir() {
-		return nil, fmt.Errorf("%q is a directory", path)
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("not a regular file")
 	}
-
-	// Stage a local copy so the file persists even if the original is removed.
-	stagedPath := path
-	if tmpMgr != nil {
-		stagedDir := tmpMgr.StagingDir()
-		if err := os.MkdirAll(stagedDir, 0o755); err == nil {
-			dest := filepath.Join(stagedDir, filepath.Base(path))
-			if _, statErr := os.Stat(dest); statErr == nil {
-				ext := filepath.Ext(path)
-				base := strings.TrimSuffix(filepath.Base(path), ext)
-				dest = filepath.Join(stagedDir, fmt.Sprintf("%s_%d%s", base, time.Now().UnixNano(), ext))
-			}
-			if cpErr := copyFile(path, dest); cpErr == nil {
-				stagedPath = dest
-			}
-		}
+	input := NormalizeUserInput(context.Background(), "", []attachment.Attachment{localAttachment(path, info)}, cfg, tmpMgr)
+	if len(input.Warnings) > 0 {
+		return input.Parts, fmt.Errorf("%s", strings.Join(input.Warnings, "; "))
 	}
-
-	ext := strings.ToLower(filepath.Ext(path))
-
-	// ── Image handling ────────────────────────────────────────────────────────
-	if mime, isImage := imageExts[ext]; isImage {
-		if mm.MaxImageBytes > 0 && info.Size() > mm.MaxImageBytes {
-			return nil, fmt.Errorf("image %q is too large (%d bytes, limit %d)", filepath.Base(path), info.Size(), mm.MaxImageBytes)
-		}
-		if mm.Vision {
-			data, err := os.ReadFile(stagedPath)
-			if err != nil {
-				return nil, fmt.Errorf("read image %q: %w", path, err)
-			}
-			encoded := base64.StdEncoding.EncodeToString(data)
-			return []llm.ContentPart{{
-				Type: "image_url",
-				ImageURL: &llm.ImageURLPart{
-					URL:    fmt.Sprintf("data:%s;base64,%s", mime, encoded),
-					Detail: "auto",
-				},
-			}}, nil
-		}
-		// vision=false: try converter, else placeholder
-		extNoDot := strings.TrimPrefix(ext, ".")
-		if conv := cfg.FindConverter(extNoDot); conv != nil {
-			text, tmpPath, err := runConverter(stagedPath, conv, tmpMgr)
-			if err == nil {
-				return []llm.ContentPart{{Type: "text", Text: fmt.Sprintf("[Image %q converted to text — %d lines]\n\n%s\n[tmp: %s]", filepath.Base(path), countLines(text), text, tmpPath)}}, nil
-			}
-		}
-		return []llm.ContentPart{{Type: "text", Text: fmt.Sprintf("[Image attachment: %q — vision not enabled and no converter configured]", filepath.Base(path))}}, nil
-	}
-
-	// ── Converter-handled document formats ───────────────────────────────────
-	extNoDot := strings.TrimPrefix(ext, ".")
-	if conv := cfg.FindConverter(extNoDot); conv != nil {
-		text, tmpPath, err := runConverter(stagedPath, conv, tmpMgr)
-		if err != nil {
-			return nil, fmt.Errorf("convert %q: %w", filepath.Base(path), err)
-		}
-		total := countLines(text)
-		return []llm.ContentPart{{Type: "text", Text: fmt.Sprintf("[File %q converted to text — %d lines]\n\n%s\n[tmp: %s]", filepath.Base(path), total, text, tmpPath)}}, nil
-	}
-
-	// ── Plain text / source code fallback ────────────────────────────────────
-	data, err := os.ReadFile(stagedPath)
-	if err != nil {
-		return nil, fmt.Errorf("read %q: %w", path, err)
-	}
-	total := countLines(string(data))
-	note := ""
-	if stagedPath != path {
-		note = fmt.Sprintf(" — staged at: %s", stagedPath)
-	}
-	return []llm.ContentPart{{Type: "text", Text: fmt.Sprintf("[File %q — %d lines%s]\n\n%s", filepath.Base(path), total, note, string(data))}}, nil
+	return input.Parts, nil
 }
 
-// copyFile copies a file from src to dst.
-func copyFile(src, dst string) error {
-	data, err := os.ReadFile(src)
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(dst, data, 0o644)
-}
-
-// runConverter executes a configured converter on inputPath, writing output to
-// a managed tmp .md file. Returns (output text, tmp path, error).
-//
-// The command template supports two substitution tokens:
-//
-//	{input}  — absolute path to the input file
-//	{output} — absolute path to the output .md tmp file
-func runConverter(inputPath string, conv *config.ConverterConfig, tmpMgr *TmpManager) (string, string, error) {
-	outPath, err := tmpMgr.NewFile(".md")
-	if err != nil {
-		return "", "", err
-	}
-
-	absInput, err := filepath.Abs(inputPath)
-	if err != nil {
-		return "", "", err
-	}
-
-	// Split the command template into tokens BEFORE substituting paths, so that
-	// file paths containing spaces are never split across multiple arguments.
-	// e.g. template: `pdftotext {input} {output}` → ["pdftotext", "{input}", "{output}"]
-	// then each token gets the path substituted in-place as a single argument.
-	templateTokens := strings.Fields(conv.Command)
-	if len(templateTokens) == 0 {
-		return "", outPath, fmt.Errorf("converter command is empty")
-	}
-	cmdParts := make([]string, len(templateTokens))
-	for i, tok := range templateTokens {
-		tok = strings.ReplaceAll(tok, "{input}", absInput)
-		tok = strings.ReplaceAll(tok, "{output}", outPath)
-		cmdParts[i] = tok
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, cmdParts[0], cmdParts[1:]...)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return "", outPath, fmt.Errorf("converter exited with error: %w\n%s", err, string(out))
-	}
-
-	// Some converters write to stdout instead of the output file.
-	// If the output file is empty, use stdout as the content.
-	content, readErr := os.ReadFile(outPath)
-	if readErr != nil || len(strings.TrimSpace(string(content))) == 0 {
-		if len(out) > 0 {
-			if writeErr := os.WriteFile(outPath, out, 0o644); writeErr == nil {
-				content = out
-			}
-		}
-	}
-
-	if len(strings.TrimSpace(string(content))) == 0 {
-		return "", outPath, fmt.Errorf("converter produced no output")
-	}
-
-	// Cap output to prevent a single attachment exhausting the LLM context window.
-	const maxConverterBytes = 512 * 1024 // 512 KB
-	if len(content) > maxConverterBytes {
-		content = content[:maxConverterBytes]
-		// Trim to the last newline to avoid cutting mid-line.
-		if idx := strings.LastIndexByte(string(content), '\n'); idx > 0 {
-			content = content[:idx]
-		}
-		content = append(content, []byte("\n[... output truncated at 512 KB ...]")...)
-	}
-
-	return string(content), outPath, nil
-}
-
-// ParseCLIInput scans userInput for @path tokens, processes each as a file
-// attachment, and returns:
-//   - cleaned text (with @path tokens removed)
-//   - accumulated content parts (text part first, then attachments)
-//   - non-fatal warning strings for missing files or oversized images
+// ParseCLIInput retains the CLI's @path grammar, with the same runtime pipeline
+// as IM. Missing paths remain literal text (mentions and email addresses).
 func ParseCLIInput(userInput string, cfg *config.Config, tmpMgr *TmpManager) (text string, parts []llm.ContentPart, warnings []string) {
-	tokens := strings.Fields(userInput)
 	var textTokens []string
-	var attParts []llm.ContentPart
-
-	for _, tok := range tokens {
+	var attachments []attachment.Attachment
+	for _, tok := range strings.Fields(userInput) {
 		if !strings.HasPrefix(tok, "@") {
 			textTokens = append(textTokens, tok)
 			continue
 		}
-
-		rawPath := strings.TrimPrefix(tok, "@")
-		absPath, err := filepath.Abs(rawPath)
+		path, err := filepath.Abs(strings.TrimPrefix(tok, "@"))
 		if err != nil {
-			textTokens = append(textTokens, tok) // keep as-is
-			warnings = append(warnings, fmt.Sprintf("cannot resolve path %q: %s", rawPath, err))
+			textTokens = append(textTokens, tok)
 			continue
 		}
-
-		if _, err := os.Stat(absPath); err != nil {
-			textTokens = append(textTokens, tok) // not a file — might be an email or mention
-			continue
-		}
-
-		fileParts, err := processAttachment(absPath, cfg, tmpMgr)
+		info, err := os.Stat(path)
 		if err != nil {
-			warnings = append(warnings, fmt.Sprintf("attachment %q: %s", rawPath, err))
+			textTokens = append(textTokens, tok)
 			continue
 		}
-		attParts = append(attParts, fileParts...)
+		if !info.Mode().IsRegular() {
+			warnings = append(warnings, fmt.Sprintf("attachment %q: not a regular file", sanitizeAttachmentName(path)))
+			continue
+		}
+		attachments = append(attachments, localAttachment(path, info))
 	}
-
-	cleanText := strings.Join(textTokens, " ")
-
-	if len(attParts) == 0 {
-		// No attachments — return plain text, no parts.
-		return cleanText, nil, warnings
+	text = strings.Join(textTokens, " ")
+	input := NormalizeUserInput(context.Background(), text, attachments, cfg, tmpMgr)
+	warnings = append(warnings, input.Warnings...)
+	if len(attachments) == 0 && len(warnings) > 0 {
+		input.Parts = warningParts(text, warnings)
 	}
-
-	// Build multimodal parts: text first, then attachments.
-	parts = append([]llm.ContentPart{{Type: "text", Text: cleanText}}, attParts...)
-	return cleanText, parts, warnings
+	return text, input.Parts, warnings
 }
 
 func countLines(s string) int {

@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"ageage/attachment"
 	"ageage/config"
 )
 
@@ -306,17 +307,90 @@ func (d *DiscordChannel) Unreact(channelID, reactionKey string) error {
 // --- Discord API types ---
 
 type discordMessage struct {
-	ID                string          `json:"id"`
-	Content           string          `json:"content"`
-	Author            discordUser     `json:"author"`
-	ChannelID         string          `json:"channel_id"`
-	ReferencedMessage *discordMessage `json:"referenced_message"` // Non-nil when this is a reply
+	ID                string              `json:"id"`
+	Content           string              `json:"content"`
+	Author            discordUser         `json:"author"`
+	ChannelID         string              `json:"channel_id"`
+	ReferencedMessage *discordMessage     `json:"referenced_message"` // Non-nil when this is a reply
+	Attachments       []discordAttachment `json:"attachments"`
+}
+
+type discordAttachment struct {
+	Filename    string `json:"filename"`
+	ContentType string `json:"content_type"`
+	Size        int64  `json:"size"`
+	URL         string `json:"url"`
+	ParseError  string `json:"-"`
+}
+
+// UnmarshalJSON keeps one malformed attachment from discarding its containing
+// message (and any valid sibling attachments). Field errors are surfaced as an
+// unsupported attachment by incomingAttachments.
+func (a *discordAttachment) UnmarshalJSON(data []byte) error {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		a.ParseError = "invalid attachment metadata"
+		return nil
+	}
+	var errors []string
+	decode := func(key string, dst any) {
+		value, ok := fields[key]
+		if !ok || string(value) == "null" {
+			return
+		}
+		if err := json.Unmarshal(value, dst); err != nil {
+			errors = append(errors, "invalid "+key)
+		}
+	}
+	decode("filename", &a.Filename)
+	decode("content_type", &a.ContentType)
+	decode("size", &a.Size)
+	decode("url", &a.URL)
+	a.ParseError = strings.Join(errors, ", ")
+	return nil
 }
 
 type discordUser struct {
 	ID       string `json:"id"`
 	Username string `json:"username"`
 	Bot      bool   `json:"bot"`
+}
+
+func (d *DiscordChannel) incomingAttachments(items []discordAttachment) []attachment.Attachment {
+	result := make([]attachment.Attachment, 0, len(items))
+	for _, item := range items {
+		a := attachment.Attachment{Filename: item.Filename, MIMEType: item.ContentType, Size: item.Size}
+		if item.ParseError != "" {
+			a.UnsupportedReason = item.ParseError
+			result = append(result, a)
+			continue
+		}
+		parsed, err := url.Parse(item.URL)
+		if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" || parsed.User != nil {
+			a.UnsupportedReason = "invalid attachment URL"
+		} else {
+			a.URL = item.URL
+			mediaURL := item.URL
+			a.Open = func(ctx context.Context) (io.ReadCloser, error) {
+				req, err := http.NewRequestWithContext(ctx, http.MethodGet, mediaURL, nil)
+				if err != nil {
+					return nil, fmt.Errorf("invalid attachment request")
+				}
+				// CDN URLs are public signed URLs; never send the Discord bot token here.
+				resp, err := d.client.Do(req)
+				if err != nil {
+					return nil, fmt.Errorf("download attachment failed")
+				}
+				if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+					resp.Body.Close()
+					return nil, fmt.Errorf("download attachment returned HTTP %d", resp.StatusCode)
+				}
+				return resp.Body, nil
+			}
+		}
+		result = append(result, a)
+	}
+	return result
 }
 
 func (d *DiscordChannel) doRequest(method, path string, body interface{}) ([]byte, error) {
@@ -471,7 +545,7 @@ func (d *DiscordChannel) pollChannel(channelID string, handler MessageHandler) {
 			continue
 		}
 
-		if strings.TrimSpace(msg.Content) == "" {
+		if strings.TrimSpace(msg.Content) == "" && len(msg.Attachments) == 0 {
 			d.mu.Lock()
 			d.lastMsgIDs[channelID] = msg.ID
 			d.mu.Unlock()
@@ -554,6 +628,7 @@ func (d *DiscordChannel) pollChannel(channelID string, handler MessageHandler) {
 			SenderID:     msg.Author.ID,
 			SenderName:   msg.Author.Username,
 			Text:         content,
+			Attachments:  d.incomingAttachments(msg.Attachments),
 			ReplyTo:      msg.ID,
 			ThreadID:     threadID,
 			IsGroupChat:  isGroup,

@@ -287,6 +287,30 @@ You ▸ Summarise @report.pdf and check @screenshot.png for issues
 
 **HTTP API** — multimodal `content` arrays in request bodies are forwarded directly to the agent.
 
+**Matrix, Telegram, Discord** — send files with or without a caption. Matrix
+`m.image` and `m.file`, Telegram photos and documents, and Discord attachments
+use the same runtime pipeline as CLI files. Photos use the highest resolution
+Telegram variant; thumbnails are ignored. Captions and all accepted files form
+one user turn, preserving each channel's allowlist, mentions, and thread routing.
+
+`multimodal.max_image_bytes` applies to every CLI/IM file and the total successfully
+downloaded bytes per turn (10 MiB when unset or nonpositive). At most 16 files are
+processed per turn. Metadata is checked before opening streams; bodies are
+streamed into private staging files with a hard byte limit. Filenames are cleaned
+and content is sniffed before constructing image parts. Text and converter output
+are capped at 512 KiB per file. Converters run for at most 60 seconds with bounded
+stdout/stderr; on POSIX systems a child file-size limit also caps output files at
+1 MiB. Staged files and converter results share the session's temporary-file GC.
+
+Download failures, size violations, disabled Vision without a usable converter,
+and unsupported formats produce warnings in both the reply and model context;
+other files in the message continue. Matrix audio/video and encrypted attachments
+retain metadata and report that they are unsupported.
+
+The runtime returns a normalized `agent.UserInput` with no open download streams.
+`Agent.RunInput` consumes it; normalization is independent of scheduling so a
+future active-run inbox can reuse it.
+
 Images are sent as `image_url` parts when `multimodal.vision = true`; non-image documents are converted to text via configurable converter commands (`pdftotext`, `libreoffice`, etc.).
 
 ---

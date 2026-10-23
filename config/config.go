@@ -235,7 +235,7 @@ type ConverterConfig struct {
 // MultimodalConfig holds settings for file attachment processing.
 type MultimodalConfig struct {
 	Vision        bool              `toml:"vision"`          // true = LLM accepts image parts; false = extract text instead
-	MaxImageBytes int64             `toml:"max_image_bytes"` // max size for image attachments (default 10 MB)
+	MaxImageBytes int64             `toml:"max_image_bytes"` // per-file and per-turn incoming attachment bytes (default 10 MB)
 	Converters    []ConverterConfig `toml:"converters"`      // converters for non-image document formats
 }
 

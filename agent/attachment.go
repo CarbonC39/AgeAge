@@ -26,8 +26,8 @@ const (
 )
 
 // UserInput is a normalized turn, independent of transport and run scheduling.
-// It contains no open readers or download callbacks and can later be queued in
-// a RunHandle inbox. Warnings are also included as text parts for model context.
+// It contains no open readers or download callbacks and can be queued in a
+// RunHandle inbox. Warnings are also included as text parts for model context.
 // Referenced files belong to the session's TmpManager until history releases them.
 type UserInput = input.UserInput
 
@@ -366,6 +366,11 @@ func processAttachment(path string, cfg *config.Config, tmpMgr *TmpManager) ([]l
 // ParseCLIInput retains the CLI's @path grammar, with the same runtime pipeline
 // as IM. Missing paths remain literal text (mentions and email addresses).
 func ParseCLIInput(userInput string, cfg *config.Config, tmpMgr *TmpManager) (text string, parts []llm.ContentPart, warnings []string) {
+	return ParseCLIInputContext(context.Background(), userInput, cfg, tmpMgr)
+}
+
+// ParseCLIInputContext also cancels attachment preparation with its owning run.
+func ParseCLIInputContext(ctx context.Context, userInput string, cfg *config.Config, tmpMgr *TmpManager) (text string, parts []llm.ContentPart, warnings []string) {
 	var textTokens []string
 	var attachments []attachment.Attachment
 	for _, tok := range strings.Fields(userInput) {
@@ -390,7 +395,7 @@ func ParseCLIInput(userInput string, cfg *config.Config, tmpMgr *TmpManager) (te
 		attachments = append(attachments, localAttachment(path, info))
 	}
 	text = strings.Join(textTokens, " ")
-	input := NormalizeUserInput(context.Background(), text, attachments, cfg, tmpMgr)
+	input := NormalizeUserInput(ctx, text, attachments, cfg, tmpMgr)
 	warnings = append(warnings, input.Warnings...)
 	if len(attachments) == 0 && len(warnings) > 0 {
 		input.Parts = warningParts(text, warnings)

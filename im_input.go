@@ -12,7 +12,7 @@ import (
 )
 
 // normalizeIMInput is scheduling independent: the same result can be submitted
-// to Agent.RunInput now or an active run's inbox in the future.
+// to Agent.RunInput or an active run's inbox.
 func normalizeIMInput(ctx context.Context, msg channel.IncomingMessage, cfg *config.Config, tmp *agent.TmpManager) agent.UserInput {
 	text := msg.Text
 	target := msg.Target()

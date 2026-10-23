@@ -7,6 +7,7 @@ type Kind string
 
 const (
 	RunStarted            Kind = "run_started"
+	ModelStarted          Kind = "model_started"
 	RunCompleted          Kind = "run_completed"
 	RunFailed             Kind = "run_failed"
 	RunCancelled          Kind = "run_cancelled"
@@ -20,6 +21,7 @@ const (
 	Notification          Kind = "notification"
 	Warning               Kind = "warning"
 	CronCompleted         Kind = "cron_completed"
+	InputUpdated          Kind = "input_updated"
 )
 
 type Event struct {
@@ -28,5 +30,6 @@ type Event struct {
 	Text      string
 	Arguments string // redacted tool arguments; never raw credential substitutions
 	Options   []string
+	Pending   int
 	At        time.Time
 }

@@ -10,6 +10,7 @@ import (
 // Used in channel mode where confirmations require async user responses.
 type ConfirmationManager struct {
 	pendingConfirmations map[string]*PendingConfirmation
+	allowedOperations    map[string]struct{}
 	// allowedResponders is an optional per-channel allowlist. The originating
 	// sender is always allowed; entries here may additionally approve requests
 	// in a channel after the scope location has matched.
@@ -31,8 +32,55 @@ type PendingConfirmation struct {
 func NewConfirmationManager() *ConfirmationManager {
 	return &ConfirmationManager{
 		pendingConfirmations: make(map[string]*PendingConfirmation),
+		allowedOperations:    make(map[string]struct{}),
 		allowedResponders:    make(map[string]map[string]struct{}),
 	}
+}
+
+// IsAlwaysAllowed reports whether a user selected the persistent "always"
+// choice for this exact operation during the current manager lifetime.
+func (cm *ConfirmationManager) IsAlwaysAllowed(operation string) bool {
+	if cm == nil {
+		return false
+	}
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+	_, ok := cm.allowedOperations[operation]
+	return ok
+}
+
+// RespondAlwaysForScope approves one uniquely matched request and remembers
+// that operation for later requests handled by this manager.
+func (cm *ConfirmationManager) RespondAlwaysForScope(scope InteractionScope) (string, bool) {
+	if cm == nil {
+		return "", false
+	}
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	var match *PendingConfirmation
+	for _, pc := range cm.pendingConfirmations {
+		if pc.Scope.locationEqual(scope) && cm.authorizedLocked(pc, scope.SenderID) {
+			if match != nil {
+				return "", false
+			}
+			match = pc
+		}
+	}
+	if match == nil {
+		return "", false
+	}
+	select {
+	case match.ResultCh <- true:
+		close(match.ResultCh)
+	default:
+		return "", false
+	}
+	if cm.allowedOperations == nil {
+		cm.allowedOperations = make(map[string]struct{})
+	}
+	cm.allowedOperations[match.Operation] = struct{}{}
+	delete(cm.pendingConfirmations, match.ID)
+	return match.Operation, true
 }
 
 // RequestConfirmation creates a new confirmation request and returns its ID and result channel.
@@ -144,6 +192,20 @@ func (cm *ConfirmationManager) RespondForScope(scope InteractionScope, allowed b
 		return false
 	}
 	delete(cm.pendingConfirmations, match.ID)
+	return true
+}
+
+// CancelRequest closes only the matching outstanding request. A run uses its
+// request ID so cancellation cannot dismiss another parallel interaction.
+func (cm *ConfirmationManager) CancelRequest(id string) bool {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	pc, ok := cm.pendingConfirmations[id]
+	if !ok {
+		return false
+	}
+	delete(cm.pendingConfirmations, id)
+	close(pc.ResultCh)
 	return true
 }
 

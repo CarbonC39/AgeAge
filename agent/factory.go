@@ -373,7 +373,7 @@ func (f *AgentFactory) CreateAgentFiltered(confirmMgr *tools.ConfirmationManager
 	var currentAgent *Agent
 
 	confirmFunc := func(operation string) bool {
-		if autoAllowAll {
+		if autoAllowAll || confirmMgr.IsAlwaysAllowed(operation) {
 			return true
 		}
 
@@ -381,7 +381,7 @@ func (f *AgentFactory) CreateAgentFiltered(confirmMgr *tools.ConfirmationManager
 		if confirmMgr != nil && currentAgent != nil && currentAgent.GetChannelID() != "" {
 			ag := currentAgent
 
-			_, resultCh := confirmMgr.RequestConfirmationScoped(operation, ag.GetInteractionScope(), 10*time.Minute)
+			requestID, resultCh := confirmMgr.RequestConfirmationScoped(operation, ag.GetInteractionScope(), 10*time.Minute)
 			if ag.Callbacks.Event != nil {
 				ag.emitEvent(event.Event{Kind: event.ConfirmationRequested, Text: operation, Options: []string{"y", "n", "a"}})
 			} else {
@@ -393,11 +393,13 @@ func (f *AgentFactory) CreateAgentFiltered(confirmMgr *tools.ConfirmationManager
 				}
 			}
 
-			allowed, ok := <-resultCh
-			if !ok {
-				return false // Timeout
+			select {
+			case allowed, ok := <-resultCh:
+				return ok && allowed
+			case <-ag.executionContext().Done():
+				confirmMgr.CancelRequest(requestID)
+				return false
 			}
-			return allowed
 		}
 
 		// Fallback to CLI confirmation.

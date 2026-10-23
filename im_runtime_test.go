@@ -9,6 +9,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -222,6 +224,283 @@ func TestIMRuntimeAttachmentAnswersPendingAskAndSessionCommandsStayResponsive(t 
 	if len(ch.replies) < 2 {
 		t.Fatalf("expected list/new/attachment acknowledgements, replies=%#v", ch.replies)
 	}
+}
+
+func TestIMRuntimeSteeringInputJoinsActiveRunAndPersistsAfterToolBatch(t *testing.T) {
+	firstRequest := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	secondRequest := make(chan []json.RawMessage, 1)
+	var callsMu sync.Mutex
+	calls := 0
+	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read model request: %v", err)
+			return
+		}
+		callsMu.Lock()
+		calls++
+		n := calls
+		callsMu.Unlock()
+		if n == 1 {
+			close(firstRequest)
+			select {
+			case <-releaseFirst:
+			case <-r.Context().Done():
+				return
+			}
+		} else if n == 2 {
+			var req struct {
+				Messages []json.RawMessage `json:"messages"`
+			}
+			if err := json.Unmarshal(body, &req); err != nil {
+				t.Errorf("decode follow-up request: %v", err)
+			}
+			secondRequest <- req.Messages
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if n == 1 {
+			_, _ = io.WriteString(w, `{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"read-1","type":"function","function":{"name":"file_read","arguments":"{\"path\":\"details.txt\"}"}}]},"finish_reason":"tool_calls"}]}`)
+		} else {
+			_, _ = io.WriteString(w, `{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"finish-1","type":"function","function":{"name":"finish_task","arguments":"{\"status\":\"success\",\"summary\":\"Updated answer\"}"}}]},"finish_reason":"tool_calls"}]}`)
+		}
+	}))
+	defer llmServer.Close()
+
+	work := t.TempDir()
+	if err := os.WriteFile(filepath.Join(work, "details.txt"), []byte("existing detail"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.DefaultConfig()
+	cfg.Workspace, cfg.WorkDir = work, work
+	cfg.Agent.Mode = config.AgentModeFull
+	cfg.Agent.Tools = []string{"file_read"}
+	cfg.Router.Enabled = false
+	cfg.MCP.Enabled = false
+	cfg.Notifications.Preset = config.ProgressPresetQuiet
+	factory := &agent.AgentFactory{Config: cfg, LLMClient: llm.NewClient("test-key", llmServer.URL, "test-model", false, 0), UserInputMgr: tools.NewUserInputManager()}
+	runtime := newIMRuntime(factory, map[string]channel.Channel{config.ChannelMatrix: &runtimeTestChannel{}})
+	target := conversation.Target{ChannelType: config.ChannelMatrix, ChannelID: "steering-room", SenderID: "user-1"}
+	initialDone := make(chan string, 1)
+	go func() {
+		initialDone <- runtime.Handler(channel.IncomingMessage{Conversation: target, Text: "Read the existing details"})
+	}()
+	select {
+	case <-firstRequest:
+	case <-time.After(5 * time.Second):
+		t.Fatal("initial model request did not start")
+	}
+
+	image := []byte("\x89PNG\r\n\x1a\nsteering-image")
+	attachmentValue := attachment.Attachment{Filename: "reference.png", MIMEType: "image/png", Size: int64(len(image)), Open: func(context.Context) (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(image)), nil }}
+	steeringDone := make(chan string, 1)
+	go func() {
+		steeringDone <- runtime.Handler(channel.IncomingMessage{Conversation: target, Text: "Also use this reference", Attachments: []attachment.Attachment{attachmentValue}})
+	}()
+	select {
+	case <-steeringDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("steering input waited behind the active run")
+	}
+	close(releaseFirst)
+
+	var messages []json.RawMessage
+	select {
+	case messages = <-secondRequest:
+	case <-time.After(5 * time.Second):
+		t.Fatal("active run did not make the follow-up model request")
+	}
+	select {
+	case <-initialDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("active run did not complete")
+	}
+
+	assistantBatch, toolResult, steering := -1, -1, -1
+	for i, raw := range messages {
+		var msg struct {
+			Role       string            `json:"role"`
+			Content    json.RawMessage   `json:"content"`
+			ToolCallID string            `json:"tool_call_id"`
+			ToolCalls  []json.RawMessage `json:"tool_calls"`
+		}
+		if err := json.Unmarshal(raw, &msg); err != nil {
+			t.Fatalf("decode message %d: %v", i, err)
+		}
+		if msg.Role == "assistant" && len(msg.ToolCalls) > 0 {
+			assistantBatch = i
+		}
+		if msg.Role == "tool" && msg.ToolCallID == "read-1" {
+			toolResult = i
+		}
+		if msg.Role == "user" && bytes.Contains(raw, []byte("Also use this reference")) {
+			steering = i
+		}
+	}
+	if assistantBatch < 0 || toolResult != assistantBatch+1 || steering <= toolResult {
+		t.Fatalf("tool batch and steering order is invalid: assistant=%d result=%d steering=%d messages=%s", assistantBatch, toolResult, steering, marshalMessages(messages))
+	}
+	if !bytes.Contains(messages[steering], []byte(base64.StdEncoding.EncodeToString(image))) {
+		t.Fatal("steering image did not reach the next model request")
+	}
+	if count := bytes.Count(messages[steering], []byte("data:image/png;base64,")); count != 1 {
+		t.Fatalf("steering image parts = %d, want exactly one", count)
+	}
+	sessionID := runtime.Sessions.Current(target)
+	history, err := agent.NewSessionManager(cfg.AgeAgeDirPath()).LoadHistory(sessionID)
+	if err != nil {
+		t.Fatalf("load persisted history: %v", err)
+	}
+	var persistedSteering bool
+	for _, message := range history {
+		if message.Role == "user" && strings.Contains(message.TextContent(), "Also use this reference") {
+			persistedSteering = true
+		}
+	}
+	if !persistedSteering {
+		t.Fatal("steering message was not persisted in session history")
+	}
+}
+
+func TestIMRuntimeStopCancelsActiveRunWithoutStartingAnotherTurn(t *testing.T) {
+	requestStarted := make(chan struct{})
+	releaseHandler := make(chan struct{})
+	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		close(requestStarted)
+		select {
+		case <-r.Context().Done():
+		case <-releaseHandler:
+		}
+	}))
+	t.Cleanup(func() {
+		close(releaseHandler)
+		llmServer.Close()
+	})
+	work := t.TempDir()
+	cfg := config.DefaultConfig()
+	cfg.Workspace, cfg.WorkDir = work, work
+	cfg.Agent.Mode = config.AgentModeFull
+	cfg.Router.Enabled = false
+	cfg.MCP.Enabled = false
+	cfg.Notifications.Preset = config.ProgressPresetQuiet
+	factory := &agent.AgentFactory{Config: cfg, LLMClient: llm.NewClient("test-key", llmServer.URL, "test-model", false, 0), UserInputMgr: tools.NewUserInputManager()}
+	runtime := newIMRuntime(factory, map[string]channel.Channel{config.ChannelMatrix: &runtimeTestChannel{}})
+	target := conversation.Target{ChannelType: config.ChannelMatrix, ChannelID: "stop-room", SenderID: "user-1"}
+	initialDone := make(chan string, 1)
+	go func() {
+		initialDone <- runtime.Handler(channel.IncomingMessage{Conversation: target, Text: "Start a slow task"})
+	}()
+	select {
+	case <-requestStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("initial model request did not start")
+	}
+	stopDone := make(chan string, 1)
+	go func() { stopDone <- runtime.Handler(channel.IncomingMessage{Conversation: target, Text: "!stop"}) }()
+	select {
+	case <-stopDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stop command blocked behind active run")
+	}
+	select {
+	case <-initialDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("active run did not stop")
+	}
+	if active := agent.NewSessionManager(cfg.AgeAgeDirPath()).ActiveRun(runtime.Sessions.Current(target)); active != nil {
+		t.Fatal("stopped run remained registered after persistence")
+	}
+}
+
+func TestIMRuntimePreservesStartupInputsWhenHistoryCannotLoad(t *testing.T) {
+	work := t.TempDir()
+	cfg := config.DefaultConfig()
+	cfg.Workspace, cfg.WorkDir = work, work
+	cfg.Agent.Mode = config.AgentModeFull
+	cfg.Router.Enabled = false
+	cfg.MCP.Enabled = false
+	cfg.Notifications.Preset = config.ProgressPresetQuiet
+	factory := &agent.AgentFactory{Config: cfg, LLMClient: llm.NewClient("test-key", "http://127.0.0.1:1", "test-model", false, 0), UserInputMgr: tools.NewUserInputManager()}
+	ch := &runtimeTestChannel{}
+	runtime := newIMRuntime(factory, map[string]channel.Channel{config.ChannelMatrix: ch})
+	target := conversation.Target{ChannelType: config.ChannelMatrix, ChannelID: "startup-error-room", SenderID: "user-1"}
+	sessionID, err := runtime.Sessions.Resolve(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := agent.NewSessionManager(cfg.AgeAgeDirPath())
+	if err := os.Remove(store.HistoryPath(sessionID)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(store.HistoryPath(sessionID), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	openStarted := make(chan struct{})
+	releaseOpen := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseOpen) }) }
+	t.Cleanup(release)
+	image := []byte("\x89PNG\r\n\x1a\nfailed-inbox-image")
+	attachmentValue := attachment.Attachment{Filename: "initial.png", MIMEType: "image/png", Size: int64(len(image)), Open: func(context.Context) (io.ReadCloser, error) {
+		close(openStarted)
+		<-releaseOpen
+		return io.NopCloser(bytes.NewReader(image)), nil
+	}}
+	initialDone := make(chan string, 1)
+	go func() {
+		initialDone <- runtime.Handler(channel.IncomingMessage{Conversation: target, Text: "Initial request", Attachments: []attachment.Attachment{attachmentValue}})
+	}()
+	select {
+	case <-openStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("initial attachment normalization did not start")
+	}
+	steeringDone := make(chan string, 1)
+	go func() {
+		steeringDone <- runtime.Handler(channel.IncomingMessage{Conversation: target, Text: "Queued while starting"})
+	}()
+	select {
+	case <-steeringDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("startup steering waited behind initial normalization")
+	}
+	release()
+	select {
+	case <-initialDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("startup failure did not finish")
+	}
+
+	data, err := os.ReadFile(filepath.Join(store.SessionDir(sessionID), failedInboxFilename))
+	if err != nil {
+		t.Fatalf("failed inbox was not saved: %v", err)
+	}
+	var preserved []agent.UserInput
+	if err := json.Unmarshal(data, &preserved); err != nil {
+		t.Fatal(err)
+	}
+	if len(preserved) != 2 || preserved[0].Text != "Initial request" || preserved[1].Text != "Queued while starting" {
+		t.Fatalf("preserved startup inputs = %#v", preserved)
+	}
+	foundImage := false
+	for _, part := range preserved[0].Parts {
+		foundImage = foundImage || part.ImageURL != nil
+	}
+	if !foundImage {
+		t.Fatalf("initial image was not preserved: %#v", preserved[0].Parts)
+	}
+	ch.mu.Lock()
+	defer ch.mu.Unlock()
+	if len(ch.replies) == 0 || !strings.Contains(ch.replies[len(ch.replies)-1], "1 queued update(s) were preserved") {
+		t.Fatalf("startup failure did not explain preserved updates: %#v", ch.replies)
+	}
+}
+
+func marshalMessages(messages []json.RawMessage) string {
+	data, _ := json.Marshal(messages)
+	return string(data)
 }
 
 func waitFor(t *testing.T, timeout time.Duration, ready func() bool) {

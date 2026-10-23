@@ -22,8 +22,9 @@ type Readline struct {
 	PromptAnsi string
 
 	history []string
-	histIdx int    // current position in history; len(history) = live input
-	saved   string // live input saved while browsing history
+	histIdx int           // current position in history; len(history) = live input
+	saved   string        // live input saved while browsing history
+	reader  *bufio.Reader // persistent so buffered bytes survive between ReadLine calls
 }
 
 // AddHistory appends a non-empty line to the in-memory history ring.
@@ -103,7 +104,7 @@ func (rl *Readline) ReadLine() (string, error) {
 		os.Stdout.WriteString(s) //nolint:errcheck
 	}
 
-	reader := bufio.NewReaderSize(os.Stdin, 256)
+	reader := rl.inputReader()
 
 	for {
 		r, _, err := reader.ReadRune()
@@ -254,16 +255,28 @@ func (rl *Readline) ReadLine() (string, error) {
 
 // simpleRead reads one line without any editing support (for non-TTY contexts).
 func (rl *Readline) simpleRead() (string, error) {
-	r := bufio.NewReader(os.Stdin)
-	line, err := r.ReadString('\n')
+	line, err := rl.inputReader().ReadString('\n')
 	if err != nil && err != io.EOF {
 		return "", err
+	}
+	if err == io.EOF && line == "" {
+		return "", io.EOF
 	}
 	// Strip trailing newline characters.
 	for len(line) > 0 && (line[len(line)-1] == '\n' || line[len(line)-1] == '\r') {
 		line = line[:len(line)-1]
 	}
+	if line == "\x03" {
+		return "", ErrInterrupt
+	}
 	return line, nil
+}
+
+func (rl *Readline) inputReader() *bufio.Reader {
+	if rl.reader == nil {
+		rl.reader = bufio.NewReaderSize(os.Stdin, 256)
+	}
+	return rl.reader
 }
 
 // itoa converts a non-negative integer to its decimal string without importing strconv.

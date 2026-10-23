@@ -72,8 +72,9 @@ type PipelineExecutor struct {
 	channelID  string
 	scope      tools.InteractionScope
 
-	nodeStatus map[string]string // node ID → nodeStatus* value
-	todoMsgID  string
+	nodeStatus       map[string]string // node ID → nodeStatus* value
+	steeringProgress []string          // completed foreach indices when yielding to the owner
+	todoMsgID        string
 }
 
 // NewPipelineExecutor creates a new executor for the given pipeline skill.
@@ -141,6 +142,9 @@ func (e *PipelineExecutor) Run(ctx context.Context) (string, error) {
 	}
 
 	for i, node := range e.ps.Pipeline {
+		if steeringPending(ctx) {
+			return "", errRunSteering
+		}
 		e.currentNodeIdx = i
 		if ctx.Err() != nil {
 			return "", ctx.Err()
@@ -218,7 +222,7 @@ func (e *PipelineExecutor) mergeOutputs(out map[string]interface{}) {
 // execForeach iterates a node over an array pipeline variable.
 // After all iterations, per-output-key values are collected as slices and
 // written to e.vars. Parallel execution is used when Config.Pipeline.ForeachConcurrency > 1.
-func (e *PipelineExecutor) execForeach(ctx context.Context, node skills.PipelineNode) error {
+func (e *PipelineExecutor) execForeach(ctx context.Context, node skills.PipelineNode) (runErr error) {
 	// Normalize foreach var: bare names (no $ prefix) resolve as $vars.name.
 	foreachRef := node.Foreach
 	if foreachRef != "" && !strings.HasPrefix(foreachRef, "$") {
@@ -270,6 +274,15 @@ func (e *PipelineExecutor) execForeach(ctx context.Context, node skills.Pipeline
 	}
 
 	outputAccum := make(map[string][]interface{}, len(node.Outputs))
+	var completed []int
+	defer func() {
+		if errors.Is(runErr, errRunSteering) {
+			for key, values := range outputAccum {
+				e.vars[key] = values
+			}
+			e.steeringProgress = append(e.steeringProgress, fmt.Sprintf("%s: completed foreach iterations %v; do not repeat them", node.ID, completed))
+		}
+	}()
 
 	concurrency := e.factory.Config.Pipeline.ForeachConcurrency
 	if concurrency <= 1 {
@@ -282,6 +295,7 @@ func (e *PipelineExecutor) execForeach(ctx context.Context, node skills.Pipeline
 			if err := e.execNode(ctx, node, item, idx, out); err != nil {
 				return fmt.Errorf("foreach iteration %d: %w", idx, err)
 			}
+			completed = append(completed, idx)
 			// Collect outputs per pipeline var (will become slices).
 			for pipelineVar := range node.Outputs {
 				outputAccum[pipelineVar] = append(outputAccum[pipelineVar], out[pipelineVar])
@@ -333,12 +347,25 @@ func (e *PipelineExecutor) execForeach(ctx context.Context, node skills.Pipeline
 				failedIdxs = append(failedIdxs, r.idx)
 				if firstErr == nil {
 					firstErr = r.err
-					subCancel() // signal remaining goroutines to stop
+					if !errors.Is(r.err, errRunSteering) {
+						subCancel() // signal remaining goroutines to stop
+					}
 				}
 			}
 			results[r.idx] = r
 		}
 		if firstErr != nil {
+			if errors.Is(firstErr, errRunSteering) {
+				for _, result := range results {
+					if result.err == nil {
+						completed = append(completed, result.idx)
+						for key := range node.Outputs {
+							outputAccum[key] = append(outputAccum[key], result.out[key])
+						}
+					}
+				}
+				return firstErr
+			}
 			if len(failedIdxs) == 1 {
 				return fmt.Errorf("foreach iteration %d: %w", failedIdxs[0], firstErr)
 			}
@@ -369,6 +396,9 @@ func (e *PipelineExecutor) execForeach(ctx context.Context, node skills.Pipeline
 // execNode validates and dispatches to the correct executor (agent or auto).
 // Outputs are written to `out` (keyed by PIPELINE VAR NAME from node.Outputs).
 func (e *PipelineExecutor) execNode(ctx context.Context, node skills.PipelineNode, foreachItem interface{}, foreachIdx int, out map[string]interface{}) error {
+	if steeringPending(ctx) {
+		return errRunSteering
+	}
 	if node.Validate == "not_empty" {
 		for argName, varRef := range node.Inputs {
 			val := e.resolveValue(varRef, foreachItem, foreachIdx)
@@ -568,7 +598,7 @@ func (e *PipelineExecutor) execAgentNode(ctx context.Context, node skills.Pipeli
 			return nil
 		}
 		// Do not retry on context cancellation — the user or timeout killed the run.
-		if ctx.Err() != nil {
+		if ctx.Err() != nil || errors.Is(err, errRunSteering) {
 			return err
 		}
 		var reportedFailure *nodeReportedFailureError
@@ -612,6 +642,20 @@ func (e *PipelineExecutor) runAgentNodeAttempt(
 	}
 	subAgent.SetInteractionScope(e.scope)
 	subAgent.Mode.IsSubAgent = true
+	// Surface useful child progress through the owning run's event stream.
+	// Child run lifecycle belongs to the parent pipeline node wrapper below,
+	// and forwarding it would incorrectly finish the parent run's UI state.
+	if e.eventSink != nil {
+		sink := e.eventSink
+		subAgent.Callbacks.Event = func(ev event.Event) {
+			switch ev.Kind {
+			case event.RunStarted, event.RunCompleted, event.RunFailed, event.RunCancelled:
+				return
+			default:
+				sink(ev)
+			}
+		}
+	}
 	subAgent.SessionDir = e.sessionDir
 	// SOUL is injected only in the last agent node; context is always injected.
 	subAgent.Mode.InjectSoul = e.factory.InjectSoul && (e.currentNodeIdx == e.lastAgentNodeIdx)
@@ -776,6 +820,9 @@ func (e *PipelineExecutor) execNestedPipeline(ctx context.Context, node skills.P
 
 	result, err := nestedExec.Run(ctx)
 	if err != nil {
+		if errors.Is(err, errRunSteering) {
+			return fmt.Errorf("nested pipeline %q: %w\n%s", nestedSkill.Name, err, nestedExec.NodeSummary())
+		}
 		return fmt.Errorf("nested pipeline %q: %w", nestedSkill.Name, err)
 	}
 
@@ -990,6 +1037,9 @@ func (e *PipelineExecutor) interpolatePrompt(tmpl string, foreachItem interface{
 func (e *PipelineExecutor) NodeSummary() string {
 	var sb strings.Builder
 	sb.WriteString("Pipeline node outputs:\n")
+	for _, progress := range e.steeringProgress {
+		fmt.Fprintf(&sb, "- %s\n", progress)
+	}
 	for _, node := range e.ps.Pipeline {
 		for pvar := range node.Outputs {
 			if v, ok := e.vars[pvar]; ok {

@@ -84,6 +84,7 @@ func newIMRuntime(factory *agent.AgentFactory, channelsByType map[string]channel
 		return ag, id, nil
 	}
 	chatLocks := make(map[string]*sync.Mutex)
+	admissionLocks := make(map[string]*sync.Mutex)
 	var chatLocksMu sync.Mutex
 	getChatMutex := func(key string) *sync.Mutex {
 		chatLocksMu.Lock()
@@ -93,6 +94,16 @@ func newIMRuntime(factory *agent.AgentFactory, channelsByType map[string]channel
 		}
 		lock := &sync.Mutex{}
 		chatLocks[key] = lock
+		return lock
+	}
+	getAdmissionMutex := func(key string) *sync.Mutex {
+		chatLocksMu.Lock()
+		defer chatLocksMu.Unlock()
+		if lock := admissionLocks[key]; lock != nil {
+			return lock
+		}
+		lock := &sync.Mutex{}
+		admissionLocks[key] = lock
 		return lock
 	}
 	respond := func(msg channel.IncomingMessage, text string) string {
@@ -165,14 +176,18 @@ func newIMRuntime(factory *agent.AgentFactory, channelsByType map[string]channel
 		// stop and session abort bypass the per-chat mutex (which may be held by
 		// the agent). Both are exact channel-aware command matches.
 		if cmd.is("stop") && cmd.Args == "" || cmd.is("session") && strings.EqualFold(cmd.Args, "abort") {
+			pendingSession := sessions.Current(target)
 			agentMu.Lock()
-			if sessionID := sessions.Current(target); sessionID != "" {
-				if ag, ok := agents[sessionID]; ok {
+			if pendingSession != "" {
+				if ag, ok := agents[pendingSession]; ok {
 					ag.Stop()
 				}
 			}
 			feedback := activeFeedback[chatKey]
 			agentMu.Unlock()
+			if run := sm.ActiveRun(pendingSession); run != nil {
+				run.Cancel()
+			}
 			factory.UserInputMgr.CancelForScope(interactionScope(target, sessions.Current(target)))
 			if feedback != nil {
 				feedback.Stop()
@@ -189,10 +204,14 @@ func newIMRuntime(factory *agent.AgentFactory, channelsByType map[string]channel
 			readOnly := cmd.is("sessions") || sub == "" || strings.EqualFold(sub, "list") || strings.EqualFold(sub, "ls")
 			newThread := (strings.EqualFold(sub, "new") || strings.EqualFold(sub, "n")) && surfaceFor(target.Room()).Capabilities().CreateThread
 			if !readOnly && !newThread {
+				admission := getAdmissionMutex(chatKey)
+				admission.Lock()
 				lock := getChatMutex(chatKey)
-				if !lock.TryLock() {
+				if sm.ActiveRun(sessions.Current(target)) != nil || !lock.TryLock() {
+					admission.Unlock()
 					return respond(msg, "A run is active here. Use session list to navigate, or stop it before changing this session.")
 				}
+				defer admission.Unlock()
 				defer lock.Unlock()
 			}
 			reply, err := sessionCommands.handle(surface, cmd)
@@ -225,13 +244,85 @@ func newIMRuntime(factory *agent.AgentFactory, channelsByType map[string]channel
 			_, reply := answerPendingIMInput(context.Background(), msg, scope, factory.UserInputMgr, factory.Config, tmp)
 			return respond(msg, reply)
 		}
+		ag, sessionID, getErr := getAgent(target)
+		if getErr != nil {
+			return respond(msg, "❌ "+getErr.Error())
+		}
+		adminCommand := cmd.is("cred") || cmd.is("build") || cmd.is("clear") || cmd.is("summarize") || cmd.is("undo") || cmd.is("help")
+		lockedForCommand := false
+		if adminCommand {
+			// Serialize the idle check with run admission, and keep it locked for
+			// the command's complete history transaction.
+			admission := getAdmissionMutex(chatKey)
+			admission.Lock()
+			if current := sessions.Current(target); current != sessionID {
+				ag, sessionID, getErr = getAgent(target)
+				if getErr != nil {
+					admission.Unlock()
+					return respond(msg, "❌ "+getErr.Error())
+				}
+			}
+			if sm.ActiveRun(sessionID) != nil {
+				admission.Unlock()
+				return respond(msg, "A run is active here. Send a regular message to steer it, or stop it before using that command.")
+			}
+			mu := getChatMutex(chatKey)
+			if !mu.TryLock() {
+				admission.Unlock()
+				return respond(msg, "A command is already active here. Try again when it finishes.")
+			}
+			lockedForCommand = true
+			defer admission.Unlock()
+			defer mu.Unlock()
+		}
+
+		// Claim the logical session before waiting on the per-chat mutex. If a
+		// run already owns it, normalize and enqueue the complete input now so
+		// concurrent channel callbacks never wait behind the running turn.
+		var runHandle *agent.RunHandle
+		if !adminCommand {
+			admission := getAdmissionMutex(chatKey)
+			for {
+				admission.Lock()
+				if current := sessions.Current(target); current != sessionID {
+					admission.Unlock()
+					ag, sessionID, getErr = getAgent(target)
+					if getErr != nil {
+						return respond(msg, "❌ "+getErr.Error())
+					}
+					continue
+				}
+				run, owner := sm.ClaimRun(context.Background(), sessionID)
+				admission.Unlock()
+				if owner {
+					runHandle = run
+					defer run.Close()
+					break
+				}
+				if cmd.is("cred") || cmd.is("build") || cmd.is("clear") || cmd.is("summarize") || cmd.is("undo") || cmd.is("retry") {
+					return respond(msg, "A run is active here. Send a regular message to steer it, or stop it before using that command.")
+				}
+				accepted := run.Prepare(func(ctx context.Context) agent.UserInput {
+					return normalizeIMInput(ctx, msg, factory.Config, ag.TmpManager())
+				})
+				if accepted {
+					return ""
+				}
+				// The run sealed its inbox while this message was being normalized.
+				// Wait until its history transaction has been released, then retry as
+				// a fresh turn instead of dropping or duplicating the input.
+				<-run.Done()
+			}
+		}
 
 		_ = surface.Read()
 
 		// All other messages are processed sequentially per chat.
-		mu := getChatMutex(chatKey)
-		mu.Lock()
-		defer mu.Unlock()
+		if !lockedForCommand {
+			mu := getChatMutex(chatKey)
+			mu.Lock()
+			defer mu.Unlock()
+		}
 
 		if debugFlag {
 			fmt.Printf("\n  ▸ [%s] %s: %s\n", target.ChannelType, target.SenderName, msg.Text)
@@ -375,19 +466,28 @@ func newIMRuntime(factory *agent.AgentFactory, channelsByType map[string]channel
 			delete(activeFeedback, chatKey)
 			agentMu.Unlock()
 		}()
-		ag, sessionID, getErr := getAgent(target)
-		if getErr != nil {
-			return respond(msg, "❌ "+getErr.Error())
-		}
-
 		// Serialize the complete mutable Agent lifecycle per logical session.
 		// The transaction keeps the lock through Agent.Run and history save;
 		// use tx.SaveHistory below to avoid reacquiring the non-reentrant lock.
+		initialInput := normalizeIMInput(runHandle.Context(), msg, factory.Config, ag.TmpManager())
 		tx, unlockSession := sm.BeginSessionTransaction(sessionID)
 		defer unlockSession()
+		// This defer was registered after the handle's cleanup, so the session
+		// transaction is unlocked before the active-run claim is released.
 		persistedMessages, loadErr := tx.LoadHistory()
 		if loadErr != nil {
-			return respond(msg, fmt.Sprintf("Agent error: failed to load session history: %s", loadErr))
+			pending := sealAndDrainRun(runHandle)
+			preserved := append([]agent.UserInput{initialInput}, pending...)
+			persistErr := persistFailedInbox(sm.SessionDir(sessionID), preserved)
+			detail := fmt.Sprintf("Agent error: failed to load session history: %s", loadErr)
+			if persistErr != nil {
+				detail += fmt.Sprintf("; could not preserve this input: %s", persistErr)
+			} else if len(pending) > 0 {
+				detail += fmt.Sprintf("; the request and %d queued update(s) were preserved in the session's failed inbox but were not processed", len(pending))
+			} else {
+				detail += "; the request was preserved in the session's failed inbox but was not processed"
+			}
+			return respond(msg, detail)
 		}
 		ag.SetMessages(persistedMessages)
 		ag.SetInteractionScope(tools.InteractionScope{
@@ -400,22 +500,38 @@ func newIMRuntime(factory *agent.AgentFactory, channelsByType map[string]channel
 
 		restoreCallbacks := installIMRunCallbacks(ag, runReporter, surface)
 		defer restoreCallbacks()
+		var firstInboxFeedback sync.Once
+		runHandle.SetObserver(func(pending int) {
+			if surface.Capabilities().Edit {
+				_ = runReporter.Handle(event.Event{Kind: event.InputUpdated, Pending: pending})
+				return
+			}
+			if pending > 0 {
+				firstInboxFeedback.Do(func() {
+					_ = runReporter.Handle(event.Event{Kind: event.InputUpdated, Pending: pending})
+				})
+			}
+		})
 
 		runText := msg.Text
 		var retryParts []llm.ContentPart
 		if retryRequested {
 			lastMsg, ok := ag.LastTurnUserMessage()
 			if !ok {
-				runFailed = false
-				return respond(msg, "Nothing to retry.")
+				if runHandle.TryFinish() {
+					runFailed = false
+					return respond(msg, "Nothing to retry.")
+				}
+				retryRequested = false
+			} else {
+				retried := retryUserInput(lastMsg, retryModifier)
+				runText, retryParts = retried.Text, retried.Parts
+				ag.RollbackLastTurn()
 			}
-			retried := retryUserInput(lastMsg, retryModifier)
-			runText, retryParts = retried.Text, retried.Parts
-			ag.RollbackLastTurn()
 		}
-		input := agent.UserInput{Text: runText, Parts: retryParts}
-		if !retryRequested {
-			input = normalizeIMInput(context.Background(), msg, factory.Config, ag.TmpManager())
+		input := initialInput
+		if retryRequested {
+			input = agent.UserInput{Text: runText, Parts: retryParts}
 		}
 		warningReply := imInputWarnings(input)
 		if warningReply != "" {
@@ -423,7 +539,8 @@ func newIMRuntime(factory *agent.AgentFactory, channelsByType map[string]channel
 		}
 		var result string
 		var err error
-		result, err = ag.RunInput(context.Background(), input, nil)
+		runCtx := agent.WithRunHandle(runHandle.Context(), runHandle)
+		result, err = ag.RunInput(runCtx, input, nil)
 		// Save history after every run (best-effort; ignore errors).
 		if saveErr := tx.SaveHistory(ag.Messages()); saveErr != nil && err == nil {
 			err = fmt.Errorf("save session history: %w", saveErr)
@@ -544,3 +661,7 @@ func startChannels(factory *agent.AgentFactory) (*channel.Manager, int, func(too
 func interactionScope(target conversation.Target, sessionID string) tools.InteractionScope {
 	return tools.InteractionScope{ChannelType: target.ChannelType, ChannelID: target.ChannelID, ThreadID: target.ThreadID, SessionID: sessionID, SenderID: target.SenderID}
 }
+
+// mergeRunInputs preserves the arrival order and multimodal parts when a
+// queued message must become the first turn (for example, a retry request on
+// an empty history followed by ordinary input during startup).

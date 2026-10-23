@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -70,18 +71,22 @@ type turnRecord struct {
 
 // Agent is the core agent that drives the conversation and tool execution loop.
 type Agent struct {
-	cfg          *config.Config
-	client       ChatClient
-	registry     *tools.Registry
-	finishTool   *tools.FinishTool
-	router       *Router
-	summarizer   *Summarizer
-	skills       []skills.Skill
-	conv         Conversation
-	pendingTurns []turnRecord
-	debug        bool
-	cancel       context.CancelFunc
-	cancelMu     sync.Mutex
+	cfg           *config.Config
+	client        ChatClient
+	registry      *tools.Registry
+	finishTool    *tools.FinishTool
+	router        *Router
+	summarizer    *Summarizer
+	skills        []skills.Skill
+	conv          Conversation
+	runMu         sync.Mutex
+	inbox         *RunHandle
+	pendingTurns  []turnRecord
+	debug         bool
+	cancel        context.CancelFunc
+	activeContext context.Context
+	cancelMu      sync.Mutex
+	runAskUser    func(string, []string) // Original transport callback, before the event bridge wraps it.
 
 	// Mode and Callbacks are set after construction by the factory or caller.
 	Mode      AgentMode
@@ -509,26 +514,32 @@ func (a *Agent) installEventCallbackBridge() {
 // RunWithParts executes a single user turn. If parts is non-nil the user message
 // is sent as a multimodal content array; otherwise userInput is used as plain text.
 func (a *Agent) RunWithParts(ctx context.Context, userInput string, parts []llm.ContentPart, streamCb llm.StreamCallback) (result string, runErr error) {
+	if !a.runMu.TryLock() {
+		return "", fmt.Errorf("agent already has an active run; submit input to its inbox")
+	}
+	defer a.runMu.Unlock()
+	a.inbox = nil
+	if !a.Mode.IsSubAgent {
+		a.inbox = runHandleFromContext(ctx)
+	}
+	defer func() { a.inbox = nil }()
 	a.finishTool.Reset()
 	a.runUsage = llm.Usage{}
-
-	// Hot-reload: refresh skill list from deps on every run.
-	// This is a cheap pointer swap; WatchSkills goroutine does the actual I/O.
-	if a.deps != nil {
-		current := a.deps.GetSkills()
-		a.skills = current
-		if a.router != nil {
-			a.router.skills = current
-		}
-	}
-
-	// Create a cancellable context for this run.
 	ctx, cancel := context.WithCancel(ctx)
 	a.cancelMu.Lock()
 	a.cancel = cancel
+	a.activeContext = ctx
 	a.cancelMu.Unlock()
-	defer cancel()
+	defer func() {
+		cancel()
+		a.cancelMu.Lock()
+		a.cancel = nil
+		a.activeContext = nil
+		a.cancelMu.Unlock()
+	}()
 	originalCallbacks := a.Callbacks
+	a.runAskUser = originalCallbacks.AskUser
+	defer func() { a.runAskUser = nil }()
 	a.installEventCallbackBridge()
 	defer func() { a.Callbacks = originalCallbacks }()
 	if !a.Mode.IsSubAgent {
@@ -537,14 +548,36 @@ func (a *Agent) RunWithParts(ctx context.Context, userInput string, parts []llm.
 			kind := event.RunCompleted
 			text := result
 			if ctx.Err() != nil {
-				kind = event.RunCancelled
-				text = ctx.Err().Error()
+				kind, text = event.RunCancelled, ctx.Err().Error()
 			} else if runErr != nil {
-				kind = event.RunFailed
-				text = runErr.Error()
+				kind, text = event.RunFailed, runErr.Error()
 			}
 			a.emitEvent(event.Event{Kind: kind, Text: text})
 		}()
+	}
+	defer a.gcTmp()
+	result, runErr = a.runWithParts(ctx, userInput, parts, streamCb)
+	// Errors and cancellation also persist every accepted input. The final seal
+	// and admission use the same mutex, including the small gap after runLoop.
+	for a.inbox != nil {
+		count := a.consumeInbox(ctx)
+		if count > 0 && runErr == nil && ctx.Err() == nil {
+			result, runErr = a.runLoop(ctx, streamCb, a.registry.ToOpenAIToolsFiltered(a.registry.List()), a.client, false)
+		}
+		if a.inbox.TryFinish() {
+			break
+		}
+	}
+	return result, runErr
+}
+
+func (a *Agent) runWithParts(ctx context.Context, userInput string, parts []llm.ContentPart, streamCb llm.StreamCallback) (string, error) {
+	// Hot reload is runner-owned, just like the conversation and tool registry.
+	if a.deps != nil {
+		a.skills = a.deps.GetSkills()
+		if a.router != nil {
+			a.router.skills = a.skills
+		}
 	}
 
 	// --- Skill selection ---
@@ -584,8 +617,11 @@ func (a *Agent) RunWithParts(ctx context.Context, userInput string, parts []llm.
 		}
 	}
 
+	// Admission during setup follows the same checkpoint rules as the loop.
+	a.consumeInbox(ctx)
 	// Proactively summarize if history is getting long (before LLM call).
 	a.trySummarize(ctx)
+	a.consumeInbox(ctx)
 
 	// --- Router phase ---
 	// Runs before system-prompt finalisation so skill selection can influence
@@ -611,6 +647,7 @@ func (a *Agent) RunWithParts(ctx context.Context, userInput string, parts []llm.
 		} else {
 			toolsForRouter := a.registry.ListExcept("finish_task", "memory_store")
 			var err error
+			a.emitEvent(event.Event{Kind: event.ModelStarted, Name: "router"})
 			routerResult, err = a.router.Route(ctx, actualInput, toolsForRouter, a.conv.All())
 			if err != nil {
 				a.debugLog("Router", "failed, using all tools: %s", err)
@@ -710,6 +747,14 @@ func (a *Agent) RunWithParts(ctx context.Context, userInput string, parts []llm.
 	// --- Pipeline skill handling ---
 	if matchedSkill != nil && matchedSkill.IsPipeline() {
 		result, nodeSummary, err := a.runPipelineSkill(ctx, matchedSkill, actualInput)
+		if errors.Is(err, errRunSteering) {
+			a.conv.Append(llm.Message{Role: "assistant", Content: "Pipeline paused for your update. " + nodeSummary + "\n" + err.Error()})
+			a.consumeInbox(ctx)
+			cleanup := a.injectSkillTools(matchedSkill)
+			defer cleanup()
+			defs, client, upgraded := a.buildExecPlan(nil, matchedSkill)
+			return a.runLoop(ctx, streamCb, defs, client, upgraded)
+		}
 		if err != nil {
 			if ctx.Err() != nil {
 				return "(Task stopped by user)", nil
@@ -721,7 +766,6 @@ func (a *Agent) RunWithParts(ctx context.Context, userInput string, parts []llm.
 		}
 		a.conv.Append(llm.Message{Role: "assistant", Content: result})
 		a.trySummarize(ctx)
-		a.gcTmp()
 		if streamCb != nil {
 			streamCb(result)
 		}
@@ -739,7 +783,6 @@ func (a *Agent) RunWithParts(ctx context.Context, userInput string, parts []llm.
 	toolDefs, activeClient, upgradeUsed := a.buildExecPlan(routerResult, matchedSkill)
 
 	// Phase 3: execute the main loop.
-	defer a.gcTmp()
 	result, err := a.runLoop(ctx, streamCb, toolDefs, activeClient, upgradeUsed)
 	if matchedSkill != nil && matchedSkill.AutoGenerated && ctx.Err() == nil {
 		agentOutput := result
@@ -877,6 +920,10 @@ func (a *Agent) runLoop(ctx context.Context, streamCb llm.StreamCallback, toolDe
 	}
 
 	for i := 0; i < a.MaxIterations; i++ {
+		if a.Mode.IsSubAgent && steeringPending(ctx) {
+			return "", a.yieldForSteering()
+		}
+		a.consumeInbox(ctx)
 		if ctx.Err() != nil {
 			return "(Task stopped by user)", nil
 		}
@@ -903,6 +950,12 @@ func (a *Agent) runLoop(ctx context.Context, streamCb llm.StreamCallback, toolDe
 
 		// dispatchTool executes a single tool call.
 		dispatchTool := func(tc llm.ToolCall) toolExecResult {
+			if ctx.Err() != nil {
+				return toolExecResult{result: "[Tool not executed: run cancelled.]"}
+			}
+			if steeringPending(ctx) {
+				return toolExecResult{result: "[Tool deferred: new user input arrived before execution. Reconsider this action using the following user messages.]"}
+			}
 			var rawArgs json.RawMessage
 			if err2 := jsonutil.ParseToolArgs(tc.Function.Arguments, &rawArgs); err2 != nil {
 				rawArgs = json.RawMessage(tc.Function.Arguments)
@@ -938,14 +991,16 @@ func (a *Agent) runLoop(ctx context.Context, streamCb llm.StreamCallback, toolDe
 				}
 				ch := make(chan toolExecResult, 1)
 				inflightResults[idx] = ch
+				limiter := sem
 				go func() {
-					sem <- struct{}{}
-					defer func() { <-sem }()
+					limiter <- struct{}{}
+					defer func() { <-limiter }()
 					ch <- dispatchTool(call)
 				}()
 			}
 		}
 
+		a.emitEvent(event.Event{Kind: event.ModelStarted})
 		if streamCb != nil {
 			var u *llm.Usage
 			assistantMsg, u, err = activeClient.ChatCompletionStream(
@@ -975,6 +1030,11 @@ func (a *Agent) runLoop(ctx context.Context, streamCb llm.StreamCallback, toolDe
 		}
 
 		if err != nil {
+			// Progressive tools may already be running when streaming fails.
+			// Join them before returning or touching run-owned callbacks/state.
+			for _, ch := range inflightResults {
+				<-ch
+			}
 			if ctx.Err() != nil {
 				return "(Task stopped by user)", nil
 			}
@@ -1046,7 +1106,12 @@ func (a *Agent) runLoop(ctx context.Context, streamCb llm.StreamCallback, toolDe
 				}
 				continue
 			}
-			// Second consecutive bare-text response: accept as final to prevent looping.
+			// Second consecutive bare-text response: accept only after checking
+			// updates atomically with closing admission to this run.
+			if a.consumeInbox(ctx) > 0 || a.inbox != nil && !a.inbox.TryFinish() {
+				textOnlyStreak = 0
+				continue
+			}
 			a.trySummarize(ctx)
 			if cleanedMsg.Content != "" {
 				return cleanedMsg.Content, nil
@@ -1064,9 +1129,10 @@ func (a *Agent) runLoop(ctx context.Context, streamCb llm.StreamCallback, toolDe
 			ch := make(chan toolExecResult, 1)
 			inflightResults[idx] = ch
 			if maxPar > 1 {
+				limiter := sem
 				go func() {
-					sem <- struct{}{}
-					defer func() { <-sem }()
+					limiter <- struct{}{}
+					defer func() { <-limiter }()
 					ch <- dispatchTool(tc)
 				}()
 			} else {
@@ -1115,6 +1181,13 @@ func (a *Agent) runLoop(ctx context.Context, streamCb llm.StreamCallback, toolDe
 				`Read .ageage/docs/troubleshooting.md to diagnose common failure causes before retrying.`
 		}
 
+		// Every tool result is now adjacent to its originating assistant batch.
+		// Steering can enter history here without violating the provider protocol.
+		a.consumeInbox(ctx)
+		if a.finishTool.Finished && a.inbox != nil && !a.inbox.TryFinish() {
+			a.finishTool.Reset()
+			continue
+		}
 		if a.finishTool.Finished {
 			finalSummary := a.finishTool.Summary
 			if a.CredMgr != nil {
@@ -1175,7 +1248,7 @@ func (a *Agent) runPipelineSkill(ctx context.Context, skill *skills.Skill, input
 		a.Callbacks.TodoSend,
 		a.Callbacks.TodoEdit,
 		a.Callbacks.Notify,
-		a.Callbacks.AskUser,
+		a.runAskUser,
 		a.ConfirmationMgr,
 		a.GetChannelID(),
 		a.registry,
@@ -1184,7 +1257,7 @@ func (a *Agent) runPipelineSkill(ctx context.Context, skill *skills.Skill, input
 	exec.scope = a.GetInteractionScope()
 	result, err = exec.Run(ctx)
 	if err != nil {
-		return "", "", err
+		return "", exec.NodeSummary(), err
 	}
 	return result, exec.NodeSummary(), nil
 }

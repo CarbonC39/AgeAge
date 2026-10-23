@@ -4,8 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -35,7 +40,7 @@ func TestAgentEmitsRunAndToolEventsAndKeepsLegacyCallbacks(t *testing.T) {
 	if len(events) < 4 || events[0].Kind != event.RunStarted || events[len(events)-1].Kind != event.RunCompleted || events[len(events)-1].Text != "finished" {
 		t.Fatalf("run events = %#v", events)
 	}
-	if events[1].Kind != event.ToolStarted || events[1].Name != "capture" || events[1].Arguments != `{"value":"x"}` || events[2].Kind != event.ToolCompleted {
+	if events[1].Kind != event.ModelStarted || events[2].Kind != event.ToolStarted || events[2].Name != "capture" || events[2].Arguments != `{"value":"x"}` || events[3].Kind != event.ToolCompleted || events[4].Kind != event.ModelStarted {
 		t.Fatalf("tool events = %#v", events)
 	}
 	if events[0].At.IsZero() || events[len(events)-1].At.IsZero() {
@@ -142,8 +147,228 @@ func TestPipelineAgentNodeEmitsParentSubagentEvents(t *testing.T) {
 	if err != nil || got["answer"] != "node answer" {
 		t.Fatalf("node result = %#v, err=%v", got, err)
 	}
-	if len(events) != 2 || events[0].Kind != event.SubagentStarted || events[0].Name != "research" || events[1].Kind != event.SubagentCompleted || events[1].Name != "research" {
+	if len(events) != 5 || events[0].Kind != event.SubagentStarted || events[0].Name != "research" ||
+		events[1].Kind != event.ModelStarted || events[2].Kind != event.ToolStarted || events[2].Name != "node_complete" ||
+		events[3].Kind != event.ToolCompleted || events[3].Name != "node_complete" ||
+		events[4].Kind != event.SubagentCompleted || events[4].Name != "research" {
 		t.Fatalf("node events = %#v", events)
+	}
+}
+
+func TestPipelineSupervisedChildConfirmationIsVisibleAndCancelable(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		approve bool
+	}{
+		{name: "approved", approve: true},
+		{name: "cancelled", approve: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			workDir := t.TempDir()
+			cfg := config.DefaultConfig()
+			cfg.Workspace, cfg.WorkDir = workDir, workDir
+			cfg.Agent.Mode = config.AgentModeSupervised
+			cfg.Agent.Tools = []string{"file_write"}
+			cfg.Router.Enabled = false
+			factory := &AgentFactory{Config: cfg, SecurityChecker: security.NewChecker(workDir, nil, nil, nil)}
+			confirmMgr := tools.NewConfirmationManager()
+			scope := tools.InteractionScope{ChannelType: "matrix", ChannelID: "room", ThreadID: "thread", SessionID: "pipeline-session", SenderID: "alice"}
+			pipeline := &skills.PipelineSkill{Vars: map[string]interface{}{}, Pipeline: []skills.PipelineNode{}}
+			executor := NewPipelineExecutor(pipeline, nil, factory, "", "", 0, nil, nil, nil, nil, confirmMgr, scope.ChannelID, nil)
+			executor.scope = scope
+			path := filepath.Join(workDir, "pipeline-write.txt")
+			writeArgs, _ := json.Marshal(map[string]string{"path": path, "content": "approved"})
+			executor.agentBuilder = func(cm *tools.ConfirmationManager, channel string, allowed []string) *Agent {
+				ag := factory.CreateAgentFiltered(cm, channel, allowed)
+				ag.SetLLMClient(&fakeChatClient{steps: []fakeChatStep{
+					{message: toolCallMessage("file_write", string(writeArgs), "write-file")},
+					{message: toolCallMessage("node_complete", `{"status":"success","vars":{"result":"written"}}`, "node-done")},
+				}})
+				return ag
+			}
+			var events []event.Event
+			registeredBeforeConfirmation := false
+			confirmationCount := 0
+			executor.eventSink = func(ev event.Event) {
+				events = append(events, ev)
+				if ev.Kind != event.ConfirmationRequested {
+					return
+				}
+				confirmationCount++
+				registeredBeforeConfirmation = len(confirmMgr.GetPendingForScope(scope)) == 1
+				if tc.approve && registeredBeforeConfirmation {
+					confirmMgr.RespondForScope(scope, true)
+				}
+			}
+			ctx := context.Background()
+			if !tc.approve {
+				cancelCtx, cancel := context.WithCancel(ctx)
+				ctx = cancelCtx
+				defer cancel()
+				priorSink := executor.eventSink
+				executor.eventSink = func(ev event.Event) {
+					priorSink(ev)
+					if ev.Kind == event.ConfirmationRequested {
+						cancel()
+					}
+				}
+			}
+			node := skills.PipelineNode{ID: "write", Prompt: "write the requested file", Outputs: skills.OutputsMap{"result": "result"}}
+			got, err := executor.runAgentNodeAttempt(ctx, node, nil, []string{"file_write"}, "write the file", "")
+			if confirmationCount != 1 || !registeredBeforeConfirmation {
+				t.Fatalf("confirmation count=%d pending-before-event=%v events=%#v", confirmationCount, registeredBeforeConfirmation, events)
+			}
+			if tc.approve {
+				if err != nil || got["result"] != "written" {
+					t.Fatalf("node result=%#v err=%v", got, err)
+				}
+				if data, readErr := os.ReadFile(path); readErr != nil || string(data) != "approved" {
+					t.Fatalf("file content=%q err=%v", data, readErr)
+				}
+			} else if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
+				t.Fatalf("cancelled confirmation wrote file; stat error=%v node err=%v", statErr, err)
+			}
+			for _, ev := range events {
+				if ev.Kind == event.RunStarted || ev.Kind == event.RunCompleted || ev.Kind == event.RunFailed || ev.Kind == event.RunCancelled {
+					t.Fatalf("child lifecycle event escaped into parent stream: %#v", events)
+				}
+			}
+		})
+	}
+}
+
+func TestPipelineChildAskUserQuestionAndWaitingAreDeliveredOnce(t *testing.T) {
+	workDir := t.TempDir()
+	cfg := config.DefaultConfig()
+	cfg.Workspace, cfg.WorkDir = workDir, workDir
+	cfg.Agent.Tools = []string{"ask_user"}
+	cfg.Router.Enabled = false
+	inputMgr := tools.NewUserInputManager()
+	factory := &AgentFactory{Config: cfg, UserInputMgr: inputMgr}
+	scope := tools.InteractionScope{ChannelType: "matrix", ChannelID: "room", ThreadID: "thread", SessionID: "ask-session", SenderID: "alice"}
+	pipeline := &skills.PipelineSkill{Vars: map[string]interface{}{}, Pipeline: []skills.PipelineNode{}}
+	taskCalls := 0
+	waitingCount := 0
+	confirmMgr := tools.NewConfirmationManager()
+	parent := newLoopTestAgent(t, &fakeChatClient{}, nil)
+	parent.Callbacks.Event = func(ev event.Event) {
+		if ev.Kind == event.Waiting {
+			waitingCount++
+		}
+	}
+	parent.Callbacks.AskUser = func(question string, _ []string) {
+		taskCalls++
+		if question != "Which option?" || !inputMgr.RespondForScope(scope, "first") {
+			t.Errorf("ask_user notification question=%q did not have a pending input", question)
+		}
+	}
+	// Reproduce the parent RunWithParts bridge setup and preserve the raw
+	// transport callback that runPipelineSkill must pass to its child.
+	parent.runAskUser = parent.Callbacks.AskUser
+	parent.installEventCallbackBridge()
+	executor := NewPipelineExecutor(pipeline, nil, factory, "", "", 0, nil, nil, nil, parent.runAskUser, confirmMgr, scope.ChannelID, nil)
+	executor.scope = scope
+	executor.agentBuilder = func(cm *tools.ConfirmationManager, channel string, allowed []string) *Agent {
+		ag := factory.CreateAgentFiltered(cm, channel, allowed)
+		ag.SetLLMClient(&fakeChatClient{steps: []fakeChatStep{
+			{message: toolCallMessage("ask_user", `{"question":"Which option?","options":["first","second"]}`, "ask")},
+			{message: toolCallMessage("node_complete", `{"status":"success","vars":{"result":"answered"}}`, "done")},
+		}})
+		return ag
+	}
+	executor.eventSink = parent.Callbacks.Event
+	_, err := executor.runAgentNodeAttempt(context.Background(), skills.PipelineNode{ID: "ask", Prompt: "ask a question", Outputs: skills.OutputsMap{"result": "result"}}, nil, []string{"ask_user"}, "ask", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if taskCalls != 1 || waitingCount != 1 {
+		t.Fatalf("ask_user notifications=%d waiting events=%d", taskCalls, waitingCount)
+	}
+}
+
+func TestParentRunPipelinePreservesRawAskUserTransportAcrossEventBridge(t *testing.T) {
+	var calls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		call := calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		switch call {
+		case 1:
+			fmt.Fprint(w, `{"choices":[{"index":0,"message":{"role":"assistant","tool_calls":[{"id":"ask-1","type":"function","function":{"name":"ask_user","arguments":"{\"question\":\"Which option?\",\"options\":[\"first\",\"second\"]}"}}]},"finish_reason":"tool_calls"}]}`)
+		case 2:
+			fmt.Fprint(w, `{"choices":[{"index":0,"message":{"role":"assistant","tool_calls":[{"id":"done-1","type":"function","function":{"name":"node_complete","arguments":"{\"status\":\"success\",\"vars\":{\"result\":\"pipeline answered\"}}"}}]},"finish_reason":"tool_calls"}]}`)
+		default:
+			t.Errorf("unexpected model request %d", call)
+			fmt.Fprint(w, `{"choices":[]}`)
+		}
+	}))
+	defer upstream.Close()
+
+	workDir := t.TempDir()
+	cfg := config.DefaultConfig()
+	cfg.Workspace, cfg.WorkDir = workDir, workDir
+	cfg.Agent.Mode = config.AgentModeFull
+	cfg.Agent.MaxParallelTools = 1
+	cfg.Router.Enabled = false
+	cfg.LLM.BaseURL = upstream.URL
+	cfg.LLM.Model = "test-model"
+	pipeline := &skills.PipelineSkill{
+		Returns: "answer",
+		Vars:    map[string]interface{}{"answer": ""},
+		Pipeline: []skills.PipelineNode{{
+			ID:      "ask",
+			Type:    "agent",
+			Tools:   []string{"ask_user"},
+			Prompt:  "Ask the user which option they prefer.",
+			Outputs: skills.OutputsMap{"answer": "result"},
+		}},
+	}
+	skill := skills.Skill{Name: "pipeline", Description: "pipeline fixture", Pipeline: pipeline}
+	inputMgr := tools.NewUserInputManager()
+	factory := &AgentFactory{
+		Config:       cfg,
+		LLMClient:    llm.NewClient("", upstream.URL, "test-model", false, 0),
+		UserInputMgr: inputMgr,
+		Skills:       []skills.Skill{skill},
+	}
+	confirmMgr := tools.NewConfirmationManager()
+	parent := factory.CreateAgent(confirmMgr, "room")
+	scope := tools.InteractionScope{ChannelType: "matrix", ChannelID: "room", ThreadID: "thread", SessionID: "parent-pipeline", SenderID: "alice"}
+	parent.SetInteractionScope(scope)
+	waitingCount := atomic.Int32{}
+	askCount := atomic.Int32{}
+	parent.Callbacks.Event = func(ev event.Event) {
+		if ev.Kind == event.Waiting && ev.Name == "ask_user" {
+			waitingCount.Add(1)
+		}
+	}
+	rawAskUser := func(question string, _ []string) {
+		askCount.Add(1)
+		if question != "Which option?" || !inputMgr.RespondForScope(scope, "first") {
+			t.Errorf("ask_user transport question=%q did not find the scoped pending input", question)
+		}
+	}
+	parent.Callbacks.AskUser = rawAskUser
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	result, err := parent.Run(ctx, "/pipeline choose", nil)
+	if err != nil || result != "pipeline answered" {
+		t.Fatalf("parent Run = (%q, %v)", result, err)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("model calls=%d, want ask_user and node_complete", got)
+	}
+	if got := waitingCount.Load(); got != 1 {
+		t.Fatalf("parent Waiting events=%d, want 1", got)
+	}
+	if got := askCount.Load(); got != 1 {
+		t.Fatalf("raw AskUser calls=%d, want 1", got)
+	}
+	if parent.runAskUser != nil {
+		t.Fatal("raw run AskUser callback leaked after parent Run")
+	}
+	if parent.Callbacks.AskUser == nil || reflect.ValueOf(parent.Callbacks.AskUser).Pointer() != reflect.ValueOf(rawAskUser).Pointer() {
+		t.Fatal("parent Run did not restore the original AskUser callback")
 	}
 }
 

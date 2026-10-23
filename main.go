@@ -5,11 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -19,6 +21,7 @@ import (
 	"ageage/config"
 	"ageage/conversation"
 	"ageage/creds"
+	"ageage/event"
 	"ageage/llm"
 	"ageage/security"
 	"ageage/server"
@@ -29,6 +32,8 @@ import (
 )
 
 var debugFlag bool
+
+const cliInterruptInput = "\x00ageage-interrupt"
 
 func main() {
 	if err := newRootCommand().Execute(); err != nil {
@@ -618,13 +623,14 @@ func runCLI(cmd *cobra.Command, args []string) error {
 		sessionRegistry = nil
 	}
 	activeSessionID := "default"
+	cliConfirmMgr := tools.NewConfirmationManager()
 	if err := sm.EnsureSession(activeSessionID); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: could not initialise session: %s\n", err)
 	}
 
 	// createSessionAgent builds a fresh agent wired to a session directory.
 	createSessionAgent := func(sessionID string) *agent.Agent {
-		newAg := factory.CreateAgent(nil, "")
+		newAg := factory.CreateAgent(cliConfirmMgr, "interactive")
 		newAg.SetInteractionScope(tools.InteractionScope{
 			ChannelType: "cli",
 			ChannelID:   "interactive",
@@ -639,6 +645,14 @@ func runCLI(cmd *cobra.Command, args []string) error {
 				fmt.Printf("     %d. %s\n", i+1, opt)
 			}
 			fmt.Println("  (Type your answer, or /stop to cancel)")
+		}
+		newAg.Callbacks.Event = func(ev event.Event) {
+			if ev.Kind != event.ConfirmationRequested {
+				return
+			}
+			fmt.Println()
+			fmt.Printf("  ⚠  Confirm: %s\n", ev.Text)
+			fmt.Println("  Reply y to allow, n to deny, or a to always allow this operation.")
 		}
 		// Pipeline node progress: print each status update on its own line.
 		newAg.Callbacks.Notify = func(msg string) {
@@ -722,7 +736,7 @@ func runCLI(cmd *cobra.Command, args []string) error {
 				rl.PromptAnsi = promptMain
 			}
 			raw, err := rl.ReadLine()
-			if err != nil {
+			if err != nil && !(err == io.EOF && raw != "") {
 				return accum.String(), err
 			}
 			if inBlock {
@@ -748,33 +762,60 @@ func runCLI(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// readyForInput is a semaphore: the goroutine waits for a token before
-	// printing the next prompt. The main loop sends a token when it has finished
-	// all output and is ready for the next user turn. This prevents readline's
-	// prompt from interleaving with agent streaming output.
-	readyForInput := make(chan struct{}, 1)
-	readyForInput <- struct{}{} // initial: ready immediately
-
-	// signalReady sends the readiness token; safe to call multiple times.
-	signalReady := func() {
-		select {
-		case readyForInput <- struct{}{}:
-		default:
-		}
-	}
-
 	// Read stdin in a dedicated goroutine so the main loop can remain
 	// responsive (e.g. to /stop) while the agent is running.
-	inputCh := make(chan string)
+	inputCh := make(chan string, 8)
+	readerStop := make(chan struct{})
+	readerDone := make(chan struct{})
+	readyForInput := make(chan struct{}, 1)
+	var readinessMu sync.Mutex
+	readerWaiting := true
+	inputPending := false
+	ackInput := func() {
+		readinessMu.Lock()
+		inputPending = false
+		readinessMu.Unlock()
+	}
+	signalReady := func() {
+		readinessMu.Lock()
+		defer readinessMu.Unlock()
+		if readerWaiting && !inputPending {
+			readerWaiting = false
+			readyForInput <- struct{}{}
+		}
+	}
+	sendInput := func(line string) bool {
+		readinessMu.Lock()
+		readerWaiting, inputPending = true, true
+		readinessMu.Unlock()
+		select {
+		case inputCh <- line:
+			return true
+		case <-readerStop:
+			return false
+		}
+	}
+	signalReady() // initial prompt
+	defer func() {
+		close(readerStop)
+		<-readerDone
+	}()
 	go func() {
+		defer close(readerDone)
 		for {
-			<-readyForInput // wait until the main loop is done printing
+			select {
+			case <-readerStop:
+				return
+			case <-readyForInput:
+			}
 			line, err := readMultiLine()
 			if err == ErrInterrupt {
-				// Ctrl+C while idle → exit. The signal handler handles Ctrl+C
-				// when the agent is running (terminal is then in cooked mode).
-				close(inputCh)
-				return
+				// Deliver Ctrl+C as input so the main loop can stop the active run
+				// without terminating the CLI. At an idle prompt it exits cleanly.
+				if !sendInput(cliInterruptInput) {
+					return
+				}
+				continue
 			}
 			if err != nil {
 				close(inputCh)
@@ -783,34 +824,51 @@ func runCLI(cmd *cobra.Command, args []string) error {
 			if line != "" {
 				rl.AddHistory(line)
 			}
-			inputCh <- line
+			if !sendInput(line) {
+				return
+			}
 			// Main loop calls signalReady() when its output is complete.
 		}
 	}()
 
-	// agentActive is true while the agent goroutine is running.
-	// The signal handler reads this to decide whether to stop or exit.
-	var agentActive atomic.Bool
+	// Signals use the claimed handle, including the interval before Agent starts.
+	var activeRun *agent.RunHandle // owned by the main loop; its context cancels the run
+	var activeRunSignal atomic.Pointer[agent.RunHandle]
 
 	// Ctrl+C handling:
-	//   SIGTERM        → always save + exit immediately
+	//   SIGTERM        → cancel, persist through the owner, then exit
 	//   SIGINT, active → stop the running agent
 	//   SIGINT, idle   → ignored here; readline returns ErrInterrupt which sends
 	//                    "/stop" through inputCh, avoiding a double-exit race
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	signalDone := make(chan struct{})
+	defer func() {
+		signal.Stop(sigCh)
+		close(signalDone)
+	}()
 	go func() {
-		for sig := range sigCh {
+		for {
+			var sig os.Signal
+			select {
+			case <-signalDone:
+				return
+			case sig = <-sigCh:
+			}
 			if sig == syscall.SIGTERM {
 				fmt.Println()
-				_ = sm.SaveHistory(activeSessionID, ag.Messages())
+				if run := activeRunSignal.Load(); run != nil {
+					run.Cancel()
+					<-run.Done() // the owner persists its final history before closing
+				}
 				os.Exit(0)
 			}
-			// SIGINT: only act when the agent is running.
-			if agentActive.Load() {
+			// SIGINT: cancel the claimed run even if its goroutine has not
+			// entered Agent.RunWithParts yet.
+			if run := activeRunSignal.Load(); run != nil {
 				fmt.Println()
 				ui.printWarn("Interrupted. Press Ctrl+C again to exit.")
-				ag.Stop()
+				run.Cancel()
 			}
 		}
 	}()
@@ -821,15 +879,90 @@ func runCLI(cmd *cobra.Command, args []string) error {
 	}
 
 	var agentCh chan agentResult
+	var queuedInputs []string // inputs received after a run sealed its inbox
 
 	for {
 		if agentCh == nil {
-			input, ok := <-inputCh
+			var input string
+			var ok bool
+			active := sm.ActiveRun(activeSessionID)
+			if len(queuedInputs) > 0 && active == nil {
+				input = queuedInputs[0]
+				queuedInputs = queuedInputs[1:]
+				ok = true
+			} else if active != nil {
+				select {
+				case <-active.Done():
+					continue
+				case input, ok = <-inputCh:
+					ackInput()
+					if !ok {
+						inputCh = nil
+						continue
+					}
+				}
+			} else if inputCh == nil {
+				break
+			} else {
+				input, ok = <-inputCh
+				ackInput()
+			}
 			if !ok {
+				break
+			}
+			if input == cliInterruptInput {
+				if active != nil {
+					active.Cancel()
+					factory.UserInputMgr.CancelForScope(ag.GetInteractionScope())
+					ui.printWarn("Interrupted. Stopping the active run.")
+					signalReady()
+					continue
+				}
 				break
 			}
 			input = strings.TrimSpace(input)
 			if input == "" {
+				signalReady()
+				continue
+			}
+			// Another surface may have claimed this session since the CLI last
+			// finished a turn. Route to that owner before interpreting any history
+			// command or attempting another session transaction.
+			if run := sm.ActiveRun(activeSessionID); run != nil {
+				if activeRunSignal.CompareAndSwap(nil, run) {
+					go func(active *agent.RunHandle) {
+						<-active.Done()
+						activeRunSignal.CompareAndSwap(active, nil)
+					}(run)
+				}
+				confirmationPending := false
+				if ag.ConfirmationMgr != nil {
+					confirmationPending = len(ag.ConfirmationMgr.GetPendingForScope(ag.GetInteractionScope())) > 0
+				}
+				switch classifyCLIActiveInput(input,
+					len(factory.UserInputMgr.GetPendingForScope(ag.GetInteractionScope())) > 0,
+					confirmationPending) {
+				case cliInputStop:
+					run.Cancel()
+					factory.UserInputMgr.CancelForScope(ag.GetInteractionScope())
+					ui.printWarn("Stop signal sent.")
+				case cliInputCommand:
+					ui.printWarn("Session commands are unavailable while a run is active; wait for it to finish or use /stop.")
+				case cliInputConfirmation:
+					respondCLIConfirmation(ag.ConfirmationMgr, ag.GetInteractionScope(), input, factory.OnAlwaysAllow)
+				case cliInputAskUser:
+					text, parts, warnings := agent.ParseCLIInput(input, factory.Config, ag.TmpManager())
+					factory.UserInputMgr.RespondInputForScope(ag.GetInteractionScope(), agent.UserInput{Text: text, Parts: parts, Warnings: warnings})
+				case cliInputSteer:
+					if run.Prepare(func(inputCtx context.Context) agent.UserInput {
+						text, parts, warnings := agent.ParseCLIInputContext(inputCtx, input, factory.Config, ag.TmpManager())
+						return agent.UserInput{Text: text, Parts: parts, Warnings: warnings}
+					}) {
+						ui.printInfo(fmt.Sprintf("Update received (%d pending).", run.Pending()))
+					} else {
+						queuedInputs = append(queuedInputs, input)
+					}
+				}
 				signalReady()
 				continue
 			}
@@ -1223,8 +1356,29 @@ func runCLI(cmd *cobra.Command, args []string) error {
 			}
 
 			if shouldRun {
+				run, owner := sm.ClaimRun(context.Background(), activeSessionID)
+				if !owner {
+					accepted := run.Prepare(func(inputCtx context.Context) agent.UserInput {
+						text, parts, warnings := agent.ParseCLIInputContext(inputCtx, input, factory.Config, ag.TmpManager())
+						for _, warning := range warnings {
+							ui.printWarn(warning)
+						}
+						return agent.UserInput{Text: text, Parts: parts, Warnings: warnings}
+					})
+					if accepted {
+						ui.printInfo(fmt.Sprintf("Update received (%d pending).", run.Pending()))
+					} else {
+						queuedInputs = append(queuedInputs, input)
+						ui.printInfo("Run is finishing; your message is queued for the next run.")
+					}
+					signalReady()
+					continue
+				}
+				activeRun = run
+				activeRunSignal.Store(run)
+
 				// Parse @path file attachments from input.
-				cleanText, parts, warnings := agent.ParseCLIInput(input, factory.Config, ag.TmpManager())
+				cleanText, parts, warnings := agent.ParseCLIInputContext(run.Context(), input, factory.Config, ag.TmpManager())
 				for _, w := range warnings {
 					ui.printWarn(w)
 				}
@@ -1282,8 +1436,7 @@ func runCLI(cmd *cobra.Command, args []string) error {
 				thinkFilter.OnThinkBegin = func() { spinner.Stop() }
 				thinkFilter.OnThinkEnd = func() { spinner.Start("Thinking…") }
 				agentCh = make(chan agentResult, 1)
-				agentActive.Store(true)
-				go func(text string, ps []llm.ContentPart, retry bool, modifier string, ch chan agentResult) {
+				go func(text string, ps []llm.ContentPart, retry bool, modifier string, ch chan agentResult, run *agent.RunHandle, sessionID string) {
 					var buf strings.Builder
 					thinkFilter.inner = func(token string) {
 						buf.WriteString(token)
@@ -1292,14 +1445,24 @@ func runCLI(cmd *cobra.Command, args []string) error {
 							spinner.Update(fmt.Sprintf("Writing… (~%d tokens)", approxTokens))
 						}
 					}
-					tx, unlock := sm.BeginSessionTransaction(activeSessionID)
+					tx, unlock := sm.BeginSessionTransaction(sessionID)
 					messages, err := tx.LoadHistory()
+					if err != nil {
+						preserved := append([]agent.UserInput{{Text: text, Parts: ps}}, sealAndDrainRun(run)...)
+						if preserveErr := persistFailedInbox(sm.SessionDir(sessionID), preserved); preserveErr != nil {
+							err = fmt.Errorf("load session history: %w; preserve pending inputs: %v", err, preserveErr)
+						} else {
+							err = fmt.Errorf("load session history: %w; %d input(s) preserved in the session's failed inbox", err, len(preserved))
+						}
+					}
 					if err == nil {
 						ag.SetMessages(messages)
 						if retry {
 							lastMsg, ok := ag.LastTurnUserMessage()
 							if !ok {
-								err = fmt.Errorf("nothing to retry")
+								if run.TryFinish() {
+									err = fmt.Errorf("nothing to retry")
+								}
 							} else {
 								retried := retryUserInput(lastMsg, modifier)
 								text, ps = retried.Text, retried.Parts
@@ -1309,23 +1472,27 @@ func runCLI(cmd *cobra.Command, args []string) error {
 					}
 					result := ""
 					if err == nil {
-						result, err = ag.RunWithParts(context.Background(), text, ps, thinkFilter.Wrap())
+						runCtx := agent.WithRunHandle(run.Context(), run)
+						result, err = ag.RunWithParts(runCtx, text, ps, thinkFilter.Wrap())
 						if saveErr := tx.SaveHistory(ag.Messages()); saveErr != nil && err == nil {
 							err = fmt.Errorf("save session history: %w", saveErr)
 						}
 					}
 					unlock()
+					run.Close()
 					thinkFilter.Flush()
 					spinner.Stop()
 					ch <- agentResult{result, err}
-				}(cleanText, parts, retryRequested, retryModifier, agentCh)
+				}(cleanText, parts, retryRequested, retryModifier, agentCh, run, activeSessionID)
+				signalReady()
 			}
 
 		} else {
 			select {
 			case res := <-agentCh:
 				agentCh = nil
-				agentActive.Store(false)
+				activeRun = nil
+				activeRunSignal.Store(nil)
 				// Auto-rename auto-generated session names (session-N) to a slug
 				// derived from the first user message so sessions are easy to identify.
 				if isAutoSessionName(activeSessionID) && res.err == nil {
@@ -1351,33 +1518,133 @@ func runCLI(cmd *cobra.Command, args []string) error {
 				signalReady()
 
 			case input, ok := <-inputCh:
+				ackInput()
 				if !ok {
-					ag.Stop()
-					agentActive.Store(false)
+					inputCh = nil
+					continue
+				}
+				if input == cliInterruptInput {
+					activeRun.Cancel()
 					factory.UserInputMgr.CancelForScope(ag.GetInteractionScope())
-					<-agentCh
-					return nil
+					ui.printWarn("Interrupted. Stopping the active run.")
+					signalReady()
+					continue
 				}
 				trimmed := strings.TrimSpace(input)
-				if trimmed == "/stop" {
-					ag.Stop()
+				// While a run owns the session, control replies and ask_user answers
+				// are handled immediately. All remaining input enters that run's
+				// ordered inbox, including CLI file attachments.
+				confirmationPending := false
+				if ag.ConfirmationMgr != nil {
+					confirmationPending = len(ag.ConfirmationMgr.GetPendingForScope(ag.GetInteractionScope())) > 0
+				}
+				switch classifyCLIActiveInput(trimmed,
+					len(factory.UserInputMgr.GetPendingForScope(ag.GetInteractionScope())) > 0,
+					confirmationPending) {
+				case cliInputStop:
+					activeRun.Cancel()
 					factory.UserInputMgr.CancelForScope(ag.GetInteractionScope())
 					fmt.Println()
 					ui.printWarn("Stop signal sent.")
-				} else if len(factory.UserInputMgr.GetPendingForScope(ag.GetInteractionScope())) > 0 {
-					// A pipeline node is waiting for user input — deliver the answer.
+				case cliInputCommand:
+					ui.printWarn("Session commands are unavailable while a run is active; wait for it to finish or use /stop.")
+				case cliInputConfirmation:
+					respondCLIConfirmation(ag.ConfirmationMgr, ag.GetInteractionScope(), trimmed, factory.OnAlwaysAllow)
+				case cliInputAskUser:
 					text, parts, warnings := agent.ParseCLIInput(trimmed, factory.Config, ag.TmpManager())
 					for _, warning := range warnings {
 						ui.printWarn(warning)
 					}
 					factory.UserInputMgr.RespondInputForScope(ag.GetInteractionScope(), agent.UserInput{Text: text, Parts: parts, Warnings: warnings})
+				case cliInputSteer:
+					if !activeRun.Prepare(func(inputCtx context.Context) agent.UserInput {
+						text, parts, warnings := agent.ParseCLIInputContext(inputCtx, trimmed, factory.Config, ag.TmpManager())
+						for _, warning := range warnings {
+							ui.printWarn(warning)
+						}
+						return agent.UserInput{Text: text, Parts: parts, Warnings: warnings}
+					}) {
+						queuedInputs = append(queuedInputs, trimmed)
+						ui.printInfo("Run is finishing; your message is queued for the next run.")
+					} else {
+						ui.printInfo(fmt.Sprintf("Update received (%d pending).", activeRun.Pending()))
+					}
 				}
+				signalReady()
 			}
 		}
 	}
 
 	_ = rl.SaveHistory(historyFile, 1000)
 	return nil
+}
+
+func isCLIConfirmationReply(text string) bool {
+	switch strings.ToLower(strings.TrimSpace(text)) {
+	case "y", "n", "a":
+		return true
+	default:
+		return false
+	}
+}
+
+type cliActiveInputRoute uint8
+
+const (
+	cliInputSteer cliActiveInputRoute = iota
+	cliInputAskUser
+	cliInputConfirmation
+	cliInputCommand
+	cliInputStop
+)
+
+func classifyCLIActiveInput(text string, askPending, confirmationPending bool) cliActiveInputRoute {
+	text = strings.TrimSpace(text)
+	lower := strings.ToLower(text)
+	if lower == "/stop" || lower == "/abort" || lower == "/session abort" || lower == "/s abort" {
+		return cliInputStop
+	}
+	if confirmationPending && isCLIConfirmationReply(text) {
+		return cliInputConfirmation
+	}
+	if askPending {
+		return cliInputAskUser
+	}
+	if isCLIActiveHistoryCommand(text) {
+		return cliInputCommand
+	}
+	return cliInputSteer
+}
+
+func isCLIActiveHistoryCommand(text string) bool {
+	text = strings.ToLower(strings.TrimSpace(text))
+	for _, command := range []string{"/clear", "/summarize", "/undo", "/retry", "/session", "/s", "/build", "/cred"} {
+		if text == command || strings.HasPrefix(text, command+" ") {
+			return true
+		}
+	}
+	return false
+}
+
+func respondCLIConfirmation(manager *tools.ConfirmationManager, scope tools.InteractionScope, answer string, onAlwaysAllow func(string)) bool {
+	if manager == nil {
+		return false
+	}
+	answer = strings.ToLower(strings.TrimSpace(answer))
+	if answer == "a" {
+		operation, ok := manager.RespondAlwaysForScope(scope)
+		if !ok {
+			return false
+		}
+		if onAlwaysAllow != nil {
+			onAlwaysAllow(operation)
+		}
+		return true
+	}
+	if (answer != "y" && answer != "n") || !manager.RespondForScope(scope, answer == "y") {
+		return false
+	}
+	return true
 }
 
 // handleCredChanCmd processes channel-prefixed cred commands received from an

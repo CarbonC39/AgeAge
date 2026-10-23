@@ -216,6 +216,37 @@ func TestRunCoalescesUpdatesClosesTimerAndDeliversResultOnce(t *testing.T) {
 	}
 }
 
+func TestInputUpdatedReusesStatusCardAndShowsPendingCount(t *testing.T) {
+	surface := &fakeSurface{target: conversation.Target{ChannelType: "matrix", ChannelID: "room"}, edit: true}
+	policy := config.DefaultNotificationConfig()
+	policy.Preset = config.ProgressPresetVerbose
+	policy.ThrottleMS = 1
+	run := NewRun(surface, policy)
+	if err := run.Handle(event.Event{Kind: event.RunStarted}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(5 * time.Millisecond)
+	if err := run.Handle(event.Event{Kind: event.InputUpdated, Pending: 2}); err != nil {
+		t.Fatal(err)
+	}
+	if len(surface.sent) != 1 || len(surface.updated) != 1 {
+		t.Fatalf("updates should reuse the run card: sent=%#v updated=%#v", surface.sent, surface.updated)
+	}
+	if !strings.Contains(surface.updated[0], "Received your update") || !strings.Contains(surface.updated[0], "Pending updates: 2") {
+		t.Fatalf("pending update state = %q", surface.updated[0])
+	}
+	time.Sleep(5 * time.Millisecond)
+	if err := run.Handle(event.Event{Kind: event.InputUpdated, Pending: 0}); err != nil {
+		t.Fatal(err)
+	}
+	if len(surface.sent) != 1 || len(surface.updated) != 2 || !strings.Contains(surface.updated[1], "Using your update") || strings.Contains(surface.updated[1], "Pending updates") {
+		t.Fatalf("consumed update state = sent %#v updated %#v", surface.sent, surface.updated)
+	}
+	if err := run.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestCompleteFallsBackToNewCardWhenEditFails(t *testing.T) {
 	surface := &fakeSurface{target: conversation.Target{ChannelType: "discord", ChannelID: "thread"}, edit: true}
 	policy := config.DefaultNotificationConfig()

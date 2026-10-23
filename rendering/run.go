@@ -21,6 +21,7 @@ type State struct {
 	Phase    string
 	Plan     string
 	Activity string
+	Pending  int
 }
 
 // Render formats one state snapshot. It deliberately describes the latest
@@ -38,6 +39,9 @@ func Render(state State) string {
 	if state.Activity != "" {
 		fmt.Fprintf(&b, "\nLast activity: %s", state.Activity)
 	}
+	if state.Pending > 0 {
+		fmt.Fprintf(&b, "\nPending updates: %d", state.Pending)
+	}
 	return b.String()
 }
 
@@ -49,9 +53,11 @@ type Run struct {
 	surface         channel.Surface
 	policy          config.NotificationConfig
 	statusLifecycle bool
+	editableStatus  bool
 	reporter        *channel.FilteredProgressReporter
 	ref             conversation.Reference
 	state           State
+	terminalPhase   string
 	closed          bool
 	complete        bool
 }
@@ -68,13 +74,9 @@ func NewRun(surface channel.Surface, policy config.NotificationConfig) *Run {
 		capabilities = surface.Capabilities()
 	}
 	r.statusLifecycle = cardLifecycleAllowed(r.policy, capabilities)
+	r.editableStatus = capabilities.Edit && r.statusLifecycle
 	r.reporter = channel.NewFilteredProgressReporter(channel.ProgressReporterOptions{
-		Allowed: func(category channel.ProgressCategory) bool {
-			if category == channel.ProgressLifecycle && r.statusLifecycle {
-				return true
-			}
-			return r.policy.Allows(string(category))
-		},
+		Allowed:  r.progressAllowed,
 		Throttle: durationMS(r.policy.ThrottleMS),
 		Send: func(text string) (string, error) {
 			if r.surface == nil {
@@ -128,6 +130,20 @@ func cardLifecycleAllowed(policy config.NotificationConfig, capabilities channel
 	return true
 }
 
+// Balanced suppresses standalone tool notifications, but an editable status
+// card still needs the latest activity. Override the preset for that card's
+// snapshots while keeping explicit category allowlists and exclusions.
+func (r *Run) statusCategory(category channel.ProgressCategory) channel.ProgressCategory {
+	if r.editableStatus {
+		policy := r.policy
+		policy.Preset = config.ProgressPresetVerbose
+		if policy.Allows(string(category)) {
+			return channel.ProgressLifecycle
+		}
+	}
+	return category
+}
+
 func (r *Run) Handle(ev event.Event) error {
 	if r == nil {
 		return nil
@@ -146,8 +162,11 @@ func (r *Run) Handle(ev event.Event) error {
 			r.mu.Unlock()
 			return channel.ErrUnsupported
 		}
-		r.state.Phase = "Waiting"
-		r.state.Activity = "Waiting for confirmation"
+		statusCategory := r.statusCategory(category)
+		if r.progressAllowed(statusCategory) {
+			r.state.Phase = "Waiting"
+			r.state.Activity = "Waiting for confirmation"
+		}
 		question := fmt.Sprintf("Agent confirmation required: %s\nReply with y (allow once), n (deny), or a (always allow).", ev.Text)
 		options := append([]string(nil), ev.Options...)
 		if len(options) == 0 {
@@ -155,10 +174,6 @@ func (r *Run) Handle(ev event.Event) error {
 		}
 		askErr := r.surface.Ask(question, options)
 		message := Render(r.state)
-		statusCategory := category
-		if r.statusLifecycle {
-			statusCategory = channel.ProgressLifecycle
-		}
 		reportErr := r.reporter.ReportProgress(channel.ProgressEvent{Category: statusCategory, Name: string(ev.Kind), Message: message, At: ev.At})
 		r.mu.Unlock()
 		return errors.Join(askErr, reportErr)
@@ -181,19 +196,36 @@ func (r *Run) Handle(ev event.Event) error {
 		return err
 	}
 
+	statusCategory := r.statusCategory(category)
+	terminal := ev.Kind == event.RunCompleted || ev.Kind == event.RunFailed || ev.Kind == event.RunCancelled
+	if terminal {
+		switch ev.Kind {
+		case event.RunCompleted:
+			r.terminalPhase = "Completed"
+		case event.RunFailed:
+			r.terminalPhase = "Failed"
+		case event.RunCancelled:
+			r.terminalPhase = "Stopped"
+		}
+		r.mu.Unlock()
+		return nil
+	}
+	// Only state that can be presented under the effective category may be
+	// retained: every later card update renders the whole state snapshot.
+	if !r.progressAllowed(statusCategory) {
+		r.mu.Unlock()
+		return nil
+	}
 	switch ev.Kind {
 	case event.RunStarted:
 		r.state.Phase = "Working"
 		r.state.Activity = "Starting"
-	case event.RunCompleted:
-		r.state.Phase = "Completed"
-		r.state.Activity = "Finished"
-	case event.RunFailed:
-		r.state.Phase = "Failed"
-		r.state.Activity = ev.Text
-	case event.RunCancelled:
-		r.state.Phase = "Stopped"
-		r.state.Activity = "Cancelled"
+	case event.ModelStarted:
+		r.state.Phase = "Working"
+		r.state.Activity = "Thinking"
+		if ev.Name == "router" {
+			r.state.Activity = "Understanding your request"
+		}
 	case event.PlanUpdated:
 		r.state.Phase = "Working"
 		r.state.Plan = oneLine(ev.Text)
@@ -216,24 +248,23 @@ func (r *Run) Handle(ev event.Event) error {
 	case event.SubagentCompleted:
 		r.state.Phase = "Working"
 		r.state.Activity = "Sub-agent finished"
-	}
-	if ev.Kind == event.RunCompleted || ev.Kind == event.RunFailed || ev.Kind == event.RunCancelled {
-		r.mu.Unlock()
-		return nil
+	case event.InputUpdated:
+		r.state.Phase = "Working"
+		if ev.Pending == 0 {
+			r.state.Activity = "Using your update"
+		} else {
+			r.state.Activity = "Received your update"
+		}
+		r.state.Pending = ev.Pending
 	}
 	message := Render(r.state)
-	statusCategory := category
-	if r.statusLifecycle && (ev.Kind == event.Waiting || ev.Kind == event.ToolCompleted && ev.Name == "ask_user") {
-		waitingPolicy := r.policy
-		waitingPolicy.Preset = config.ProgressPresetVerbose
-		waitingPolicy.Include = nil
-		if waitingPolicy.Allows(config.ProgressWaiting) {
-			statusCategory = channel.ProgressLifecycle
-		}
-	}
 	err := r.reporter.ReportProgress(channel.ProgressEvent{Category: statusCategory, Name: ev.Name, Message: message, At: ev.At})
 	r.mu.Unlock()
 	return err
+}
+
+func (r *Run) progressAllowed(category channel.ProgressCategory) bool {
+	return category == channel.ProgressLifecycle && r.statusLifecycle || r.policy.Allows(string(category))
 }
 
 // Complete flushes and closes pending progress before replacing the card with
@@ -256,6 +287,15 @@ func (r *Run) Complete(result string, runErr error) error {
 			r.state.Phase = "Failed"
 		}
 		r.state.Activity = "Run finished with an error"
+	} else if r.terminalPhase != "" {
+		r.state.Phase = r.terminalPhase
+		if r.terminalPhase == "Stopped" {
+			r.state.Activity = "Cancelled"
+		} else if r.terminalPhase == "Failed" {
+			r.state.Activity = "Run finished with an error"
+		} else {
+			r.state.Activity = "Finished"
+		}
 	} else if r.state.Phase == "Stopped" {
 		r.state.Activity = "Cancelled"
 	} else {
@@ -327,7 +367,7 @@ func (r *Run) MessageID() string {
 
 func categoryFor(kind event.Kind) (channel.ProgressCategory, bool) {
 	switch kind {
-	case event.RunStarted, event.RunCompleted, event.RunFailed, event.RunCancelled, event.Notification, event.Warning:
+	case event.RunStarted, event.ModelStarted, event.RunCompleted, event.RunFailed, event.RunCancelled, event.Notification, event.Warning:
 		return channel.ProgressLifecycle, true
 	case event.ToolStarted, event.ToolCompleted:
 		return channel.ProgressTool, true
@@ -341,6 +381,8 @@ func categoryFor(kind event.Kind) (channel.ProgressCategory, bool) {
 		return channel.ProgressPlan, true
 	case event.CronCompleted:
 		return channel.ProgressCron, true
+	case event.InputUpdated:
+		return channel.ProgressLifecycle, true
 	default:
 		return "", false
 	}

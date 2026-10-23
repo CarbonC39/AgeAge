@@ -62,6 +62,27 @@ sender and request ID before the chat/run lock is acquired. Their multimodal
 parts are appended after the complete tool-response batch in the same run.
 Session commands remain commands while a question is waiting.
 
+Each session has one active run. New conversation inputs enter that run's ordered
+inbox instead of waiting for the chat lock to start another turn. Text and
+attachments use the same normalized `UserInput` path. Attachment preparation
+reserves its place before conversion, so slower downloads cannot reorder inputs
+or race with final history persistence and temporary-file cleanup.
+
+Stop and abort controls cancel the active run immediately. Scoped confirmation
+responses and pending `ask_user` answers take priority over steering. The agent
+consumes steering before another model call and after a complete tool-result
+batch. Updates arriving before a tool starts can defer it for replanning; tools
+already executing finish normally. An atomic inbox check closes admission before
+run completion, and the session claim remains held through history persistence.
+Messages arriving after admission closes wait for release before starting a run.
+
+The CLI accepts steering and `@path` attachments while a run is active, using
+the same inbox. Ctrl+C stops the active run; stdin EOF waits for it to finish
+and persist. Commands that modify session history are rejected during a run.
+If startup cannot load history, normalized requests are preserved privately in
+the session's `failed-inbox.json` and the error explains that they were not
+processed. This recovery file is not automatically replayed.
+
 Questions use native interactions where available, such as Telegram keyboards
 inside the original topic, and numbered text elsewhere. Confirmation questions
 are mandatory interactions even under the quiet notification preset. Their
@@ -71,9 +92,14 @@ so restoring or closing a run's presenter cannot redirect a delayed notification
 Cron delivery likewise resolves a structured target and uses the event renderer.
 Legacy flat cron delivery strings remain a compatibility fallback.
 
+Pipeline agent nodes forward their interaction and progress events to the parent
+run. Confirmation prompts remain visible, and each `ask_user` question and its
+waiting status are delivered once.
+
 The default balanced policy gives editable surfaces a single running status card
 and coalesces plans into it. Quiet mode omits intermediate cards but preserves
 questions and final results. Explicit category filters still take precedence.
+Filtered events do not populate the state retained for later card updates.
 Long final results use native connector chunking rather than truncation.
 
 ## Fallbacks

@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -167,6 +168,37 @@ func ExecuteCronEntry(ctx context.Context, factory *AgentFactory, e tools.CronEn
 	}
 	sm := NewSessionManager(factory.Config.AgeAgeDirPath())
 	sessionID := cronSessionID(factory.Config.Cron.SessionIntegration, e)
+	input := e.TaskText()
+	if strings.HasPrefix(input, "skill:") {
+		rest := strings.TrimPrefix(input, "skill:")
+		parts := strings.SplitN(rest, " ", 2)
+		input = "/" + parts[0]
+		if len(parts) > 1 && strings.TrimSpace(parts[1]) != "" {
+			input += " " + strings.TrimSpace(parts[1])
+		}
+	}
+	var run *RunHandle
+	for {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		var owner bool
+		run, owner = sm.ClaimRun(ctx, sessionID)
+		if owner {
+			break
+		}
+		// Scheduled work needs its own execution result and cancellation scope.
+		// Wait for session ownership instead of acknowledging an inbox submission
+		// as success before the task has actually executed. The scheduler retains
+		// its overlap guard, and this wait shares the task's execution timeout.
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-run.Done():
+		}
+	}
+	defer run.Close()
+	ctx = WithRunHandle(run.Context(), run)
 	tx, unlockSession, err := sm.BeginSessionTransactionContext(ctx, sessionID)
 	if err != nil {
 		return "", err
@@ -181,34 +213,28 @@ func ExecuteCronEntry(ctx context.Context, factory *AgentFactory, e tools.CronEn
 	ag.Mode.InjectSoul = false
 
 	// Restore prior history so recurring tasks can build up context over time.
-	if msgs, err := tx.LoadHistory(); err == nil && len(msgs) > 0 {
-		ag.SetMessages(msgs)
+	msgs, err := tx.LoadHistory()
+	if err != nil {
+		return "", fmt.Errorf("load session history: %w", err)
 	}
-
-	input := e.TaskText()
-	if strings.HasPrefix(input, "skill:") {
-		rest := strings.TrimPrefix(input, "skill:")
-		parts := strings.SplitN(rest, " ", 2)
-		input = "/" + parts[0]
-		if len(parts) > 1 && strings.TrimSpace(parts[1]) != "" {
-			input += " " + strings.TrimSpace(parts[1])
-		}
-	}
+	ag.SetMessages(msgs)
 
 	result, err := ag.Run(ctx, input, nil)
-	if err != nil && ctx.Err() != nil {
-		// Do not persist a half-written scheduled turn after cancellation or
-		// timeout. The audit path still records the failed run.
-		return "", err
+	// Agent.Run uses a normal result for user-facing cancellation. Cron must
+	// expose the cancelled context as an error so its audit cannot claim success.
+	if ctx.Err() != nil {
+		err = ctx.Err()
+	} else if err == nil && ag.finishTool.Status == "failure" {
+		err = fmt.Errorf("scheduled task reported failure: %s", result)
 	}
+	// The agent has joined tools and completed their result batch, including on
+	// cancellation. Save that history and any accepted steering before releasing
+	// the active claim, just as interactive runs do.
 	saveErr := tx.SaveHistory(ag.Messages())
-	if err != nil {
-		return "", err
-	}
 	if saveErr != nil {
-		return result, fmt.Errorf("history save failed: %w", saveErr)
+		err = errors.Join(err, fmt.Errorf("history save failed: %w", saveErr))
 	}
-	return result, nil
+	return result, err
 }
 
 func cronSessionID(sessionIntegration bool, e tools.CronEntry) string {

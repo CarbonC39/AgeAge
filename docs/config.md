@@ -299,6 +299,8 @@ session_integration = false
 
 Manage tasks with `ageage cron list|add|remove|run|pause|resume`, or via the `cron_add`, `cron_remove`, `cron_list`, `cron_run`, `cron_pause`, and `cron_resume` agent tools. Agent-created tasks are owned by the current principal in the originating room/thread; switching sessions does not hide them. The source session is used only when `continue_current_session` is enabled. CLI commands are administrative.
 
+When the source session already has an active run, a scheduled task waits for that run to release the session, then executes as its own unsupervised run. The configured timeout includes this wait. Audit records and result delivery occur after actual execution finishes; cancellation, timeout, and an agent-reported failure are recorded as errors. User steering messages continue to enter the current run's inbox.
+
 ---
 
 ## `[notifications]`
